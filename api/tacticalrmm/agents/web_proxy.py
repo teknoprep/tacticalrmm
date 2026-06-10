@@ -269,20 +269,55 @@ _ROOT_REL_RE = re.compile(
 _CSS_URL_RE = re.compile(rb'''(url\(\s*["']?)/(?!/)''', re.IGNORECASE)
 
 
+def _client_shim(token: str) -> bytes:
+    """JS injected into HTML pages that patches XHR/fetch/WebSocket so URLs the
+    app builds dynamically in JavaScript (e.g. Proxmox/ExtJS calling
+    /api2/json/access/domains) are routed back through the proxy prefix."""
+    import json as _json
+
+    p = _prefix(token).rstrip("/")  # /agentproxy/<token>
+    pj = _json.dumps(p)
+    js = (
+        "(function(){var P=" + pj + ";"
+        "function fix(u){try{if(typeof u!=='string')return u;"
+        "if(u.slice(0,P.length+1)===P+'/')return u;"  # already prefixed
+        "if(u.charAt(0)==='/'&&u.charAt(1)!=='/')return P+u;"  # root-relative
+        "return u;}catch(e){return u;}}"
+        "var O=XMLHttpRequest.prototype.open;"
+        "XMLHttpRequest.prototype.open=function(){"
+        "if(arguments.length>1){arguments[1]=fix(arguments[1]);}"
+        "return O.apply(this,arguments);};"
+        "if(window.fetch){var F=window.fetch;window.fetch=function(i,n){"
+        "try{if(typeof i==='string'){i=fix(i);}}catch(e){}return F.call(this,i,n);};}"
+        "if(window.WebSocket){var W=window.WebSocket;var NW=function(u,pr){"
+        "try{u=fix(u);}catch(e){}return pr?new W(u,pr):new W(u);};"
+        "NW.prototype=W.prototype;NW.CONNECTING=W.CONNECTING;NW.OPEN=W.OPEN;"
+        "NW.CLOSING=W.CLOSING;NW.CLOSED=W.CLOSED;window.WebSocket=NW;}"
+        "})();"
+    )
+    return b"<script>" + js.encode() + b"</script>"
+
+
 def rewrite_body(body: bytes, content_type: str, token: str) -> bytes:
     ct = (content_type or "").lower()
-    if not any(x in ct for x in ("text/html", "text/css", "javascript", "application/json", "text/xml", "application/xml")):
-        return body
     prefix = _prefix(token).encode()
-    # root-relative attribute URLs: ="/x" -> ="/agentproxy/<token>/x"
-    body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
-    body = _CSS_URL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
-    # inject <base> so relative URLs resolve under the proxy path
+
     if "text/html" in ct:
+        # static root-relative attribute URLs: ="/x" -> "/agentproxy/<token>/x"
+        body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
+        # inject runtime shim (first, so it patches before app code runs) + <base>
         m = re.search(rb"<head[^>]*>", body, re.IGNORECASE)
+        inject = _client_shim(token) + b'<base href="' + prefix + b'">'
         if m:
-            tag = b'<base href="' + prefix + b'">'
-            body = body[: m.end()] + tag + body[m.end():]
+            body = body[: m.end()] + inject + body[m.end():]
+        else:
+            body = inject + body
+        return body
+
+    if "text/css" in ct:
+        return _CSS_URL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
+
+    # leave JS/JSON/XML/binary untouched - the runtime shim handles dynamic URLs
     return body
 
 
