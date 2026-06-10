@@ -399,3 +399,9 @@ async def agent_web_proxy(request, token: str, path: str = ""):
     resp["X-Robots-Tag"] = "noindex"
     resp.xframe_options_exempt = True
     return resp
+
+
+# This view only forwards requests to the proxied device, which performs its own
+# CSRF protection. Exempt it from Django's CsrfViewMiddleware so POSTs (e.g. the
+# pfSense login form) aren't rejected with a Django 403 before reaching the device.
+agent_web_proxy.csrf_exempt = True
