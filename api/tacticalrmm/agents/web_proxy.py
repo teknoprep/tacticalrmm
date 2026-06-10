@@ -18,6 +18,7 @@ Mechanism (validated end-to-end):
 """
 
 import asyncio
+import contextlib
 import re
 import secrets
 import ssl
@@ -31,6 +32,10 @@ from django.core.cache import cache
 from django.http import HttpResponse, JsonResponse
 
 from tacticalrmm.logger import logger
+
+
+class TunnelError(Exception):
+    """Raised when the agent cannot establish the tunnel to the target."""
 
 # ---------------------------------------------------------------------------
 # Config
@@ -93,6 +98,7 @@ class TunnelStream:
     def __init__(self, ws, use_tls: bool, server_hostname: str):
         self.ws = ws
         self.use_tls = use_tls
+        self._handshake_timeout = HANDSHAKE_TIMEOUT
         self._tls = None
         self._inbio = None
         self._outbio = None
@@ -107,25 +113,49 @@ class TunnelStream:
 
     @classmethod
     async def open(cls, *, hex_node_id: str, addr: str, port: int, use_tls: bool,
-                   auth_token: str) -> "TunnelStream":
+                   auth_token: str, connect_timeout: int = HANDSHAKE_TIMEOUT) -> "TunnelStream":
         nodeid = f"node//{hex_node_id}"
         q = urllib.parse.urlencode(
             {"auth": auth_token, "nodeid": nodeid, "tcpport": str(port), "tcpaddr": addr}
         )
         uri = f"ws://{RELAY_HOST}:{MESH_PORT}/meshrelay.ashx?{q}"
-        ws = await websockets.connect(uri, max_size=None, open_timeout=HANDSHAKE_TIMEOUT)
+        ws = await websockets.connect(uri, max_size=None, open_timeout=connect_timeout)
 
-        # wait for the 'c'/'cr' connect handshake from the relay
-        while True:
-            msg = await asyncio.wait_for(ws.recv(), HANDSHAKE_TIMEOUT)
-            if isinstance(msg, bytes):
-                # unexpected pre-connect binary, ignore
-                continue
-            if msg in ("c", "cr"):
-                break
+        # Wait for the 'c'/'cr' connect handshake. The relay only sends this once
+        # the AGENT has actually established the TCP connection to addr:port, so a
+        # timeout here means the chosen agent cannot reach the target.
+        try:
+            while True:
+                msg = await asyncio.wait_for(ws.recv(), connect_timeout)
+                if isinstance(msg, bytes):
+                    continue  # unexpected pre-connect binary, ignore
+                if msg in ("c", "cr"):
+                    break
+        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+            with contextlib.suppress(Exception):
+                await ws.close()
+            raise TunnelError(
+                f"The selected agent could not reach {addr}:{port}. The host may be "
+                f"unreachable from that agent's network, blocked by a firewall, or the "
+                f"port is closed. Try a different agent."
+            )
+
         self = cls(ws, use_tls, addr)
+        self._handshake_timeout = connect_timeout
         if use_tls:
-            await self._do_handshake()
+            try:
+                await self._do_handshake()
+            except TunnelError:
+                raise
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                raise TunnelError(
+                    f"Could not establish a secure connection to {addr}:{port} through "
+                    f"this agent. The host is likely unreachable from that agent's "
+                    f"network, blocked by a firewall, or not serving HTTPS on that port. "
+                    f"Try a different agent."
+                )
         return self
 
     async def _flush_out(self):
@@ -140,7 +170,7 @@ class TunnelStream:
                 break
             except ssl.SSLWantReadError:
                 await self._flush_out()
-                d = await asyncio.wait_for(self.ws.recv(), HANDSHAKE_TIMEOUT)
+                d = await asyncio.wait_for(self.ws.recv(), self._handshake_timeout)
                 if isinstance(d, bytes):
                     self._inbio.write(d)
         await self._flush_out()
@@ -182,6 +212,53 @@ class TunnelStream:
             await self.ws.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Reachability probe: can <agent> actually reach <addr:port>?  (used to pick the
+# best agent for a network device). Receiving the relay 'c' handshake means the
+# agent successfully opened the TCP connection to the target.
+# ---------------------------------------------------------------------------
+async def _probe(hex_node_id, addr, port, protocol, auth_token, timeout):
+    # The relay sends 'c' as soon as the agent reconnects, BEFORE the target TCP
+    # is known-good, so we must actually exchange data to confirm reachability:
+    #   https  -> a successful TLS handshake proves it
+    #   http   -> send a request and require a response
+    #   ssh/telnet -> the server speaks first (banner/negotiation)
+    use_tls = protocol == "https"
+    ts = None
+    try:
+        ts = await asyncio.wait_for(
+            TunnelStream.open(
+                hex_node_id=hex_node_id, addr=addr, port=int(port),
+                use_tls=use_tls, auth_token=auth_token, connect_timeout=timeout,
+            ),
+            timeout + 3,
+        )
+        if use_tls:
+            return True  # TLS handshake completing means the target is reachable
+        if protocol == "http":
+            await ts.write(
+                b"HEAD / HTTP/1.0\r\nHost: " + addr.encode() + b"\r\n\r\n"
+            )
+        data = await asyncio.wait_for(ts.read(), timeout)
+        return bool(data)
+    except Exception:
+        return False
+    finally:
+        if ts:
+            with contextlib.suppress(Exception):
+                await ts.close()
+
+
+def agent_can_reach(hex_node_id, addr, port, protocol="https", timeout=6) -> bool:
+    """Synchronous helper: True if the agent can actually talk to addr:port."""
+    from core.utils import get_core_settings
+    from meshctrl.utils import get_auth_token
+
+    core = get_core_settings()
+    token = get_auth_token(core.mesh_api_superuser, core.mesh_token)
+    return asyncio.run(_probe(hex_node_id, addr, port, protocol, token, timeout))
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +450,14 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             stream=stream, method=request.method, target=target,
             headers=up_headers, body=body,
         )
+    except TunnelError as e:
+        logger.error(f"web proxy unreachable {sess.get('addr')}:{sess.get('port')} - {e}")
+        r = HttpResponse(str(e), status=502, content_type="text/plain")
+        r.xframe_options_exempt = True
+        return r
     except Exception as e:
-        logger.error(f"web proxy error {sess.get('addr')}:{sess.get('port')} - {e}")
-        r = HttpResponse(f"Proxy error: {e}", status=502)
+        logger.error(f"web proxy error {sess.get('addr')}:{sess.get('port')} - {e!r}")
+        r = HttpResponse(f"Proxy error: {e}", status=502, content_type="text/plain")
         r.xframe_options_exempt = True
         return r
     finally:

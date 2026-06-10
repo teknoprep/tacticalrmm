@@ -106,7 +106,9 @@ class NetworkDeviceConnect(APIView):
         if not _has_perm_on_site(request.user, device.site_id):
             return notify_error("Permission denied")
 
-        agent = device.resolve_agent()
+        # try preferred agents in order and verify each can actually reach the
+        # device, falling back to the next one if not
+        agent, tried = device.resolve_reachable_agent()
         if not agent:
             return notify_error(
                 "No online agent is available to reach this device. "

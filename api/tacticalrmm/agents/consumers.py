@@ -369,11 +369,16 @@ class AgentTerminalConsumer(AsyncWebsocketConsumer):
 
         await self.audit_session(agent, protocol, address, port)
 
+        from agents.web_proxy import TunnelError
+
         try:
             self.tunnel = await TunnelStream.open(
                 hex_node_id=hex_node, addr=address, port=port,
                 use_tls=False, auth_token=auth_token,
             )
+        except TunnelError as e:
+            await self.term_error(str(e))
+            return
         except Exception as e:
             await self.term_error(f"Could not reach {address}:{port} via agent ({e})")
             return

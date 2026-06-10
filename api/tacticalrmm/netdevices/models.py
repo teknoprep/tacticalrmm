@@ -45,39 +45,72 @@ class NetworkDevice(models.Model):
     def client(self):
         return self.site.client
 
-    def resolve_agent(self):
-        """Pick the agent to tunnel through:
+    def candidate_agents(self):
+        """Ordered list of ONLINE agents to try, highest preference first:
 
-        1. First ONLINE agent in ``preferred_agents`` (preference order).
-        2. Otherwise a random online agent in the device's site (servers first,
-           then workstations), broadening to the client if the site has none.
-        Returns an Agent instance or None.
+        1. ONLINE agents from ``preferred_agents`` in preference order.
+        2. Then other online agents in the device's site (servers first), then
+           the client (servers first) - shuffled within each group.
         """
         from agents.models import Agent
 
-        # 1) walk preferred agents in order
+        ordered = []
+        seen = set()
+
+        # 1) preferred agents, in order
         if self.preferred_agents:
-            agents = {
+            by_id = {
                 a.agent_id: a
                 for a in Agent.objects.filter(agent_id__in=self.preferred_agents)
             }
             for agent_id in self.preferred_agents:
-                agent = agents.get(agent_id)
-                if agent and agent.status == AGENT_STATUS_ONLINE:
-                    return agent
+                a = by_id.get(agent_id)
+                if a and a.status == AGENT_STATUS_ONLINE and a.agent_id not in seen:
+                    ordered.append(a)
+                    seen.add(a.agent_id)
 
-        # 2) fallback: random online agent, servers first
+        # 2) fallback pools (site then client), servers before workstations
         for scope in (
             Agent.objects.filter(site=self.site),
             Agent.objects.filter(site__client=self.site.client),
         ):
-            online = [a for a in scope if a.status == AGENT_STATUS_ONLINE]
-            if not online:
-                continue
-            servers = [
-                a for a in online if a.monitoring_type == AgentMonType.SERVER
+            online = [
+                a
+                for a in scope
+                if a.status == AGENT_STATUS_ONLINE and a.agent_id not in seen
             ]
-            pool = servers if servers else online
-            return random.choice(pool)
+            servers = [a for a in online if a.monitoring_type == AgentMonType.SERVER]
+            workstations = [
+                a for a in online if a.monitoring_type != AgentMonType.SERVER
+            ]
+            random.shuffle(servers)
+            random.shuffle(workstations)
+            for a in servers + workstations:
+                ordered.append(a)
+                seen.add(a.agent_id)
 
-        return None
+        return ordered
+
+    def resolve_agent(self):
+        """First online candidate (no reachability test)."""
+        agents = self.candidate_agents()
+        return agents[0] if agents else None
+
+    def resolve_reachable_agent(self, max_tries=5, timeout=8):
+        """Return (agent, tried_hostnames). Tests candidates in order and returns
+        the first that can actually reach the device. Falls back to the first
+        online candidate if none pass the reachability probe."""
+        from agents.web_proxy import agent_can_reach
+
+        candidates = self.candidate_agents()
+        tried = []
+        for agent in candidates[:max_tries]:
+            if agent.hex_mesh_node_id == "error":
+                continue
+            tried.append(agent.hostname)
+            if agent_can_reach(
+                agent.hex_mesh_node_id, self.ip_address, self.port,
+                protocol=self.protocol, timeout=timeout,
+            ):
+                return agent, tried
+        return (candidates[0] if candidates else None), tried
