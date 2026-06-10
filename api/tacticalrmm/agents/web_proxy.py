@@ -366,13 +366,44 @@ def _client_shim(token: str) -> bytes:
         "return O.apply(this,arguments);};"
         "if(window.fetch){var F=window.fetch;window.fetch=function(i,n){"
         "try{if(typeof i==='string'){i=fix(i);}}catch(e){}return F.call(this,i,n);};}"
+        # WebSocket URLs are absolute (ws(s)://host/path); if they point at our own
+        # host, re-route the path through the proxy prefix.
+        "function fixws(u){try{if(typeof u!=='string')return u;"
+        "var a=document.createElement('a');a.href=u;"
+        "if(a.host===location.host&&a.pathname.indexOf(P+'/')!==0){"
+        "var pr=(location.protocol==='https:')?'wss:':'ws:';"
+        "return pr+'//'+location.host+P+a.pathname+a.search;}return u;}catch(e){return u;}}"
         "if(window.WebSocket){var W=window.WebSocket;var NW=function(u,pr){"
-        "try{u=fix(u);}catch(e){}return pr?new W(u,pr):new W(u);};"
+        "try{u=fixws(u);}catch(e){}return pr?new W(u,pr):new W(u);};"
         "NW.prototype=W.prototype;NW.CONNECTING=W.CONNECTING;NW.OPEN=W.OPEN;"
         "NW.CLOSING=W.CLOSING;NW.CLOSED=W.CLOSED;window.WebSocket=NW;}"
         "})();"
     )
     return b"<script>" + js.encode() + b"</script>"
+
+
+def _parse_set_cookie(header: str):
+    """Parse a Set-Cookie header preserving the raw value. Returns
+    (name, raw_value, attrs) with Domain intentionally dropped."""
+    parts = header.split(";")
+    nv = parts[0].strip()
+    if "=" not in nv:
+        return None, None, {}
+    name, value = nv.split("=", 1)
+    attrs: dict[str, Any] = {}
+    for p in parts[1:]:
+        p = p.strip()
+        if not p:
+            continue
+        if "=" in p:
+            k, v = p.split("=", 1)
+            k = k.strip().lower()
+            if k == "domain":  # scope to our origin
+                continue
+            attrs[k] = v.strip()
+        else:
+            attrs[p.lower()] = True
+    return name.strip(), value, attrs
 
 
 def rewrite_body(body: bytes, content_type: str, token: str) -> bytes:
@@ -487,8 +518,7 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             out_headers["Location"] = v
             continue
         if k == "set-cookie":
-            # strip Domain (scope to our origin) and Secure-only issues
-            set_cookies.append(re.sub(r";\s*[Dd]omain=[^;]+", "", v))
+            set_cookies.append(v)  # parsed byte-exact below (Domain dropped there)
             continue
         out_headers[hk.decode("latin-1")] = v
 
@@ -499,20 +529,33 @@ async def agent_web_proxy(request, token: str, path: str = ""):
         if hk.lower() == "content-type":
             continue
         resp[hk] = hv
-    # pass through device cookies (scoped to our origin)
-    if set_cookies:
-        from http.cookies import SimpleCookie
-        jar = SimpleCookie()
-        for c in set_cookies:
-            try:
-                jar.load(c)
-            except Exception:
-                pass
-        for morsel in jar.values():
-            resp.cookies[morsel.key] = morsel.value
-            for attr in ("path", "expires", "max-age", "secure", "httponly", "samesite"):
-                if morsel[attr]:
-                    resp.cookies[morsel.key][attr] = morsel[attr]
+    # Pass through device cookies BYTE-EXACT. We must not reserialize the value
+    # via SimpleCookie, which quotes values containing '='/'%'/':' etc. and would
+    # corrupt tickets (e.g. Proxmox/PBS __Host-PBSAuthCookie -> 401 right after
+    # login). We only strip Domain; Path=/ and Secure are preserved so __Host-*
+    # prefixed cookies remain valid.
+    for c in set_cookies:
+        name, value, attrs = _parse_set_cookie(c)
+        if not name:
+            continue
+        resp.cookies[name] = ""
+        # set raw value as both value and coded_value -> emitted exactly, no quoting
+        try:
+            resp.cookies[name].set(name, value, value)
+        except Exception:
+            resp.cookies[name] = value  # fallback (will quote, but better than drop)
+        if "path" in attrs:
+            resp.cookies[name]["path"] = attrs["path"]
+        if "expires" in attrs:
+            resp.cookies[name]["expires"] = attrs["expires"]
+        if "max-age" in attrs:
+            resp.cookies[name]["max-age"] = attrs["max-age"]
+        if "samesite" in attrs:
+            resp.cookies[name]["samesite"] = attrs["samesite"]
+        if attrs.get("secure"):
+            resp.cookies[name]["secure"] = True
+        if attrs.get("httponly"):
+            resp.cookies[name]["httponly"] = True
     resp["X-Robots-Tag"] = "noindex"
     resp.xframe_options_exempt = True
     return resp

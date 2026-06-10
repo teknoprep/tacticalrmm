@@ -5,6 +5,7 @@ from knox import views as knox_views
 from accounts.views import CheckCredsV2, LoginViewV2
 from agents.consumers import AgentTerminalConsumer, CommandStreamConsumer
 from agents.web_proxy import agent_web_proxy
+from agents.ws_proxy import ProxyWebSocketConsumer
 
 # from agents.consumers import SendCMD
 from core.consumers import DashInfo, TerminalConsumer
@@ -89,6 +90,11 @@ ws_urlpatterns = [
     # path("ws/sendcmd/", SendCMD.as_asgi()),
     path("ws/agent/<str:agent_id>/cmd/", CommandStreamConsumer.as_asgi()),
     path("ws/agent/<str:agent_id>/term/", AgentTerminalConsumer.as_asgi()),
+    # Remote Web Proxy WebSocket (e.g. Proxmox/PBS consoles) - same /agentproxy/ path
+    re_path(
+        r"^agentproxy/(?P<token>[^/]+)/(?P<path>.*)$",
+        ProxyWebSocketConsumer.as_asgi(),
+    ),
 ]
 
 if not (
