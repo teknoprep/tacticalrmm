@@ -344,6 +344,9 @@ _ROOT_REL_RE = re.compile(
     re.IGNORECASE,
 )
 _CSS_URL_RE = re.compile(rb'''(url\(\s*["']?)/(?!/)''', re.IGNORECASE)
+# ES-module specifiers: import X from "/path", import "/path", import("/path").
+# These ignore <base> and resolve against the origin root, so rewrite them too.
+_MODULE_IMPORT_RE = re.compile(rb'''((?:\bfrom|\bimport)\s*\(?\s*["'])/(?!/)''')
 
 
 def _client_shim(token: str) -> bytes:
@@ -413,6 +416,8 @@ def rewrite_body(body: bytes, content_type: str, token: str) -> bytes:
     if "text/html" in ct:
         # static root-relative attribute URLs: ="/x" -> "/agentproxy/<token>/x"
         body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
+        # root-absolute ES-module imports: from "/x" -> from "/agentproxy/<token>/x"
+        body = _MODULE_IMPORT_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
         # inject runtime shim (first, so it patches before app code runs) + <base>
         m = re.search(rb"<head[^>]*>", body, re.IGNORECASE)
         inject = _client_shim(token) + b'<base href="' + prefix + b'">'
