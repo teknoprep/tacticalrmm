@@ -34,6 +34,7 @@ urlpatterns = [
     path("logoutall/", knox_views.LogoutAllView.as_view()),
     path("clients/", include("clients.urls")),
     path("agents/", include("agents.urls")),
+    path("netdevices/", include("netdevices.urls")),
     path("checks/", include("checks.urls")),
     path("services/", include("services.urls")),
     path("winupdate/", include("winupdate.urls")),

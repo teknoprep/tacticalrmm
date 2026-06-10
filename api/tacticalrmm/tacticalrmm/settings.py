@@ -223,6 +223,7 @@ INSTALLED_APPS = [
     "apiv4",
     "clients",
     "agents",
+    "netdevices",
     "checks",
     "services",
     "winupdate",
