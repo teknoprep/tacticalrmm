@@ -3,7 +3,7 @@ from django.urls import include, path, re_path, register_converter
 from knox import views as knox_views
 
 from accounts.views import CheckCredsV2, LoginViewV2
-from agents.consumers import CommandStreamConsumer
+from agents.consumers import AgentTerminalConsumer, CommandStreamConsumer
 from agents.web_proxy import agent_web_proxy
 
 # from agents.consumers import SendCMD
@@ -87,6 +87,7 @@ ws_urlpatterns = [
     path("ws/dashinfo/", DashInfo.as_asgi()),
     # path("ws/sendcmd/", SendCMD.as_asgi()),
     path("ws/agent/<str:agent_id>/cmd/", CommandStreamConsumer.as_asgi()),
+    path("ws/agent/<str:agent_id>/term/", AgentTerminalConsumer.as_asgi()),
 ]
 
 if not (
