@@ -419,6 +419,69 @@ class AgentMeshCentral(APIView):
         return Response(f"Repaired mesh agent on {agent.hostname}")
 
 
+class AgentWebProxy(APIView):
+    """Create a short-lived Remote Web Proxy session that tunnels HTTP/HTTPS
+    to a device on the agent's LAN (e.g. a firewall admin UI) through the agent."""
+
+    permission_classes = [IsAuthenticated, MeshPerms]
+
+    def post(self, request, agent_id):
+        from agents.web_proxy import create_session
+
+        agent = get_object_or_404(
+            Agent.objects.select_related("site__client").defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
+        if agent.hex_mesh_node_id == "error":
+            return notify_error("Missing mesh node id")
+
+        protocol = str(request.data.get("protocol", "https")).lower()
+        if protocol not in ("http", "https"):
+            return notify_error("protocol must be http or https")
+
+        addr = str(request.data.get("address", "")).strip()
+        if not addr:
+            return notify_error("address is required")
+
+        try:
+            port = int(request.data.get("port"))
+            if not (0 < port < 65536):
+                raise ValueError
+        except (TypeError, ValueError):
+            return notify_error("invalid port")
+
+        token = create_session(
+            agent_id=agent.agent_id,
+            hex_node_id=agent.hex_mesh_node_id,
+            protocol=protocol,
+            addr=addr,
+            port=port,
+            username=request.user.username,
+            hostname=agent.hostname,
+        )
+
+        AuditLog.audit_mesh_session(
+            username=request.user.username,
+            agent=agent,
+            debug_info={
+                "ip": request._client_ip,
+                "feature": "web_proxy",
+                "target": f"{protocol}://{addr}:{port}",
+            },
+        )
+
+        return Response(
+            {
+                "url": f"/agentproxy/{token}/",
+                "token": token,
+                "hostname": agent.hostname,
+                "client": agent.client.name,
+                "site": agent.site.name,
+                "target": f"{protocol}://{addr}:{port}",
+            }
+        )
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, AgentPerms])
 def get_agent_versions(request):

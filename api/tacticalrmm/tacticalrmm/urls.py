@@ -1,9 +1,10 @@
 from django.conf import settings
-from django.urls import include, path, register_converter
+from django.urls import include, path, re_path, register_converter
 from knox import views as knox_views
 
 from accounts.views import CheckCredsV2, LoginViewV2
 from agents.consumers import CommandStreamConsumer
+from agents.web_proxy import agent_web_proxy
 
 # from agents.consumers import SendCMD
 from core.consumers import DashInfo, TerminalConsumer
@@ -25,6 +26,8 @@ register_converter(AgentIDConverter, "agent")
 
 urlpatterns = [
     path("", home),
+    # Remote Web Proxy (served by the ASGI server via nginx /agentproxy/ route)
+    re_path(r"^agentproxy/(?P<token>[^/]+)/(?P<path>.*)$", agent_web_proxy),
     path("v2/checkcreds/", CheckCredsV2.as_view()),
     path("v2/login/", LoginViewV2.as_view()),
     path("logout/", knox_views.LogoutView.as_view()),
