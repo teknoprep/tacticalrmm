@@ -106,6 +106,16 @@ class TunnelStream:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE  # device certs are self-signed
+            # LAN appliances (printer/MFP web UIs like Toshiba TopAccess, IPMI/
+            # iLO/iDRAC, older firewalls/switches) commonly only offer legacy TLS
+            # (1.0/1.1) and weak ciphers or SHA1 certs that modern OpenSSL
+            # defaults reject. We already don't verify the cert (self-signed) and
+            # the link rides the agent's trusted LAN, so lower the TLS floor and
+            # cipher security level instead of failing the handshake outright.
+            with contextlib.suppress(Exception):
+                ctx.minimum_version = ssl.TLSVersion.TLSv1
+            with contextlib.suppress(Exception):
+                ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
             self._inbio, self._outbio = ssl.MemoryBIO(), ssl.MemoryBIO()
             self._tls = ctx.wrap_bio(
                 self._inbio, self._outbio, server_hostname=server_hostname or "device"
@@ -147,7 +157,10 @@ class TunnelStream:
                 await self._do_handshake()
             except TunnelError:
                 raise
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    f"web proxy TLS handshake to {addr}:{port} failed: {e!r}"
+                )
                 with contextlib.suppress(Exception):
                     await ws.close()
                 raise TunnelError(
@@ -362,6 +375,11 @@ def _client_shim(token: str) -> bytes:
         "function fix(u){try{if(typeof u!=='string')return u;"
         "if(u.slice(0,P.length+1)===P+'/')return u;"  # already prefixed
         "if(u.charAt(0)==='/'&&u.charAt(1)!=='/')return P+u;"  # root-relative
+        # absolute URL to our own origin (apps that build protocol+'//'+host+'/path',
+        # e.g. Toshiba TopAccess gblTAUrl) -> insert the proxy prefix
+        "var o=location.origin;"
+        "if(u.slice(0,o.length+1)===o+'/'){var r=u.slice(o.length);"
+        "if(r.slice(0,P.length+1)!==P+'/')return o+P+r;return u;}"
         "return u;}catch(e){return u;}}"
         "var O=XMLHttpRequest.prototype.open;"
         "XMLHttpRequest.prototype.open=function(){"
@@ -369,6 +387,15 @@ def _client_shim(token: str) -> bytes:
         "return O.apply(this,arguments);};"
         "if(window.fetch){var F=window.fetch;window.fetch=function(i,n){"
         "try{if(typeof i==='string'){i=fix(i);}}catch(e){}return F.call(this,i,n);};}"
+        # Some appliance UIs (TopAccess) inject <script src=...>/<link href=...>
+        # via document.write using absolute same-origin URLs that bypass <base>.
+        # Rewrite src/href attributes in written markup through fix().
+        "function fixhtml(s){try{return (''+s).replace("
+        "/((?:src|href)\\s*=\\s*[\"'])([^\"']+)([\"'])/gi,"
+        "function(m,a,u,b){return a+fix(u)+b;});}catch(e){return s;}}"
+        "var DW=document.write,DWL=document.writeln;"
+        "document.write=function(){return DW.apply(document,[].slice.call(arguments).map(fixhtml));};"
+        "document.writeln=function(){return DWL.apply(document,[].slice.call(arguments).map(fixhtml));};"
         # WebSocket URLs are absolute (ws(s)://host/path); if they point at our own
         # host, re-route the path through the proxy prefix.
         "function fixws(u){try{if(typeof u!=='string')return u;"
@@ -380,6 +407,12 @@ def _client_shim(token: str) -> bytes:
         "try{u=fixws(u);}catch(e){}return pr?new W(u,pr):new W(u);};"
         "NW.prototype=W.prototype;NW.CONNECTING=W.CONNECTING;NW.OPEN=W.OPEN;"
         "NW.CLOSING=W.CLOSING;NW.CLOSED=W.CLOSED;window.WebSocket=NW;}"
+        # window.open() child windows/popups (e.g. Toshiba TopAccess opens
+        # externalWindow/firstLevelWindow). Route their root-relative/absolute
+        # same-origin URLs back through the proxy prefix so they aren't blank.
+        "if(window.open){var OP=window.open;window.open=function(u,n,f){"
+        "try{if(typeof u==='string'&&u){u=fix(u);}}catch(e){}"
+        "return OP.call(window,u,n,f);};}"
         "})();"
     )
     return b"<script>" + js.encode() + b"</script>"
@@ -409,11 +442,18 @@ def _parse_set_cookie(header: str):
     return name.strip(), value, attrs
 
 
-def rewrite_body(body: bytes, content_type: str, token: str) -> bytes:
+def rewrite_body(
+    body: bytes, content_type: str, token: str, inject_shim: bool = True
+) -> bytes:
     ct = (content_type or "").lower()
     prefix = _prefix(token).encode()
 
-    if "text/html" in ct:
+    # Only top-level document/iframe navigations get the HTML shim + <base>.
+    # XHR/fetch responses are often text/html too (e.g. Toshiba TopAccess
+    # contentwebserver); injecting <script>/<base> into those corrupts the
+    # payload the app's AJAX handler parses, which makes it throw and call
+    # fnClearAllSessionCookiesAndRedirect() in a loop. Leave them byte-exact.
+    if "text/html" in ct and inject_shim:
         # static root-relative attribute URLs: ="/x" -> "/agentproxy/<token>/x"
         body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
         # root-absolute ES-module imports: from "/x" -> from "/agentproxy/<token>/x"
@@ -527,7 +567,17 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             continue
         out_headers[hk.decode("latin-1")] = v
 
-    resp_body = rewrite_body(resp_body, content_type, token)
+    # Decide whether this response is a document/iframe navigation (inject the
+    # client shim) or an XHR/fetch/sub-resource (leave body untouched). Prefer
+    # the Fetch Metadata header; fall back to X-Requested-With for old clients.
+    _sfd = request.headers.get("Sec-Fetch-Dest", "").lower()
+    if _sfd:
+        _inject = _sfd in ("document", "iframe", "frame", "object", "embed")
+    else:
+        _inject = (
+            request.headers.get("X-Requested-With", "").lower() != "xmlhttprequest"
+        )
+    resp_body = rewrite_body(resp_body, content_type, token, inject_shim=_inject)
 
     resp = HttpResponse(resp_body, status=status, content_type=content_type)
     for hk, hv in out_headers.items():
@@ -549,8 +599,16 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             resp.cookies[name].set(name, value, value)
         except Exception:
             resp.cookies[name] = value  # fallback (will quote, but better than drop)
-        if "path" in attrs:
-            resp.cookies[name]["path"] = attrs["path"]
+        # Scope cookies to THIS session's path so devices proxied on the same
+        # origin don't clobber each other. Multiple appliances (e.g. two Toshiba
+        # TopAccess printers) all set `Session` at Path=/, which overwrite each
+        # other on rmm.blueuc.com and make the device report INVALID_SESSION_ID.
+        # __Host-/__Secure- prefixed cookies must keep Path=/ to stay valid, so
+        # leave those as-is.
+        if name[:7].lower() == "__host-" or name[:9].lower() == "__secure-":
+            resp.cookies[name]["path"] = "/"
+        else:
+            resp.cookies[name]["path"] = _prefix(token)
         if "expires" in attrs:
             resp.cookies[name]["expires"] = attrs["expires"]
         if "max-age" in attrs:
