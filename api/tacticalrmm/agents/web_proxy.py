@@ -333,6 +333,43 @@ def _prefix(token: str) -> str:
     return f"/agentproxy/{token}/"
 
 
+def _service_worker_js() -> bytes:
+    """Client-side request interceptor. Registered by the injected runtime at
+    scope '/' so it can catch requests that escape the /agentproxy/<token>/
+    prefix (root-relative or absolute same-origin URLs the app builds in JS, CSS
+    url(), <img src>, etc. -- everything the network sees, not just hooked APIs).
+
+    SAFETY: it only re-prefixes a request when that request ORIGINATES from a
+    proxied page (its referrer is under /agentproxy/<token>/). Every other
+    request -- i.e. the whole TacticalRMM app -- is left completely untouched.
+    """
+    js = r"""
+var PFX = /\/agentproxy\/([A-Za-z0-9_\-]+)(?:\/|$)/;
+self.addEventListener('install', function(e){ self.skipWaiting(); });
+self.addEventListener('activate', function(e){ e.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', function(event){
+  var req = event.request;
+  var url;
+  try { url = new URL(req.url); } catch (e) { return; }
+  if (url.origin !== self.location.origin) return;       // cross-origin: leave
+  if (PFX.test(url.pathname)) return;                    // already prefixed: normal
+  if (req.mode === 'navigate') return;                   // don't hijack top-level loads
+  var ref = req.referrer || '';
+  var m = ref.match(PFX);
+  if (!m) return;                                        // not from a proxied page -> passthrough (RMM app)
+  var target = url.origin + '/agentproxy/' + m[1] + url.pathname + url.search;
+  event.respondWith((async function(){
+    try {
+      var init = { method: req.method, headers: req.headers, credentials: 'include', redirect: 'follow' };
+      if (req.method !== 'GET' && req.method !== 'HEAD') { init.body = await req.clone().arrayBuffer(); }
+      return await fetch(target, init);
+    } catch (e) { try { return await fetch(req); } catch (e2) { return new Response('', {status: 502}); } }
+  })());
+});
+"""
+    return js.encode()
+
+
 def rewrite_location(value: str, sess: dict, token: str) -> str:
     base = _prefix(token)
     # absolute URL pointing back at the device -> route through proxy
@@ -413,6 +450,15 @@ def _client_shim(token: str) -> bytes:
         "if(window.open){var OP=window.open;window.open=function(u,n,f){"
         "try{if(typeof u==='string'&&u){u=fix(u);}}catch(e){}"
         "return OP.call(window,u,n,f);};}"
+        # Register the root-scoped request-interception service worker. It catches
+        # every escaping sub-resource request generically (img/css/script/etc.),
+        # not just the JS APIs hooked above. Reload once it takes control so the
+        # initial page's resources go through it too.
+        "try{if('serviceWorker' in navigator){"
+        "navigator.serviceWorker.register(P+'/__apxsw.js',{scope:'/'}).then(function(reg){"
+        "if(!navigator.serviceWorker.controller){"
+        "navigator.serviceWorker.addEventListener('controllerchange',function(){location.reload();});}"
+        "}).catch(function(){});}}catch(e){}"
         "})();"
     )
     return b"<script>" + js.encode() + b"</script>"
@@ -488,6 +534,17 @@ async def agent_web_proxy(request, token: str, path: str = ""):
     sess = await sync_to_async(get_session)(token)
     if not sess:
         r = HttpResponse("Proxy session expired or invalid.", status=410)
+        r.xframe_options_exempt = True
+        return r
+
+    # Serve the request-interception service worker (registered by the injected
+    # runtime). Served by the proxy itself, NOT tunneled to the device.
+    if path == "__apxsw.js":
+        r = HttpResponse(
+            _service_worker_js(), content_type="application/javascript"
+        )
+        r["Service-Worker-Allowed"] = "/"
+        r["Cache-Control"] = "no-cache"
         r.xframe_options_exempt = True
         return r
 
