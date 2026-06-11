@@ -339,12 +339,16 @@ class WebVNC(APIView):
         uri = get_mesh_ws_url()
         ms = MeshSync(uri)
 
+        # Optional ?addr=<ip> relays VNC to a device on the agent's LAN (through
+        # the agent) instead of the agent's own VNC -- reuses MeshCentral's
+        # bundled noVNC viewer + meshrelay, so no extra client/deps are needed.
+        tcpaddr = request.query_params.get("addr") or None
         payload = {
             "action": "getcookie",
             "name": None,
             "nodeid": f"node//{agent.hex_mesh_node_id}",
             "tag": "novnc",
-            "tcpaddr": None,
+            "tcpaddr": tcpaddr,
             "tcpport": int(port),
         }
         cookie_ret = ms.mesh_action(payload=payload, wait=True)
@@ -356,7 +360,7 @@ class WebVNC(APIView):
             + "%2F"
             + "meshrelay.ashx%3Fauth%3D"
             + cookie_ret["cookie"]  # type: ignore
-            + f"&show_dot=1&l=en&name={agent.hostname}"
+            + f"&show_dot=1&l=en&name={tcpaddr or agent.hostname}"
         )
 
         ret = {
