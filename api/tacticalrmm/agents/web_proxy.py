@@ -89,6 +89,28 @@ def get_session(token: str) -> Optional[dict[str, Any]]:
     return cache.get(f"{SESSION_PREFIX}{token}")
 
 
+# Per-session set of cookie names the device itself has set. We only forward
+# these back to the device, so RMM's own cookies and other proxied devices'
+# cookies are never sent to it (they bloat the header -> small embedded web
+# servers like Ricoh reject it with 400, and it's an isolation/security win).
+def _cookie_allow_key(token: str) -> str:
+    return f"webproxyck:{token}"
+
+
+def get_allowed_cookie_names(token: str) -> set:
+    return cache.get(_cookie_allow_key(token)) or set()
+
+
+def add_allowed_cookie_names(token: str, names) -> None:
+    names = {n for n in names if n}
+    if not names:
+        return
+    cur = cache.get(_cookie_allow_key(token)) or set()
+    new = cur | names
+    if new != cur:
+        cache.set(_cookie_allow_key(token), new, SESSION_TTL)
+
+
 # ---------------------------------------------------------------------------
 # Tunnel stream (raw TCP over MeshCentral relay, with optional TLS)
 # ---------------------------------------------------------------------------
@@ -353,11 +375,21 @@ self.addEventListener('fetch', function(event){
   try { url = new URL(req.url); } catch (e) { return; }
   if (url.origin !== self.location.origin) return;       // cross-origin: leave
   if (PFX.test(url.pathname)) return;                    // already prefixed: normal
-  if (req.mode === 'navigate') return;                   // don't hijack top-level loads
   var ref = req.referrer || '';
   var m = ref.match(PFX);
   if (!m) return;                                        // not from a proxied page -> passthrough (RMM app)
   var target = url.origin + '/agentproxy/' + m[1] + url.pathname + url.search;
+  if (req.mode === 'navigate') {
+    // A link/form GET inside a proxied page navigated out of the prefix (e.g.
+    // Ricoh login -> /web/.../authForm.cgi). Redirect to the prefixed URL so
+    // the address bar keeps the prefix and relative resolution stays correct.
+    // POST navigations are left alone (a redirect would drop the form body;
+    // static form actions are already prefixed by the body rewrite).
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      event.respondWith(Response.redirect(target, 302));
+    }
+    return;
+  }
   event.respondWith((async function(){
     try {
       var init = { method: req.method, headers: req.headers, credentials: 'include', redirect: 'follow' };
@@ -504,16 +536,16 @@ def rewrite_body(
         body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
         # root-absolute ES-module imports: from "/x" -> from "/agentproxy/<token>/x"
         body = _MODULE_IMPORT_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
-        # inject runtime shim (first, so it patches before app code runs). Only
-        # add our <base> when the page doesn't already declare one. Apps served
-        # under a sub-path (e.g. TrueNAS at /ui/) ship their own <base href="/ui/">
-        # which _ROOT_REL_RE has already rewritten to the proxy prefix; injecting
-        # our own prefix-root <base> ahead of it wins and breaks their asset paths.
+        # Inject the runtime shim only. We deliberately do NOT add our own <base>:
+        # relative URLs resolve correctly against the document's own path by
+        # default (works for both root and sub-path documents, e.g. Ricoh's
+        # /web/.../mainFrame.cgi referencing header.cgi), and root-relative/
+        # absolute URLs are handled by the body rewrite + service worker. Forcing
+        # a prefix-root <base> broke relative URLs in sub-path documents
+        # (e.g. Ricoh frames -> /header.cgi 404). A device's OWN <base> is left
+        # in place (already rewritten to the prefix by _ROOT_REL_RE).
         m = re.search(rb"<head[^>]*>", body, re.IGNORECASE)
-        if re.search(rb"<base\b", body, re.IGNORECASE):
-            inject = _client_shim(token)
-        else:
-            inject = _client_shim(token) + b'<base href="' + prefix + b'">'
+        inject = _client_shim(token)
         if m:
             body = body[: m.end()] + inject + body[m.end():]
         else:
@@ -567,6 +599,7 @@ async def agent_web_proxy(request, token: str, path: str = ""):
     if (use_tls and sess["port"] != 443) or (not use_tls and sess["port"] != 80):
         host_hdr = f"{sess['addr']}:{sess['port']}"
 
+    allowed_cookies = await sync_to_async(get_allowed_cookie_names)(token)
     up_headers: list[tuple[str, str]] = [("host", host_hdr)]
     for key, val in request.headers.items():
         lk = key.lower()
@@ -574,6 +607,16 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             continue
         if lk == "referer" or lk == "origin":
             continue  # avoid leaking the proxy origin to the device
+        if lk == "cookie":
+            # only forward cookies this device set (drop RMM's + other devices')
+            kept = [
+                part.strip()
+                for part in val.split(";")
+                if part.strip().split("=", 1)[0].strip() in allowed_cookies
+            ]
+            if kept:
+                up_headers.append(("cookie", "; ".join(kept)))
+            continue
         up_headers.append((lk, val))
     up_headers.append(("accept-encoding", "identity"))  # no compression -> easy rewrite
     up_headers.append(("connection", "close"))
@@ -653,10 +696,12 @@ async def agent_web_proxy(request, token: str, path: str = ""):
     # corrupt tickets (e.g. Proxmox/PBS __Host-PBSAuthCookie -> 401 right after
     # login). We only strip Domain; Path=/ and Secure are preserved so __Host-*
     # prefixed cookies remain valid.
+    _set_cookie_names: list[str] = []
     for c in set_cookies:
         name, value, attrs = _parse_set_cookie(c)
         if not name:
             continue
+        _set_cookie_names.append(name)
         resp.cookies[name] = ""
         # set raw value as both value and coded_value -> emitted exactly, no quoting
         try:
@@ -683,6 +728,8 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             resp.cookies[name]["secure"] = True
         if attrs.get("httponly"):
             resp.cookies[name]["httponly"] = True
+    if _set_cookie_names:
+        await sync_to_async(add_allowed_cookie_names)(token, _set_cookie_names)
     resp["X-Robots-Tag"] = "noindex"
     resp.xframe_options_exempt = True
     return resp
