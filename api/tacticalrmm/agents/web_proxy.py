@@ -458,9 +458,16 @@ def rewrite_body(
         body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
         # root-absolute ES-module imports: from "/x" -> from "/agentproxy/<token>/x"
         body = _MODULE_IMPORT_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
-        # inject runtime shim (first, so it patches before app code runs) + <base>
+        # inject runtime shim (first, so it patches before app code runs). Only
+        # add our <base> when the page doesn't already declare one. Apps served
+        # under a sub-path (e.g. TrueNAS at /ui/) ship their own <base href="/ui/">
+        # which _ROOT_REL_RE has already rewritten to the proxy prefix; injecting
+        # our own prefix-root <base> ahead of it wins and breaks their asset paths.
         m = re.search(rb"<head[^>]*>", body, re.IGNORECASE)
-        inject = _client_shim(token) + b'<base href="' + prefix + b'">'
+        if re.search(rb"<base\b", body, re.IGNORECASE):
+            inject = _client_shim(token)
+        else:
+            inject = _client_shim(token) + b'<base href="' + prefix + b'">'
         if m:
             body = body[: m.end()] + inject + body[m.end():]
         else:
