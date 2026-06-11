@@ -96,21 +96,41 @@ class NetworkDevice(models.Model):
         agents = self.candidate_agents()
         return agents[0] if agents else None
 
-    def resolve_reachable_agent(self, max_tries=5, timeout=8):
-        """Return (agent, tried_hostnames). Tests candidates in order and returns
-        the first that can actually reach the device. Falls back to the first
-        online candidate if none pass the reachability probe."""
+    def resolve_reachable_agent(self, max_tries=5, timeout=5):
+        """Return (agent, tried_hostnames). Probes candidate agents concurrently
+        and returns the first that can actually reach the device. A successful
+        agent is cached briefly so repeat connects are instant. Falls back to the
+        first online candidate if none pass the reachability probe."""
+        from django.core.cache import cache
+
         from agents.web_proxy import agent_can_reach
 
-        candidates = self.candidate_agents()
-        tried = []
-        for agent in candidates[:max_tries]:
-            if agent.hex_mesh_node_id == "error":
-                continue
-            tried.append(agent.hostname)
+        candidates = [
+            a for a in self.candidate_agents() if a.hex_mesh_node_id != "error"
+        ]
+        if not candidates:
+            return None, []
+
+        candidates = candidates[:max_tries]
+        tried = [a.hostname for a in candidates]
+        by_id = {a.agent_id: a for a in candidates}
+
+        # 1) reuse the last agent we confirmed could reach this device (if it's
+        #    still an online candidate) -> skip probing entirely.
+        ck = f"netdev_reach:{self.pk}:{self.protocol}:{self.ip_address}:{self.port}"
+        cached_id = cache.get(ck)
+        if cached_id and cached_id in by_id:
+            return by_id[cached_id], tried
+
+        # 2) probe candidates one at a time (the preferred/first agent normally
+        #    answers in well under a second). Sequential on purpose: firing many
+        #    simultaneous tunnels at the MeshCentral relay causes contention and
+        #    is actually slower. A short timeout bounds the cost of a dead agent.
+        for agent in candidates:
             if agent_can_reach(
                 agent.hex_mesh_node_id, self.ip_address, self.port,
                 protocol=self.protocol, timeout=timeout,
             ):
+                cache.set(ck, agent.agent_id, 300)  # remember good agent for 5 min
                 return agent, tried
         return (candidates[0] if candidates else None), tried
