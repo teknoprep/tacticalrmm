@@ -101,6 +101,21 @@ def get_allowed_cookie_names(token: str) -> set:
     return cache.get(_cookie_allow_key(token)) or set()
 
 
+def rmm_cookie_names() -> set:
+    """RMM's own cookies (lowercased) that must never be forwarded to a proxied
+    device -- forwarding them would leak the RMM session/CSRF token and bloat the
+    request header. Everything else the browser sends on the /agentproxy/<token>/
+    path is treated as belonging to the device and forwarded."""
+    from django.conf import settings
+
+    return {
+        getattr(settings, "SESSION_COOKIE_NAME", "sessionid").lower(),
+        getattr(settings, "CSRF_COOKIE_NAME", "csrftoken").lower(),
+        getattr(settings, "LANGUAGE_COOKIE_NAME", "django_language").lower(),
+        "messages",
+    }
+
+
 def add_allowed_cookie_names(token: str, names) -> None:
     names = {n for n in names if n}
     if not names:
@@ -600,6 +615,7 @@ async def agent_web_proxy(request, token: str, path: str = ""):
         host_hdr = f"{sess['addr']}:{sess['port']}"
 
     allowed_cookies = await sync_to_async(get_allowed_cookie_names)(token)
+    rmm_cookies = rmm_cookie_names()
     up_headers: list[tuple[str, str]] = [("host", host_hdr)]
     for key, val in request.headers.items():
         lk = key.lower()
@@ -608,12 +624,21 @@ async def agent_web_proxy(request, token: str, path: str = ""):
         if lk == "referer" or lk == "origin":
             continue  # avoid leaking the proxy origin to the device
         if lk == "cookie":
-            # only forward cookies this device set (drop RMM's + other devices')
-            kept = [
-                part.strip()
-                for part in val.split(";")
-                if part.strip().split("=", 1)[0].strip() in allowed_cookies
-            ]
+            # Forward the device's cookies but drop RMM's own session/CSRF
+            # cookies (we share the rmm.blueuc.com origin). Use a DENY-list of
+            # RMM cookie names rather than an allow-list of Set-Cookie-recorded
+            # names: some apps (Proxmox/PBS) set their auth cookie client-side
+            # via document.cookie, so it never appears in a Set-Cookie header.
+            # An allow-list strips it and breaks login (every API call -> 401).
+            kept = []
+            for part in val.split(";"):
+                part = part.strip()
+                if not part:
+                    continue
+                cname = part.split("=", 1)[0].strip()
+                if cname.lower() in rmm_cookies and cname not in allowed_cookies:
+                    continue  # RMM's own cookie -> never forward to the device
+                kept.append(part)
             if kept:
                 up_headers.append(("cookie", "; ".join(kept)))
             continue

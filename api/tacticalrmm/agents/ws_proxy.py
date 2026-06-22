@@ -158,7 +158,28 @@ class ProxyWebSocketConsumer(AsyncWebsocketConsumer):
             host_hdr = f"{sess['addr']}:{sess['port']}"
 
         subprotocols = headers.get("sec-websocket-protocol")
+        # Forward the device's cookies (incl. JS-set ones like Proxmox's
+        # PVEAuthCookie) but strip RMM's own session/CSRF cookies -- same
+        # deny-list policy as the HTTP proxy.
         cookie = headers.get("cookie")
+        if cookie:
+            from agents.web_proxy import (
+                get_allowed_cookie_names,
+                rmm_cookie_names,
+            )
+
+            allowed = await sync_to_async(get_allowed_cookie_names)(token)
+            rmm_cookies = rmm_cookie_names()
+            kept = []
+            for part in cookie.split(";"):
+                part = part.strip()
+                if not part:
+                    continue
+                cname = part.split("=", 1)[0].strip()
+                if cname.lower() in rmm_cookies and cname not in allowed:
+                    continue
+                kept.append(part)
+            cookie = "; ".join(kept)
         key = base64.b64encode(os.urandom(16)).decode()
 
         req = [
