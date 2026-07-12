@@ -1880,6 +1880,7 @@ class PiMultiSession(APIView):
                 "base_url": core.ai_helpdesk_api_base_url or "",
                 "api_key": core.ai_helpdesk_api_key or "",
             },
+            "helpdesk_code": core.ai_helpdesk_code or "",
         }
 
         token = create_pi_session(data=blob)
@@ -2040,6 +2041,7 @@ class AgentPiSession(APIView):
                 "base_url": core.ai_helpdesk_api_base_url or "",
                 "api_key": core.ai_helpdesk_api_key or "",
             },
+            "helpdesk_code": core.ai_helpdesk_code or "",
         }
 
         token = create_pi_session(data=blob)

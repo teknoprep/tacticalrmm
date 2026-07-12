@@ -808,6 +808,7 @@ def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id):
             "base_url": get_core_settings().ai_helpdesk_api_base_url or "",
             "api_key": get_core_settings().ai_helpdesk_api_key or "",
         },
+        "helpdesk_code": get_core_settings().ai_helpdesk_code or "",
     }
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)
@@ -855,6 +856,7 @@ def _run_report_on_bridge(*, model, prompt, run_id):
             "base_url": core.ai_helpdesk_api_base_url or "",
             "api_key": core.ai_helpdesk_api_key or "",
         },
+        "helpdesk_code": core.ai_helpdesk_code or "",
     }
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)

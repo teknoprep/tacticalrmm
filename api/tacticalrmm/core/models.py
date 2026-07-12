@@ -131,6 +131,11 @@ class CoreSettings(BaseAuditModel):
     # real key server-side (the key is never placed in the AI's context).
     ai_helpdesk_api_base_url = models.CharField(max_length=255, blank=True, default="")
     ai_helpdesk_api_key = models.CharField(max_length=255, blank=True, default="")
+    # Admin-authored JS integration ("helpdesk.js") defining deterministic
+    # operations (create_ticket, reply, note, submit_report, ...) for ANY
+    # ticketing system. Runs on the bridge; the AI calls the operations by name.
+    # This is the "precise code" companion to the natural-language policy above.
+    ai_helpdesk_code = models.TextField(blank=True, default="")
     enable_server_scripts = models.BooleanField(default=True)
     enable_server_webterminal = models.BooleanField(default=False)
     notify_on_info_alerts = models.BooleanField(default=False)
