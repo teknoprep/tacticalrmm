@@ -869,6 +869,44 @@ class AIAvailableModels(APIView):
             return Response({"models": [], "error": str(e)})
 
 
+class HelpdeskAssist(APIView):
+    """AI helper that interviews the admin and drafts the helpdesk POLICY +
+    helpdesk.js code. Stateless; the client replays the conversation each call."""
+
+    permission_classes = [IsAuthenticated, CoreSettingsPerms]
+
+    def post(self, request):
+        import requests as _requests
+        from django.conf import settings as dj_settings
+        from core.tasks import _resolve_ai_model
+
+        core = get_core_settings()
+        model = _resolve_ai_model(None)
+        if not model:
+            return Response(
+                {
+                    "reply": "No enabled AI model / default is configured. Add a provider "
+                    "and model (and mark one default) above first."
+                }
+            )
+        payload = {
+            "provider": model.provider.name,
+            "model_id": model.model_id,
+            "api_key": model.provider.api_key,
+            "thinking_level": model.thinking_level,
+            "base_url": core.ai_helpdesk_api_base_url or "",
+            "current_policy": core.ai_helpdesk_prompt or "",
+            "current_code": core.ai_helpdesk_code or "",
+            "messages": request.data.get("messages") or [],
+        }
+        bridge = getattr(dj_settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+        try:
+            r = _requests.post(f"{bridge}/pi/assist", json=payload, timeout=300)
+            return Response(r.json())
+        except Exception as e:
+            return Response({"reply": f"(bridge error: {e})"})
+
+
 class GetAddAIModel(APIView):
     permission_classes = [IsAuthenticated, CoreSettingsPerms]
 
