@@ -792,6 +792,7 @@ def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id):
         "last_logged_in_user": agent.last_logged_in_user,
         "description": agent.description,
         "agent_version": agent.version,
+        "device_url": (f"{settings.CORS_ORIGIN_WHITELIST[0]}/agents/{agent.agent_id}" if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""),
     }
     payload = {
         "agent_id": agent.agent_id,

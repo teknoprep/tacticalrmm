@@ -1747,6 +1747,7 @@ def _pi_device_facts(agent):
         "last_logged_in_user": agent.last_logged_in_user,
         "description": agent.description,
         "agent_version": agent.version,
+        "device_url": (f"{settings.CORS_ORIGIN_WHITELIST[0]}/agents/{agent.agent_id}" if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""),
         "monitoring_type": agent.monitoring_type,
         "last_seen": str(agent.last_seen) if agent.last_seen else None,
     }
@@ -2012,6 +2013,7 @@ class AgentPiSession(APIView):
             "last_logged_in_user": agent.last_logged_in_user,
             "description": agent.description,
             "agent_version": agent.version,
+            "device_url": (f"{settings.CORS_ORIGIN_WHITELIST[0]}/agents/{agent.agent_id}" if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""),
             "monitoring_type": agent.monitoring_type,
             "last_seen": str(agent.last_seen) if agent.last_seen else None,
         }
