@@ -934,7 +934,9 @@ class GetAddAITask(APIView):
             data["agent"] = agent.pk
         serializer = AITaskSerializer(data=data, partial=True)
         serializer.is_valid(raise_exception=True)
-        obj = serializer.save()
+        obj = serializer.save(
+            created_by=request.user.username, modified_by=request.user.username
+        )
         _apply_once_schedule(obj)
         return Response("ok")
 
@@ -979,7 +981,7 @@ class UpdateDeleteAITask(APIView):
             raise PermissionDenied()
         serializer = AITaskSerializer(instance=task, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        obj = serializer.save()
+        obj = serializer.save(modified_by=request.user.username)
         _apply_once_schedule(obj)
         return Response("ok")
 
@@ -1212,7 +1214,9 @@ class GetAddBulkAICommand(APIView):
 
         serializer = BulkAICommandSerializer(data=data, partial=True)
         serializer.is_valid(raise_exception=True)
-        cmd = serializer.save()
+        cmd = serializer.save(
+            created_by=request.user.username, modified_by=request.user.username
+        )
         if agent_ids:
             cmd.agents.set(Agent.objects.filter(agent_id__in=agent_ids))
         _arm_bulk_next_run(cmd)
@@ -1240,7 +1244,7 @@ class UpdateDeleteBulkAICommand(APIView):
         agent_ids = data.pop("agent_ids", None)
         serializer = BulkAICommandSerializer(instance=cmd, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
-        cmd = serializer.save()
+        cmd = serializer.save(modified_by=request.user.username)
         if agent_ids is not None:
             cmd.agents.set(Agent.objects.filter(agent_id__in=agent_ids))
         _arm_bulk_next_run(cmd)
