@@ -889,11 +889,17 @@ class HelpdeskAssist(APIView):
                     "and model (and mark one default) above first."
                 }
             )
+        trmm_base_url = (
+            dj_settings.CORS_ORIGIN_WHITELIST[0]
+            if getattr(dj_settings, "CORS_ORIGIN_WHITELIST", None)
+            else ""
+        )
         payload = {
             "provider": model.provider.name,
             "model_id": model.model_id,
             "api_key": model.provider.api_key,
             "thinking_level": model.thinking_level,
+            "trmm_base_url": trmm_base_url,
             "base_url": core.ai_helpdesk_api_base_url or "",
             "current_policy": core.ai_helpdesk_prompt or "",
             "current_code": core.ai_helpdesk_code or "",
