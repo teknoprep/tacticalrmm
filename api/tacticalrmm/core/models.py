@@ -787,6 +787,9 @@ class AITaskRun(models.Model):
         "agents.Agent", related_name="ai_runs", on_delete=models.CASCADE, null=True, blank=True
     )
     run_id = models.CharField(max_length=64, unique=True)  # correlates live progress
+    # groups all per-machine runs of a single bulk dispatch, so a finalizer can
+    # compile ONE combined report after the whole batch finishes.
+    batch_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     triggered_by = models.CharField(max_length=20, default="schedule")  # schedule|manual|bulk
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -843,6 +846,10 @@ class BulkAICommand(BaseAuditModel):
 
     name = models.CharField(max_length=255)
     prompt = models.TextField()
+    # Optional: when set, after the whole batch finishes a single finalizer run
+    # compiles ONE combined report (given every machine's result) following this
+    # instruction + the HELPDESK POLICY. Empty = no combined report.
+    report_prompt = models.TextField(blank=True, default="")
     model = models.ForeignKey(
         "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL
     )
