@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import nats
 from django.conf import settings
+from redis import from_url
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Prefetch
@@ -691,3 +692,679 @@ def scheduled_task_runner():
                 logger.debug(items)
 
     return items
+
+
+@app.task
+def dispatch_due_ai_tasks():
+    """Poller (runs every minute via celerybeat): queue any scheduled Pi AI
+    tasks that are due."""
+    from core.models import AITask, CoreSettings
+
+    core = CoreSettings.objects.first()
+    if not core or not core.ai_module_enabled:
+        return "ai module disabled"
+
+    now = djangotime.now()
+    for task in AITask.objects.filter(enabled=True).select_related("agent"):
+        due = False
+        if task.schedule_type == AITask.SCHEDULE_ONCE:
+            # legacy one-time: fires at its computed run_at
+            if task.run_at and now >= task.run_at:
+                due = True
+        elif task.run_mode == "now":
+            # on-demand one-shot; never auto-fired
+            continue
+        else:
+            # recurring (interval/daily/weekly/monthly) via next_run
+            if task.next_run is None:
+                task.next_run = _compute_task_next_run(task)
+                task.save(update_fields=["next_run"])
+                continue
+            if now >= task.next_run:
+                due = True
+        if due:
+            run_ai_task.delay(task.pk)
+    return "ok"
+
+
+def _recover_ai_run_from_redis(run_id):
+    """Read the bridge's live progress for a run from redis. Used to recover a
+    result when the HTTP call to the bridge times out but the run finished."""
+    import json as _json
+
+    from redis import from_url
+
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            raw = conn.get(f"pi_run:{run_id}")
+        if not raw:
+            return None
+        live = _json.loads(raw)
+    except Exception:
+        return None
+
+    lines = []
+    for ev in live.get("events", []):
+        t = ev.get("type")
+        if t == "tool_start":
+            lines.append(f"\u00bb {ev.get('tool')}({ev.get('args', '')})")
+        elif t == "tool_end":
+            lines.append(f"  {ev.get('result', '')}")
+        elif t == "text":
+            lines.append(ev.get("text", ""))
+    return {
+        "status": live.get("status"),
+        "summary": live.get("summary", ""),
+        "transcript": "\n".join(lines)[:50000],
+    }
+
+
+def _resolve_ai_model(model):
+    """Return the given model if usable, else the global default, else None."""
+    from core.models import AIModel
+
+    if model and model.enabled and model.provider.enabled:
+        return model
+    return (
+        AIModel.objects.filter(enabled=True, provider__enabled=True, is_default=True)
+        .select_related("provider")
+        .first()
+    )
+
+
+def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id):
+    """Execute one headless AI run on an agent via the bridge. Returns
+    (status, summary, output)."""
+    import requests as _requests
+
+    device_facts = {
+        "agent_id": agent.agent_id,
+        "hostname": agent.hostname,
+        "client": agent.client.name,
+        "site": agent.site.name,
+        "operating_system": agent.operating_system,
+        "plat": agent.plat,
+        "goarch": agent.goarch,
+        "public_ip": agent.public_ip,
+        "logged_in_username": agent.logged_in_username,
+        "last_logged_in_user": agent.last_logged_in_user,
+        "description": agent.description,
+        "agent_version": agent.version,
+    }
+    payload = {
+        "agent_id": agent.agent_id,
+        "device_facts": device_facts,
+        "provider": model.provider.name,
+        "model_id": model.model_id,
+        "api_key": model.provider.api_key,
+        "thinking_level": model.thinking_level,
+        "prompt": prompt,
+        "allow_mutating": allow_mutating,
+        "run_id": run_id,
+        "helpdesk_prompt": get_core_settings().ai_helpdesk_prompt or "",
+        "helpdesk_api": {
+            "base_url": get_core_settings().ai_helpdesk_api_base_url or "",
+            "api_key": get_core_settings().ai_helpdesk_api_key or "",
+        },
+    }
+    bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+    run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)
+    try:
+        r = _requests.post(f"{bridge}/pi/run", json=payload, timeout=(10, run_timeout))
+        data = r.json()
+        return (
+            data.get("status", "error"),
+            data.get("summary", ""),
+            data.get("transcript", ""),
+        )
+    except _requests.exceptions.Timeout:
+        recovered = _recover_ai_run_from_redis(run_id)
+        if recovered and recovered.get("status") not in (None, "running"):
+            return (
+                recovered["status"],
+                recovered.get("summary") or "(recovered after HTTP timeout)",
+                recovered.get("transcript") or "",
+            )
+        return (
+            "error",
+            f"Run exceeded PI_RUN_TIMEOUT ({run_timeout}s) and did not finish.",
+            "",
+        )
+    except Exception as e:
+        return ("error", f"Bridge error: {e}", "")
+
+
+def _ai_alert(agent, label, status, summary, alert_threshold):
+    """Create a custom TRMM alert if the verdict meets the threshold."""
+    from alerts.models import Alert
+    from tacticalrmm.constants import AlertType, AlertSeverity
+
+    if alert_threshold == "never":
+        return
+    severity = None
+    if status == "alert":
+        severity = AlertSeverity.ERROR
+    elif status == "warning" and alert_threshold == "warning":
+        severity = AlertSeverity.WARNING
+    elif status == "error":
+        severity = AlertSeverity.WARNING
+    if severity:
+        Alert.objects.create(
+            agent=agent,
+            alert_type=AlertType.CUSTOM,
+            severity=severity,
+            message=f"[Pi AI: {label}] {summary}"[:255],
+            hidden=False,
+        )
+
+
+@app.task
+def run_ai_task(task_id, triggered_by="schedule"):
+    """Run one scheduled Pi AI task headlessly via the pi-trmm-bridge, then
+    record the result and raise a TRMM alert if the verdict meets the
+    threshold."""
+    import uuid
+
+    from core.models import AITask, AITaskRun
+
+    try:
+        task = AITask.objects.select_related("agent", "model").get(pk=task_id)
+    except AITask.DoesNotExist:
+        return "not found"
+
+    # Stop-guard: emergency stop drains the backlog as no-ops. (The scheduler
+    # already gates on enabled; an explicit Run Now must still execute.)
+    if ai_killed():
+        return "skipped (stopped)"
+
+    run_id = uuid.uuid4().hex
+    run = AITaskRun.objects.create(
+        task=task, agent=task.agent, run_id=run_id,
+        triggered_by=triggered_by, status="running",
+    )
+
+    model = _resolve_ai_model(task.model)
+    if not model:
+        msg = "No enabled AI model / default configured."
+        AITask.objects.filter(pk=task.pk).update(
+            last_run=djangotime.now(), last_status="error", last_summary=msg
+        )
+        run.status = "error"; run.summary = msg; run.finished_at = djangotime.now(); run.save()
+        return "no model"
+
+    status, summary, output = _run_prompt_on_agent(
+        agent=task.agent, model=model, prompt=task.prompt,
+        allow_mutating=task.allow_mutating, run_id=run_id,
+    )
+
+    task.last_run = djangotime.now()
+    task.last_status = status
+    task.last_summary = summary[:5000] if summary else ""
+    task.last_output = output[:50000] if output else ""
+    fields = ["last_run", "last_status", "last_summary", "last_output"]
+    if task.schedule_type == AITask.SCHEDULE_ONCE or task.run_mode == "now":
+        # one-shot: disable after run (kept with results)
+        task.enabled = False
+        task.run_at = None
+        task.next_run = None
+        fields += ["enabled", "run_at", "next_run"]
+    else:
+        task.next_run = _compute_task_next_run(task)
+        fields += ["next_run"]
+    task.save(update_fields=fields)
+
+    run.status = status
+    run.summary = summary[:5000] if summary else ""
+    run.output = output[:50000] if output else ""
+    run.finished_at = djangotime.now()
+    run.save()
+
+    _ai_alert(task.agent, task.name, status, summary, task.alert_threshold)
+    return f"{status}"
+
+
+# ---- Bulk AI Command --------------------------------------------------------
+# maps a filter field to its ORM lookup path
+_BULK_FILTER_FIELDS = {
+    "hostname": "hostname",
+    "client": "site__client__name",
+    "site": "site__name",
+    "description": "description",
+    "operating_system": "operating_system",
+    "plat": "plat",
+    "monitoring_type": "monitoring_type",
+    # installed software: JSON list on the related InstalledSoftware row.
+    # Matched as a case-insensitive substring against the software list
+    # (so "contains 'online backup'" finds any machine with a matching entry).
+    "software": "installedsoftware__software",
+}
+
+
+def _condition_q(cond):
+    """Turn one {field, op, value} condition into a Q object (or None).
+    Negations use ~Q so they compose correctly inside OR groups."""
+    from django.db.models import Q
+
+    key = cond.get("field")
+    field = _BULK_FILTER_FIELDS.get(key)
+    op = cond.get("op", "contains")
+    value = cond.get("value", "")
+    if not field or value == "":
+        return None
+    # Installed software is a JSON list on a related row; only substring
+    # matching is meaningful, so all positive ops become icontains and the
+    # negative ops become its negation.
+    if key == "software":
+        base = Q(**{f"{field}__icontains": value})
+        return ~base if op in ("not_contains", "not_equals") else base
+    if op == "contains":
+        return Q(**{f"{field}__icontains": value})
+    if op == "not_contains":
+        return ~Q(**{f"{field}__icontains": value})
+    if op == "equals":
+        return Q(**{f"{field}__iexact": value})
+    if op == "not_equals":
+        return ~Q(**{f"{field}__iexact": value})
+    if op == "startswith":
+        return Q(**{f"{field}__istartswith": value})
+    return None
+
+
+def _normalize_filter_groups(filters):
+    """Accept both the new grouped shape and the legacy flat shape.
+    Legacy: [{field,op,value}, ...] -> a single AND group.
+    New:    [{match, conditions:[...]}, ...]."""
+    filters = filters or []
+    if not filters:
+        return []
+    first = filters[0]
+    if isinstance(first, dict) and "conditions" not in first and (
+        "field" in first or "op" in first or "value" in first
+    ):
+        return [{"match": "all", "conditions": filters}]
+    return filters
+
+
+def _group_q(group):
+    match = (group.get("match") or "all").lower()
+    qs = [q for q in (_condition_q(c) for c in group.get("conditions", [])) if q is not None]
+    if not qs:
+        return None
+    combined = qs[0]
+    for q in qs[1:]:
+        combined = (combined & q) if match == "all" else (combined | q)
+    return combined
+
+
+def _apply_bulk_filters(q, filters, group_match="any"):
+    """Combine filter GROUPS onto a queryset.
+    Within a group conditions are AND/OR'd by the group's own match; the groups
+    themselves are AND/OR'd by group_match ("all"=AND, "any"=OR)."""
+    groups = _normalize_filter_groups(filters)
+    gqs = [gq for gq in (_group_q(g) for g in groups) if gq is not None]
+    if not gqs:
+        return q.none()  # no effective conditions -> match nothing (fail closed)
+    gm = (group_match or "any").lower()
+    combined = gqs[0]
+    for gq in gqs[1:]:
+        combined = (combined & gq) if gm == "all" else (combined | gq)
+    # OR across joined fields (client/site names) can duplicate rows
+    return q.filter(combined).distinct()
+
+
+def _has_effective_conditions(filters):
+    """True only if at least one filter condition has a known field AND a
+    non-empty value. Used to fail CLOSED: a filter target with nothing
+    effective must match NOTHING, never every agent."""
+    for g in _normalize_filter_groups(filters):
+        for c in g.get("conditions", []) or []:
+            if _BULK_FILTER_FIELDS.get(c.get("field")) and (c.get("value", "") != ""):
+                return True
+    return False
+
+
+# Hard safety cap: a single bulk AI command may never fan out to more than this
+# many agents (guards against accidental/mis-scoped targets running up huge LLM
+# spend). Override in local_settings.py with PI_BULK_MAX_AGENTS.
+def _bulk_max_agents():
+    try:
+        return int(getattr(settings, "PI_BULK_MAX_AGENTS", 250))
+    except (TypeError, ValueError):
+        return 250
+
+
+def _resolve_bulk_targets(cmd):
+    """Resolve a bulk command's target selection to a list of ONLINE agents.
+
+    FAILS CLOSED: any target that does not establish a real constraint resolves
+    to ZERO agents. Only an explicit target=='all' matches every agent. This
+    prevents an empty/mis-scoped filter or a missing client/site from silently
+    fanning out to the entire fleet.
+    """
+    from agents.models import Agent
+    from tacticalrmm.constants import AgentMonType, AgentPlat, AGENT_STATUS_ONLINE
+
+    q = Agent.objects.select_related("site__client").defer("services", "wmi_detail")
+    target = cmd.target
+    if target == "all":
+        pass  # explicit whole-fleet target
+    elif target == "client":
+        if not cmd.client_id:
+            return []
+        q = q.filter(site__client_id=cmd.client_id)
+    elif target == "site":
+        if not cmd.site_id:
+            return []
+        q = q.filter(site_id=cmd.site_id)
+    elif target == "agents":
+        pks = list(cmd.agents.values_list("pk", flat=True))
+        if not pks:
+            return []
+        q = q.filter(pk__in=pks)
+    elif target == "filter":
+        filters = getattr(cmd, "filters", None) or []
+        if not _has_effective_conditions(filters):
+            return []  # empty/ineffective filter -> match nothing (fail closed)
+        q = _apply_bulk_filters(
+            q, filters, getattr(cmd, "filter_match", None) or "any"
+        )
+    else:
+        return []  # unknown target -> fail closed
+
+    if cmd.mon_type == "servers":
+        q = q.filter(monitoring_type=AgentMonType.SERVER)
+    elif cmd.mon_type == "workstations":
+        q = q.filter(monitoring_type=AgentMonType.WORKSTATION)
+
+    if cmd.os_type in (AgentPlat.WINDOWS, AgentPlat.LINUX, AgentPlat.DARWIN):
+        q = q.filter(plat=cmd.os_type)
+
+    # per-machine exclusions: drop specific agents even if they matched
+    exclude = set(getattr(cmd, "exclude_agent_ids", None) or [])
+
+    # skip offline agents and excluded agents
+    return [
+        a
+        for a in q
+        if a.status == AGENT_STATUS_ONLINE and a.agent_id not in exclude
+    ]
+
+
+def _compute_schedule(
+    schedule_type, interval_seconds, run_time, weekly_days, monthly_day, from_time=None
+):
+    """Generic next-run computer shared by AI tasks and bulk AI commands."""
+    import calendar
+    import datetime as _dt
+
+    from django.utils import timezone as _tz
+
+    now = _tz.localtime(from_time) if from_time else _tz.localtime()
+    if schedule_type == "interval":
+        secs = interval_seconds if interval_seconds and interval_seconds > 0 else 3600
+        return now + _dt.timedelta(seconds=secs)
+
+    rt = run_time or _dt.time(0, 0)
+    base = now.replace(hour=rt.hour, minute=rt.minute, second=0, microsecond=0)
+
+    if schedule_type == "daily":
+        return base if base > now else base + _dt.timedelta(days=1)
+
+    if schedule_type == "weekly":
+        days = sorted(weekly_days or [])
+        if not days:
+            days = [now.weekday()]
+        for i in range(0, 8):
+            cand = base + _dt.timedelta(days=i)
+            if cand > now and cand.weekday() in days:
+                return cand
+        return base + _dt.timedelta(days=7)
+
+    if schedule_type == "monthly":
+        day = monthly_day or 1
+        year, month = now.year, now.month
+        for _ in range(0, 13):
+            last = calendar.monthrange(year, month)[1]
+            d = min(day, last)
+            cand = base.replace(year=year, month=month, day=d)
+            if cand > now:
+                return cand
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        return None
+    return None
+
+
+def _compute_bulk_next_run(cmd, from_time=None):
+    return _compute_schedule(
+        cmd.schedule_type,
+        (cmd.interval_hours or 24) * 3600,
+        cmd.run_time,
+        cmd.weekly_days,
+        cmd.monthly_day,
+        from_time,
+    )
+
+
+def _compute_task_next_run(task, from_time=None):
+    return _compute_schedule(
+        task.schedule_type,
+        (task.interval_minutes or 60) * 60,
+        task.run_time,
+        task.weekly_days,
+        task.monthly_day,
+        from_time,
+    )
+    return None
+
+
+@app.task
+def dispatch_due_bulk_ai_commands():
+    """Poller: queue any bulk AI commands whose next_run has arrived."""
+    from core.models import BulkAICommand, CoreSettings
+
+    core = CoreSettings.objects.first()
+    if not core or not core.ai_module_enabled:
+        return "ai module disabled"
+
+    now = djangotime.now()
+    # only recurring (scheduled) commands are auto-fired; "now" ones wait for a
+    # manual run and then disable themselves
+    for cmd in BulkAICommand.objects.filter(enabled=True, run_mode="schedule"):
+        if cmd.next_run is None:
+            cmd.next_run = _compute_bulk_next_run(cmd)
+            cmd.save(update_fields=["next_run"])
+            continue
+        if now >= cmd.next_run:
+            run_bulk_ai_command.delay(cmd.pk)
+    return "ok"
+
+
+@app.task
+def run_bulk_ai_command(cmd_id, triggered_by="bulk"):
+    """Fan out a bulk AI command to all ONLINE targeted agents."""
+    from core.models import BulkAICommand
+
+    try:
+        cmd = BulkAICommand.objects.select_related("model", "client", "site").get(pk=cmd_id)
+    except BulkAICommand.DoesNotExist:
+        return "not found"
+
+    # a fresh dispatch clears any prior per-command stop (so a disabled/one-shot
+    # command can always be re-run manually)
+    cmd_stop_clear(cmd_id)
+
+    agents = _resolve_bulk_targets(cmd)
+
+    # Hard safety cap: never fan out to more than the cap. Guards against an
+    # accidental/mis-scoped target running up huge LLM spend across the fleet.
+    cap = _bulk_max_agents()
+    if len(agents) > cap:
+        from logs.models import DebugLog
+
+        msg = (
+            f"Bulk AI command '{cmd.name}' (id={cmd.pk}) resolved {len(agents)} "
+            f"agents which exceeds the safety cap of {cap}; REFUSING to run. "
+            f"Narrow the target/filter, or raise PI_BULK_MAX_AGENTS in "
+            f"local_settings.py to intentionally allow more."
+        )
+        try:
+            DebugLog.error(message=msg)
+        except Exception:
+            pass
+        cmd.last_run = djangotime.now()
+        cmd.last_run_count = 0
+        fields = ["last_run", "last_run_count", "next_run"]
+        if cmd.run_mode == "now":
+            cmd.enabled = False
+            cmd.next_run = None
+            fields.append("enabled")
+        else:
+            cmd.next_run = _compute_bulk_next_run(cmd)
+        cmd.save(update_fields=fields)
+        return f"REFUSED: {len(agents)} agents exceeds cap {cap}"
+
+    for agent in agents:
+        run_bulk_ai_agent.delay(cmd.pk, agent.pk, triggered_by)
+
+    cmd.last_run = djangotime.now()
+    cmd.last_run_count = len(agents)
+    fields = ["last_run", "last_run_count", "next_run"]
+    if cmd.run_mode == "now":
+        # one-shot: disable after running (kept in the list with its results)
+        cmd.enabled = False
+        cmd.next_run = None
+        fields.append("enabled")
+    else:
+        cmd.next_run = _compute_bulk_next_run(cmd)
+    cmd.save(update_fields=fields)
+    return f"queued {len(agents)} agents"
+
+
+# Global emergency-stop flag (redis). While set, ALL queued AI runner tasks
+# no-op instead of calling the LLM - this drains a large backlog that Celery's
+# revoke/inspect can't reach (tasks still sitting in the broker queue).
+_AI_KILL_KEY = "pi_ai_kill_until"
+
+
+def ai_kill_set(seconds=900):
+    from time import time
+
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            conn.set(_AI_KILL_KEY, str(int(time()) + int(seconds)), ex=int(seconds))
+    except Exception:
+        pass
+
+
+def ai_kill_clear():
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            conn.delete(_AI_KILL_KEY)
+    except Exception:
+        pass
+
+
+# Per-command stop flag (redis). Set by the per-command Stop action to drain
+# that command's queued backlog. Distinct from a command being disabled/spent
+# (a one-shot "now" command disables itself after running) - an explicit Run Now
+# CLEARS this flag and re-dispatches, so disabled/one-shot commands can always
+# be run again manually.
+def _cmd_stop_key(cmd_id):
+    return f"pi_ai_cmd_stop:{cmd_id}"
+
+
+def cmd_stop_set(cmd_id, seconds=3600):
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            conn.set(_cmd_stop_key(cmd_id), "1", ex=int(seconds))
+    except Exception:
+        pass
+
+
+def cmd_stop_clear(cmd_id):
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            conn.delete(_cmd_stop_key(cmd_id))
+    except Exception:
+        pass
+
+
+def cmd_stopped(cmd_id):
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            return bool(conn.get(_cmd_stop_key(cmd_id)))
+    except Exception:
+        return False
+
+
+def ai_killed():
+    from time import time
+
+    try:
+        with from_url(
+            f"redis://{settings.REDIS_HOST}:6379", decode_responses=True
+        ) as conn:
+            raw = conn.get(_AI_KILL_KEY)
+        return bool(raw) and time() < float(raw)
+    except Exception:
+        return False
+
+
+@app.task
+def run_bulk_ai_agent(cmd_id, agent_pk, triggered_by="bulk"):
+    """Run a bulk command's prompt on one agent, recording an AITaskRun."""
+    import uuid
+
+    from redis import from_url  # noqa: F811
+    from agents.models import Agent
+    from core.models import BulkAICommand, AITaskRun
+
+    try:
+        cmd = BulkAICommand.objects.select_related("model").get(pk=cmd_id)
+        agent = Agent.objects.select_related("site__client").get(pk=agent_pk)
+    except (BulkAICommand.DoesNotExist, Agent.DoesNotExist):
+        return "not found"
+
+    # Stop-guard: re-check at execution time so an emergency-stop or a
+    # per-command Stop drains the queued backlog with no LLM calls or alerts.
+    # NOTE: we intentionally do NOT skip merely because the command is disabled
+    # - a one-shot command disables itself after running, but an explicit Run
+    # Now must still execute. Draining is driven by the stop flags instead.
+    if ai_killed() or cmd_stopped(cmd_id):
+        return "skipped (stopped)"
+
+    model = _resolve_ai_model(cmd.model)
+    if not model:
+        return "no model"
+
+    run_id = uuid.uuid4().hex
+    run = AITaskRun.objects.create(
+        bulk=cmd, agent=agent, run_id=run_id, triggered_by=triggered_by, status="running"
+    )
+    status, summary, output = _run_prompt_on_agent(
+        agent=agent, model=model, prompt=cmd.prompt,
+        allow_mutating=cmd.allow_mutating, run_id=run_id,
+    )
+    run.status = status
+    run.summary = summary[:5000] if summary else ""
+    run.output = output[:50000] if output else ""
+    run.finished_at = djangotime.now()
+    run.save()
+
+    _ai_alert(agent, cmd.name, status, summary, cmd.alert_threshold)
+    return f"{status}"

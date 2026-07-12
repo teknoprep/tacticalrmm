@@ -117,6 +117,20 @@ class CoreSettings(BaseAuditModel):
     open_ai_model = models.CharField(
         max_length=255, blank=True, default="gpt-3.5-turbo"
     )
+    # Pi.dev AI assistant module
+    ai_module_enabled = models.BooleanField(default=False)
+    ai_persist_history = models.BooleanField(default=True)
+    ai_require_approval = models.BooleanField(default=True)
+    # Admin-authored policy text injected into every AI session's system prompt
+    # (chat + scheduled runs). Documents WHEN to open helpdesk tickets AND HOW
+    # (the ticketing API calls themselves) - fully dynamic, no code changes to
+    # switch ticketing systems.
+    ai_helpdesk_prompt = models.TextField(blank=True, default="")
+    # Generic ticketing API access for the helpdesk_api_request tool. The AI
+    # writes {{HELPDESK_API_KEY}} in request bodies; the bridge substitutes the
+    # real key server-side (the key is never placed in the AI's context).
+    ai_helpdesk_api_base_url = models.CharField(max_length=255, blank=True, default="")
+    ai_helpdesk_api_key = models.CharField(max_length=255, blank=True, default="")
     enable_server_scripts = models.BooleanField(default=True)
     enable_server_webterminal = models.BooleanField(default=False)
     notify_on_info_alerts = models.BooleanField(default=False)
@@ -282,6 +296,8 @@ class CoreSettings(BaseAuditModel):
         attachment_extension: Optional[str] = None,
         alert_template: "Optional[AlertTemplate]" = None,
         override_recipients: Optional[List[str]] = [],
+        override_from: Optional[str] = None,
+        override_from_name: Optional[str] = None,
         test: bool = False,
     ) -> tuple[str, bool]:
         if test and not self.email_is_configured:
@@ -290,8 +306,11 @@ class CoreSettings(BaseAuditModel):
         elif not self.email_is_configured:
             return "SMTP messaging not configured.", False
 
-        # override email from if alert_template is passed and is set
-        if alert_template and alert_template.email_from:
+        # override email from: explicit override wins, then alert_template, then
+        # the configured SMTP from address.
+        if override_from:
+            from_address = override_from
+        elif alert_template and alert_template.email_from:
             from_address = alert_template.email_from
         else:
             from_address = self.smtp_from_email
@@ -312,9 +331,14 @@ class CoreSettings(BaseAuditModel):
             msg["Subject"] = subject
             msg["Date"] = formatdate(localtime=True)
 
-            if self.smtp_from_name:
+            display_name = (
+                override_from_name
+                if override_from_name is not None
+                else self.smtp_from_name
+            )
+            if display_name:
                 msg["From"] = Address(
-                    display_name=self.smtp_from_name, addr_spec=from_address
+                    display_name=display_name, addr_spec=from_address
                 )
             else:
                 msg["From"] = from_address
@@ -627,3 +651,256 @@ class Schedule(BaseAuditModel):
         from .serializers import ScheduleAuditSerializer
 
         return ScheduleAuditSerializer(schedule).data
+
+
+class AIProvider(BaseAuditModel):
+    PROVIDER_CHOICES = [
+        ("anthropic", "Anthropic"),
+        ("openai", "OpenAI"),
+        ("google", "Google"),
+        ("xai", "xAI"),
+        ("openrouter", "OpenRouter"),
+        ("custom", "Custom (OpenAI-compatible)"),
+    ]
+    name = models.CharField(max_length=50, choices=PROVIDER_CHOICES, unique=True)
+    api_key = models.CharField(max_length=500, blank=True, default="")
+    base_url = models.CharField(max_length=500, blank=True, default="")
+    enabled = models.BooleanField(default=True)
+
+    def __str__(self) -> str:
+        return self.get_name_display()
+
+    @staticmethod
+    def serialize(obj):
+        from .serializers import AIProviderSerializer
+
+        return AIProviderSerializer(obj).data
+
+
+class AIModel(BaseAuditModel):
+    provider = models.ForeignKey(
+        "core.AIProvider", related_name="models", on_delete=models.CASCADE
+    )
+    model_id = models.CharField(max_length=255)
+    display_name = models.CharField(max_length=255)
+    thinking_level = models.CharField(max_length=20, blank=True, default="medium")
+    enabled = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ("provider", "model_id")
+
+    def __str__(self) -> str:
+        return f"{self.display_name} ({self.provider.name}/{self.model_id})"
+
+    def save(self, *args, **kwargs) -> None:
+        # only one default model globally
+        if self.is_default:
+            AIModel.objects.exclude(pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+    @staticmethod
+    def serialize(obj):
+        from .serializers import AIModelSerializer
+
+        return AIModelSerializer(obj).data
+
+
+class AITask(BaseAuditModel):
+    SCHEDULE_INTERVAL = "interval"
+    SCHEDULE_DAILY = "daily"
+    SCHEDULE_WEEKLY = "weekly"
+    SCHEDULE_MONTHLY = "monthly"
+    SCHEDULE_ONCE = "once"
+    SCHEDULE_CHOICES = [
+        (SCHEDULE_INTERVAL, "Interval"),
+        (SCHEDULE_DAILY, "Daily"),
+        (SCHEDULE_WEEKLY, "Weekly"),
+        (SCHEDULE_MONTHLY, "Monthly"),
+        (SCHEDULE_ONCE, "One time"),
+    ]
+
+    THRESHOLD_CHOICES = [
+        ("never", "Never alert"),
+        ("warning", "Alert on Warning or Alert"),
+        ("alert", "Alert only on Alert"),
+    ]
+
+    name = models.CharField(max_length=255)
+    agent = models.ForeignKey(
+        "agents.Agent", related_name="ai_tasks", on_delete=models.CASCADE
+    )
+    prompt = models.TextField()
+    model = models.ForeignKey(
+        "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    enabled = models.BooleanField(default=True)
+    allow_mutating = models.BooleanField(default=False)
+
+    # run mode: "now" = one-shot (disables after run), "schedule" = recurring
+    run_mode = models.CharField(max_length=20, default="schedule")  # now|schedule
+    schedule_type = models.CharField(
+        max_length=20, choices=SCHEDULE_CHOICES, default=SCHEDULE_INTERVAL
+    )
+    interval_minutes = models.PositiveIntegerField(default=60)
+    run_time = models.TimeField(null=True, blank=True)  # daily/weekly/monthly/once
+    weekly_days = ArrayField(  # 0=Mon .. 6=Sun
+        base_field=models.PositiveSmallIntegerField(),
+        size=7,
+        null=True,
+        blank=True,
+        default=list,
+    )
+    monthly_day = models.PositiveSmallIntegerField(null=True, blank=True)  # 1-31
+    run_at = models.DateTimeField(null=True, blank=True)  # computed target for one-time
+    next_run = models.DateTimeField(null=True, blank=True)  # computed for recurring
+
+    alert_threshold = models.CharField(
+        max_length=20, choices=THRESHOLD_CHOICES, default="alert"
+    )
+
+    # result of the most recent run
+    last_run = models.DateTimeField(null=True, blank=True)
+    last_status = models.CharField(max_length=20, null=True, blank=True)  # ok/warning/alert/error
+    last_summary = models.TextField(null=True, blank=True)
+    last_output = models.TextField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.agent.hostname})"
+
+    @staticmethod
+    def serialize(obj):
+        from .serializers import AITaskSerializer
+
+        return AITaskSerializer(obj).data
+
+
+class AITaskRun(models.Model):
+    # a run belongs to either a scheduled task or a bulk command; agent is always set
+    task = models.ForeignKey(
+        "core.AITask", related_name="runs", on_delete=models.CASCADE, null=True, blank=True
+    )
+    bulk = models.ForeignKey(
+        "core.BulkAICommand", related_name="runs", on_delete=models.CASCADE, null=True, blank=True
+    )
+    agent = models.ForeignKey(
+        "agents.Agent", related_name="ai_runs", on_delete=models.CASCADE, null=True, blank=True
+    )
+    run_id = models.CharField(max_length=64, unique=True)  # correlates live progress
+    triggered_by = models.CharField(max_length=20, default="schedule")  # schedule|manual|bulk
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=20, default="running")  # running/ok/warning/alert/error
+    summary = models.TextField(null=True, blank=True)
+    output = models.TextField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    @property
+    def source(self) -> str:
+        if self.bulk_id:
+            return "bulk"
+        if self.task_id:
+            return "task"
+        return "chat"
+
+    @property
+    def source_name(self) -> str:
+        if self.bulk_id:
+            return self.bulk.name
+        if self.task_id:
+            return self.task.name
+        return ""
+
+    def get_agent(self):
+        if self.agent_id:
+            return self.agent
+        if self.task_id:
+            return self.task.agent
+        return None
+
+    def __str__(self) -> str:
+        return f"{self.source_name} @ {self.started_at} [{self.status}]"
+
+
+class BulkAICommand(BaseAuditModel):
+    SCHED_INTERVAL = "interval"
+    SCHED_DAILY = "daily"
+    SCHED_WEEKLY = "weekly"
+    SCHED_MONTHLY = "monthly"
+    SCHED_CHOICES = [
+        (SCHED_INTERVAL, "Every N hours"),
+        (SCHED_DAILY, "Daily"),
+        (SCHED_WEEKLY, "Weekly"),
+        (SCHED_MONTHLY, "Monthly"),
+    ]
+    THRESHOLD_CHOICES = [
+        ("never", "Never alert"),
+        ("warning", "Alert on Warning or Alert"),
+        ("alert", "Alert only on Alert"),
+    ]
+
+    name = models.CharField(max_length=255)
+    prompt = models.TextField()
+    model = models.ForeignKey(
+        "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    enabled = models.BooleanField(default=True)
+    allow_mutating = models.BooleanField(default=False)
+    alert_threshold = models.CharField(
+        max_length=20, choices=THRESHOLD_CHOICES, default="alert"
+    )
+
+    # run mode: "now" = one-shot (disables itself after running), "schedule" = recurring
+    run_mode = models.CharField(max_length=20, default="schedule")  # now|schedule
+    # schedule
+    schedule_type = models.CharField(
+        max_length=20, choices=SCHED_CHOICES, default=SCHED_INTERVAL
+    )
+    interval_hours = models.PositiveIntegerField(default=24)
+    run_time = models.TimeField(null=True, blank=True)  # daily/weekly/monthly
+    weekly_days = ArrayField(  # 0=Mon .. 6=Sun
+        base_field=models.PositiveSmallIntegerField(),
+        size=7,
+        null=True,
+        blank=True,
+        default=list,
+    )
+    monthly_day = models.PositiveSmallIntegerField(null=True, blank=True)  # 1-31
+    next_run = models.DateTimeField(null=True, blank=True)
+
+    # targets (mirrors bulk command); target also supports "filter"
+    target = models.CharField(max_length=20, default="all")  # all/client/site/agents/filter
+    # dynamic filter rules for target=="filter". New shape: a list of GROUPS,
+    # each {match: "all"|"any", conditions: [{field, op, value}, ...]}. Old shape
+    # (a flat list of {field, op, value}) is still accepted and treated as one
+    # AND group. Groups are combined using filter_match below.
+    filters = models.JSONField(default=list, blank=True)
+    # how to combine the filter GROUPS: "all" = AND, "any" = OR.
+    filter_match = models.CharField(max_length=8, default="any")
+    # agent_ids explicitly excluded from the resolved target set, even if they
+    # match the filter/client/site/all selection.
+    exclude_agent_ids = models.JSONField(default=list, blank=True)
+    client = models.ForeignKey(
+        "clients.Client", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    site = models.ForeignKey(
+        "clients.Site", null=True, blank=True, on_delete=models.SET_NULL
+    )
+    agents = models.ManyToManyField("agents.Agent", blank=True, related_name="bulk_ai_commands")
+    mon_type = models.CharField(max_length=20, default="all")  # all/servers/workstations
+    os_type = models.CharField(max_length=20, default="all")  # all/windows/linux/darwin
+
+    # results
+    last_run = models.DateTimeField(null=True, blank=True)
+    last_run_count = models.PositiveIntegerField(default=0)
+
+    def __str__(self) -> str:
+        return self.name
+
+    @staticmethod
+    def serialize(obj):
+        from .serializers import BulkAICommandSerializer
+
+        return BulkAICommandSerializer(obj).data
