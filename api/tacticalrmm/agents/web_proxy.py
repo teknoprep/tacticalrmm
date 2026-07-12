@@ -625,7 +625,7 @@ async def agent_web_proxy(request, token: str, path: str = ""):
             continue  # avoid leaking the proxy origin to the device
         if lk == "cookie":
             # Forward the device's cookies but drop RMM's own session/CSRF
-            # cookies (we share the rmm.blueuc.com origin). Use a DENY-list of
+            # cookies (we share the the RMM origin). Use a DENY-list of
             # RMM cookie names rather than an allow-list of Set-Cookie-recorded
             # names: some apps (Proxmox/PBS) set their auth cookie client-side
             # via document.cookie, so it never appears in a Set-Cookie header.
@@ -736,7 +736,7 @@ async def agent_web_proxy(request, token: str, path: str = ""):
         # Scope cookies to THIS session's path so devices proxied on the same
         # origin don't clobber each other. Multiple appliances (e.g. two Toshiba
         # TopAccess printers) all set `Session` at Path=/, which overwrite each
-        # other on rmm.blueuc.com and make the device report INVALID_SESSION_ID.
+        # other on the RMM and make the device report INVALID_SESSION_ID.
         # __Host-/__Secure- prefixed cookies must keep Path=/ to stay valid, so
         # leave those as-is.
         if name[:7].lower() == "__host-" or name[:9].lower() == "__secure-":
