@@ -1067,6 +1067,8 @@ class AITaskRuns(APIView):
         task_id = request.query_params.get("task_id")
         bulk_id = request.query_params.get("bulk_id")
         agent_id = request.query_params.get("agent_id")
+        client_id = request.query_params.get("client")
+        site_id = request.query_params.get("site")
         if task_id:
             qs = qs.filter(task_id=task_id)
         elif bulk_id:
@@ -1075,7 +1077,53 @@ class AITaskRuns(APIView):
             qs = qs.filter(
                 Q(agent__agent_id=agent_id) | Q(task__agent__agent_id=agent_id)
             )
-        return Response(AITaskRunSerializer(qs[:200], many=True).data)
+        elif client_id:
+            qs = qs.filter(
+                Q(agent__site__client_id=client_id)
+                | Q(task__agent__site__client_id=client_id)
+            )
+        elif site_id:
+            qs = qs.filter(
+                Q(agent__site_id=site_id) | Q(task__agent__site_id=site_id)
+            )
+        return Response(AITaskRunSerializer(qs[:500], many=True).data)
+
+
+class AIHistoryScope(APIView):
+    """Aggregated chat-session history for a whole client or site (every machine
+    under it), so an operator can review all AI activity in one place."""
+
+    permission_classes = [IsAuthenticated, AITaskPerms]
+
+    def get(self, request):
+        import requests as _requests
+        from agents.models import Agent
+
+        permitted = Agent.objects.filter_by_role(request.user)  # type: ignore
+        client_id = request.query_params.get("client")
+        site_id = request.query_params.get("site")
+        if client_id:
+            agents = permitted.filter(site__client_id=client_id)
+        elif site_id:
+            agents = permitted.filter(site_id=site_id)
+        else:
+            return Response({"sessions": []})
+        amap = {a.agent_id: a.hostname for a in agents}
+        if not amap:
+            return Response({"sessions": []})
+        bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+        try:
+            r = _requests.get(
+                f"{bridge}/pi/history_bulk",
+                params={"agent_ids": ",".join(amap.keys())},
+                timeout=20,
+            )
+            data = r.json()
+        except Exception:
+            data = {"sessions": []}
+        for s in data.get("sessions", []):
+            s["hostname"] = amap.get(s.get("agent_id"), "")
+        return Response(data)
 
 
 class AITaskRunLive(APIView):
