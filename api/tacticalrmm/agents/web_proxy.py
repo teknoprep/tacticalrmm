@@ -384,22 +384,9 @@ def _service_worker_js() -> bytes:
 var PFX = /\/agentproxy\/([A-Za-z0-9_\-]+)(?:\/|$)/;
 self.addEventListener('install', function(e){ self.skipWaiting(); });
 self.addEventListener('activate', function(e){ e.waitUntil(self.clients.claim()); });
-self.addEventListener('fetch', function(event){
+function reroute(event, target){
   var req = event.request;
-  var url;
-  try { url = new URL(req.url); } catch (e) { return; }
-  if (url.origin !== self.location.origin) return;       // cross-origin: leave
-  if (PFX.test(url.pathname)) return;                    // already prefixed: normal
-  var ref = req.referrer || '';
-  var m = ref.match(PFX);
-  if (!m) return;                                        // not from a proxied page -> passthrough (RMM app)
-  var target = url.origin + '/agentproxy/' + m[1] + url.pathname + url.search;
   if (req.mode === 'navigate') {
-    // A link/form GET inside a proxied page navigated out of the prefix (e.g.
-    // Ricoh login -> /web/.../authForm.cgi). Redirect to the prefixed URL so
-    // the address bar keeps the prefix and relative resolution stays correct.
-    // POST navigations are left alone (a redirect would drop the form body;
-    // static form actions are already prefixed by the body rewrite).
     if (req.method === 'GET' || req.method === 'HEAD') {
       event.respondWith(Response.redirect(target, 302));
     }
@@ -412,6 +399,37 @@ self.addEventListener('fetch', function(event){
       return await fetch(target, init);
     } catch (e) { try { return await fetch(req); } catch (e2) { return new Response('', {status: 502}); } }
   })());
+}
+self.addEventListener('fetch', function(event){
+  var req = event.request;
+  var url;
+  try { url = new URL(req.url); } catch (e) { return; }
+  if (url.origin !== self.location.origin) return;       // cross-origin: leave
+  var ref = req.referrer || '';
+  var m = ref.match(PFX);                                 // referrer's real session token
+  var um = url.pathname.match(PFX);                       // token present on the request URL
+  if (um) {
+    // Request already carries a /agentproxy/<token>/ prefix. If it came from a
+    // proxied page but the token DOESN'T match the referrer's real token, a
+    // parent-relative ('../') reference climbed above the session root and ate
+    // the token, leaving /agentproxy/<deviceSegment>/... (e.g. Supermicro/ATEN
+    // BMC login uses ../js, ../cgi from the root document -> /agentproxy/js/...).
+    // The device-absolute path is everything after the literal '/agentproxy';
+    // rebuild it under the referrer's real token.
+    if (m && um[1] !== m[1]) {
+      var dabs = url.pathname.substring('/agentproxy'.length);   // leading '/...'
+      reroute(event, url.origin + '/agentproxy/' + m[1] + dabs + url.search);
+    }
+    return;                                              // correctly prefixed: normal
+  }
+  if (!m) return;                                        // not from a proxied page -> passthrough (RMM app)
+  // Root-relative / absolute same-origin request that escaped the prefix (e.g.
+  // Ricoh login -> /web/.../authForm.cgi, or a '../../' that over-climbed past
+  // /agentproxy entirely). Route it back under the referrer's session token.
+  // (GET/HEAD navigations redirect; POST navigations are left alone so the form
+  // body isn't dropped -- static form actions are already prefixed by the body
+  // rewrite.)
+  reroute(event, url.origin + '/agentproxy/' + m[1] + url.pathname + url.search);
 });
 """
     return js.encode()
@@ -445,6 +463,64 @@ _CSS_URL_RE = re.compile(rb'''(url\(\s*["']?)/(?!/)''', re.IGNORECASE)
 # These ignore <base> and resolve against the origin root, so rewrite them too.
 _MODULE_IMPORT_RE = re.compile(rb'''((?:\bfrom|\bimport)\s*\(?\s*["'])/(?!/)''')
 
+# --- Frame-buster neutralization -------------------------------------------
+# Many appliance UIs (Supermicro/ATEN & Aspeed BMCs, some iLO/iDRAC, printers)
+# refuse to run inside an iframe: they compare window/self to top/parent and,
+# if "framed", force top.location away (e.g. `if (window != top) top.location.
+# href="/";`) which blows the whole proxy tab back to the RMM root -> the device
+# UI never appears. We serve devices inside an iframe on purpose, so:
+#   1) rewrite top/parent .location -> self.location  (navigate INSIDE the iframe
+#      instead of the top tab; also neutralizes `top.location != self.location`
+#      style busters, which collapse to a self==self comparison)
+#   2) make bare `window/self (==|!=) top/parent` comparisons evaluate as
+#      "not framed" so the buster's redirect branch is skipped (and never throws)
+# Applied only to injected HTML documents (inline scripts); external .js is left
+# untouched. `self` === `window` in a document, so navigation semantics are kept.
+_TOP_LOCATION_RE = re.compile(rb'''\b(?:window\.)?(?:top|parent)\.location\b''')
+_FRAMEBUST_NE_RE = re.compile(
+    rb'''\b(?:window|self)\b(?!\.)\s*!==?\s*(?:window\.)?(?:top|parent)\b(?!\.)'''
+    rb'''|(?:window\.)?(?:top|parent)\b(?!\.)\s*!==?\s*\b(?:window|self)\b(?!\.)''',
+    re.IGNORECASE,
+)
+_FRAMEBUST_EQ_RE = re.compile(
+    rb'''\b(?:window|self)\b(?!\.)\s*===?\s*(?:window\.)?(?:top|parent)\b(?!\.)'''
+    rb'''|(?:window\.)?(?:top|parent)\b(?!\.)\s*===?\s*\b(?:window|self)\b(?!\.)''',
+    re.IGNORECASE,
+)
+
+# --- Parent-relative ('../') references -------------------------------------
+# Some appliance UIs (Supermicro/ATEN BMC login) serve a document at the device
+# root '/' but reference assets with '../js/x', '../cgi/y'. On the real device
+# the browser clamps '..' at root ('/js/x'); through the proxy the document lives
+# at /agentproxy/<token>/ so '../js/x' resolves to /agentproxy/js/x -- the '..'
+# eats the session token and the asset 404s (jQuery never loads -> blank UI).
+# We can't rely on the service worker for these (it isn't controlling the very
+# first page load), so resolve them SERVER-SIDE against the document's real
+# device path, then re-prefix. For deep documents (e.g. Ricoh) this yields the
+# exact same URL the browser would compute, so it's a no-op there.
+_DOTREL_ATTR_RE = re.compile(
+    rb'''(\b(?:href|src|action|formaction|data-url|background)\s*=\s*["'])(\.\.?/[^"'#?]*(?:[?#][^"']*)?)(["'])''',
+    re.IGNORECASE,
+)
+_DOTREL_CSS_RE = re.compile(rb'''(url\(\s*["']?)(\.\.?/[^"')]*)''', re.IGNORECASE)
+
+
+def _reprefix_relative(value: bytes, dev_doc: str, prefix: str) -> bytes:
+    """Resolve a '../'/'./'-relative URL against the document's device path
+    (root-clamped, like a browser) and re-prefix with /agentproxy/<token>/."""
+    try:
+        rel = value.decode("latin-1")
+        dev_abs = urllib.parse.urljoin(dev_doc, rel)
+        # A browser clamps '..' at the origin root; urljoin instead drops the
+        # leading '/' when a ref climbs above root from a shallow base
+        # (urljoin('/', '../js/x') -> 'js/x'). Restore the root anchor so the
+        # result matches browser resolution.
+        if not dev_abs.startswith("/"):
+            dev_abs = "/" + dev_abs
+        return (prefix + dev_abs.lstrip("/")).encode("latin-1")
+    except Exception:
+        return value
+
 
 def _client_shim(token: str) -> bytes:
     """JS injected into HTML pages that patches XHR/fetch/WebSocket so URLs the
@@ -464,6 +540,17 @@ def _client_shim(token: str) -> bytes:
         "var o=location.origin;"
         "if(u.slice(0,o.length+1)===o+'/'){var r=u.slice(o.length);"
         "if(r.slice(0,P.length+1)!==P+'/')return o+P+r;return u;}"
+        # relative URL built in JS ('../js/lang/dictionary_en.js', './x', 'x') --
+        # e.g. Supermicro/ATEN updateLocalDictionary() does a SYNC $.ajax to a
+        # '../' script. Resolve it against the document like the browser, then
+        # re-prefix: a '..' from the session root eats the token
+        # (/agentproxy/js/...) or climbs past it (/js/...); rebuild under P.
+        "if(u.charAt(0)!=='#'&&!/^[a-z][a-z0-9+.-]*:/i.test(u)){"
+        "try{var a=new URL(u,document.baseURI);"
+        "if(a.origin===o){var pth=a.pathname;"
+        "if(pth.slice(0,P.length+1)===P+'/')return u;"  # already correct
+        "if(pth.indexOf('/agentproxy/')===0)pth=pth.slice(11);"  # token eaten by '..'
+        "return P+pth+a.search+a.hash;}}catch(e){}}"
         "return u;}catch(e){return u;}}"
         "var O=XMLHttpRequest.prototype.open;"
         "XMLHttpRequest.prototype.open=function(){"
@@ -536,10 +623,13 @@ def _parse_set_cookie(header: str):
 
 
 def rewrite_body(
-    body: bytes, content_type: str, token: str, inject_shim: bool = True
+    body: bytes, content_type: str, token: str, inject_shim: bool = True,
+    path: str = "",
 ) -> bytes:
     ct = (content_type or "").lower()
     prefix = _prefix(token).encode()
+    dev_doc = "/" + path            # this document's real path on the device
+    prefix_s = _prefix(token)       # "/agentproxy/<token>/"
 
     # Only top-level document/iframe navigations get the HTML shim + <base>.
     # XHR/fetch responses are often text/html too (e.g. Toshiba TopAccess
@@ -548,7 +638,18 @@ def rewrite_body(
     # fnClearAllSessionCookiesAndRedirect() in a loop. Leave them byte-exact.
     if "text/html" in ct and inject_shim:
         # static root-relative attribute URLs: ="/x" -> "/agentproxy/<token>/x"
+        # neutralize frame-busting so the device UI stays in our iframe
+        body = _TOP_LOCATION_RE.sub(b"self.location", body)
+        body = _FRAMEBUST_NE_RE.sub(b"false", body)
+        body = _FRAMEBUST_EQ_RE.sub(b"true", body)
         body = _ROOT_REL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
+        # parent-relative attribute URLs: ='../js/x' -> '/agentproxy/<token>/js/x'
+        body = _DOTREL_ATTR_RE.sub(
+            lambda m: m.group(1)
+            + _reprefix_relative(m.group(2), dev_doc, prefix_s)
+            + m.group(3),
+            body,
+        )
         # root-absolute ES-module imports: from "/x" -> from "/agentproxy/<token>/x"
         body = _MODULE_IMPORT_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
         # Inject the runtime shim only. We deliberately do NOT add our own <base>:
@@ -568,7 +669,12 @@ def rewrite_body(
         return body
 
     if "text/css" in ct:
-        return _CSS_URL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
+        body = _CSS_URL_RE.sub(rb"\1" + prefix[:-1] + b"/", body)
+        body = _DOTREL_CSS_RE.sub(
+            lambda m: m.group(1) + _reprefix_relative(m.group(2), dev_doc, prefix_s),
+            body,
+        )
+        return body
 
     # leave JS/JSON/XML/binary untouched - the runtime shim handles dynamic URLs
     return body
@@ -709,7 +815,9 @@ async def agent_web_proxy(request, token: str, path: str = ""):
         _inject = (
             request.headers.get("X-Requested-With", "").lower() != "xmlhttprequest"
         )
-    resp_body = rewrite_body(resp_body, content_type, token, inject_shim=_inject)
+    resp_body = rewrite_body(
+        resp_body, content_type, token, inject_shim=_inject, path=path
+    )
 
     resp = HttpResponse(resp_body, status=status, content_type=content_type)
     for hk, hv in out_headers.items():
@@ -727,6 +835,14 @@ async def agent_web_proxy(request, token: str, path: str = ""):
         if not name:
             continue
         _set_cookie_names.append(name)
+        # A response often CLEARS then SETS the same cookie (e.g. ATEN/Supermicro
+        # login sends `SID=; expires=1970` then `SID=<real>`). Python's SimpleCookie
+        # REUSES the existing Morsel on reassignment (self.get(key, Morsel())), so
+        # the real cookie would inherit the clear's past `expires` and be deleted
+        # by the browser immediately. Drop any prior morsel so each Set-Cookie
+        # starts fresh and the last one wins with only its own attributes.
+        if name in resp.cookies:
+            del resp.cookies[name]
         resp.cookies[name] = ""
         # set raw value as both value and coded_value -> emitted exactly, no quoting
         try:

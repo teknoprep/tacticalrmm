@@ -1750,6 +1750,7 @@ def _pi_device_facts(agent):
         "device_url": (f"{settings.CORS_ORIGIN_WHITELIST[0]}/agents/{agent.agent_id}" if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""),
         "monitoring_type": agent.monitoring_type,
         "last_seen": str(agent.last_seen) if agent.last_seen else None,
+        "ai_notes": agent.ai_notes or "",
     }
 
 
@@ -1864,6 +1865,11 @@ class PiMultiSession(APIView):
             "autoapprove_allowed": bool(
                 is_super or (user.role and user.role.can_use_ai_autoapprove)
             ),
+            # Remembered preference - see accounts.User.ai_autoapprove_default.
+            "auto_approve": bool(
+                (is_super or (user.role and user.role.can_use_ai_autoapprove))
+                and getattr(user, "ai_autoapprove_default", False)
+            ),
             # mutate_allowed = may this session EVER write (role/super).
             # allow_mutating = initial state; a read_only request (e.g. AI Resolve)
             # starts read-only but can be toggled to write if mutate_allowed.
@@ -1887,7 +1893,7 @@ class PiMultiSession(APIView):
         token = create_pi_session(data=blob)
 
         for mm in machines:
-            AuditLog.audit_mesh_session(
+            AuditLog.audit_ai_session(
                 username=user.username,
                 agent=agents_by_id[mm["agent_id"]],
                 debug_info={
@@ -2031,6 +2037,10 @@ class AgentPiSession(APIView):
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(is_super or (user.role and user.role.can_use_ai_autoapprove)),
+            # Remembered preference (see accounts.User.ai_autoapprove_default): the device
+            # chat had the same reset-on-refresh behaviour as the ticket chat.
+            "auto_approve": bool((is_super or (user.role and user.role.can_use_ai_autoapprove))
+                                 and getattr(user, "ai_autoapprove_default", False)),
             "mutate_allowed": bool(is_super or (user.role and user.role.can_use_ai_mutate)),
             "allow_mutating": bool(
                 (is_super or (user.role and user.role.can_use_ai_mutate))
@@ -2048,7 +2058,7 @@ class AgentPiSession(APIView):
 
         token = create_pi_session(data=blob)
 
-        AuditLog.audit_mesh_session(
+        AuditLog.audit_ai_session(
             username=user.username,
             agent=agent,
             debug_info={
