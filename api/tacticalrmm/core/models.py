@@ -872,6 +872,27 @@ class AIProvider(BaseAuditModel):
     def serialize(obj):
         from .serializers import AIProviderSerializer
 
+        # The audit log serializes the object BEFORE the row is inserted (see
+        # BaseAuditModel.save), so on create `obj.pk` is still None. The serializer carries
+        # a nested reverse relation (`models`), and Django refuses to read a reverse
+        # relation on an unsaved instance - it raises
+        #   ValueError: 'AIProvider' instance needs to have a primary key value before
+        #               this relationship can be used
+        # which surfaced as a bare HTTP 500 when adding ANY new provider through Global
+        # Settings. It only bit over real HTTP because the audit path is skipped when there
+        # is no request user, which is why the same call succeeded from a shell.
+        #
+        # A brand-new provider has no child models by definition, so describe it directly
+        # and keep the audit entry. `api_key` is deliberately absent here, exactly as the
+        # serializer marks it write_only - an audit record must never carry the secret.
+        if obj.pk is None:
+            return {
+                "name": obj.name,
+                "base_url": obj.base_url,
+                "enabled": obj.enabled,
+                "api_key_set": bool(obj.api_key),
+                "models": [],
+            }
         return AIProviderSerializer(obj).data
 
 
