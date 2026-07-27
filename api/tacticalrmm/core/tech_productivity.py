@@ -410,7 +410,8 @@ WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
      r"(\bservers?\b[ -]{0,3}(upgrade|update|patch|maintenance|reboot|restart|migration|"
      r"build|rebuild|install|setup|config|provision|down|offline|issue|problem|error|"
      r"fail|crash|hang)|"
-     r"(upgrade|patch|update|maintenance|reboot|restart|rebuild|provision|configure)"
+     r"(upgrade|patch|update|maintenance|reboot|restart|rebuild|provision|configure|"
+     r"assess|audit)"
      r"[ -]{0,3}(the )?\bservers?\b|"
      r"\bhost\b (down|offline|reboot|maintenance)|windows server \d)"),
     (5, "data_recovery", "data loss / recovery",
@@ -419,6 +420,7 @@ WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
     # ---- 4: advanced / specialist, bounded in scope ----
     (4, "server_hardware", "server hardware fault",
      r"(\bnvme\b|boot disk|\bssd\b (fail|error)|disk (fail|error|dying)|"
+     r"\bhdd\b|hard (disk|drive) (fail|error)|drive fail(ure|ing|s)?|"
      r"smart (error|fail|warning)|media (error|read error)|read errors?|"
      r"degraded (array|raid|pool)|power supply|\bpsu\b|controller fail(ure)?|"
      r"memory (error|fault)|\becc\b error|overheat)"),
@@ -443,7 +445,8 @@ WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
      r"quarantine|transport rule|journal)"),
     (4, "network_infra", "network infrastructure",
      r"(firewall|fortigate|forti ?os|sonicwall|meraki|pfsense|"
-     r"\bvlan\b|subnet|\bbgp\b|\bospf\b|\bvpn\b|ipsec|site-?to-?site|"
+     r"\bvlan\b|subnet|\bbgp\b|\bospf\b|\bvpn\b|openvpn|ipsec|site-?to-?site|"
+     r"\bwi-?fi\b|\bwireless\b|\bssid\b|"
      r"\bswitch\b|switch stack|\bstp\b|spanning tree|trunk port|"
      r"wireless (controller|infrastructure)|access point|\bap\b (issue|down|"
      r"offline)|\bptp\b|backhaul|\buisp\b|ubiquiti|unifi|"
@@ -475,7 +478,8 @@ WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
      r"\bslow\b|performance|profile (corrupt|issue|roaming)|mapped drive|"
      r"network (drive|share)|share permission|folder permission|"
      r"outlook|\boffice\b|excel|\bword\b|onedrive|sharepoint (sync|library)|"
-     r"\bteams\b|adobe|acrobat|reinstall|re-?image|imaging|"
+     r"\bteams\b|adobe|acrobat|\binstalls?\b|installing|installation|reinstall|"
+     r"re-?image|imaging|portal (error|issue|access|down)|"
      r"new (laptop|pc|workstation|computer|machine)|"
      r"docking station|\bdock\b|\bmonitors?\b|\busb\b|keyboard|mouse|webcam|headset|"
      r"laptop|desktop|workstation|\bpc\b)"),
@@ -484,11 +488,12 @@ WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
      r"storage full|cleanup|clean ?up)"),
     (3, "voip_user", "VoIP / telephony (user level)",
      r"(\bvoip\b|\bpbx\b|\bsip\b|extension \d|\bext\b \d|voicemail|"
+     r"\bphones?\b|phone (number|system|line|call)|not connecting|"
      r"\bivr\b|auto ?attendant|\bdid\b|call quality|one-?way audio|"
      r"dial ?plan|ring group|\bfax(es|ing)?\b|call forward|caller id|"
      r"after-?hours (routing|message)|holiday (message|greeting))"),
     (3, "email_user", "email / mailbox (user level)",
-     r"(not receiving email|email (not )?(sending|receiving|delivered)|"
+     r"(\bemails?\b|not receiving email|email (not )?(sending|receiving|delivered)|"
      r"bounce|undeliverable|junk (folder|mail)|spam filter|"
      r"mailbox full|archive|retention|shared mailbox (access|permission)|"
      r"calendar (share|permission|sync))"),
@@ -500,7 +505,8 @@ WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
      r"disable (user|account)|terminate|distribution (list|group)|"
      r"email signature|out of office|auto ?reply|forward(ing)? (email|mail)|"
      r"\balias\b|licen[cs]e (assign|add|request)|add .{0,25}to .{0,25}group|"
-     r"access to (the )?(folder|share|drive|mailbox|system)|permission to)"),
+     r"access to .{0,24}(folder|share|drive|mailbox|system|portal|site|app)|"
+     r"\bpermissions?\b|permission to)"),
     (2, "request_admin", "request / scheduling / info",
      r"(how (do|can) i|how to|\bquestion\b|please (add|send|provide|update|change)|"
      r"appointment|schedul(e|ing)|availabilit|training|inquir|"
@@ -794,7 +800,7 @@ UNITS = {
     "documentation": "internal notes per ticket",
     "communication": "median minutes to first reply",
     "autonomy": "% of closes handled alone",
-    "phone": "minutes of talk time",
+    "phone": "talk minutes per active day",
 }
 
 SCALE_WORDS = {1: "needs attention", 2: "below desk norm", 3: "solid / on par",
@@ -1047,6 +1053,11 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
             "closed_per_active_day": closed_per_active_day,
             "solo_closed": solo_closed,
             "solo_closed_pct": round(100.0 * solo_closed / max(1, len(closed)), 1) if closed else None,
+            # Two different denominators, because they answer two different questions. People do
+            # work at weekends, so "days active" is out of ALL days in the window; an unaccounted
+            # day is only meaningful on a working day, since a quiet Saturday is not a finding.
+            # Using the weekday count for both produced the nonsense "active 27 of 21".
+            "days_in_window": len(window_days),
             "working_days_in_window": sum(1 for d in window_days if d.weekday() < 5),
             "active_days": len(active_days),
             "active_day_list": sorted(d.isoformat() for d in active_days),
@@ -1119,9 +1130,10 @@ DIMENSIONS: List[Tuple[str, str, str, List[float], bool, str]] = [
     ("communication", "Customer communication", "median_first_response_min",
      [480, 240, 60, 20], False, "Median minutes to first reply - lower is better."),
     ("autonomy", "Autonomy", "solo_closed_pct",
-     [35, 55, 75, 90], True, "Share of their closes they handled without another tech stepping in."),
-    ("phone", "Phone engagement", "talk_minutes_total",
-     [15, 60, 150, 300], True, "Talk time in the period - inbound answered plus outbound."),
+     [40, 60, 80, 92], True, "Share of their closes they handled without another tech stepping in."),
+    ("phone", "Phone engagement", "talk_minutes_per_active_day",
+     [5, 20, 45, 90], True,
+     "Talk time per active day - inbound answered plus outbound, so any window compares."),
 ]
 
 
@@ -1136,7 +1148,12 @@ MIN_MINUTES_TO_SCORE = 60
 def _score(rows: List[Dict[str, Any]]) -> None:
     """Attach absolute and relative 1-5 scores, plus an overall, to every technician."""
     for r in rows:
-        r["talk_minutes_total"] = (r["phone"] or {}).get("talk_minutes", 0.0) if r["phone"] else None
+        # Rate the daily habit, not the size of the window: total talk time scored every
+        # technician 5/5 over a month while discriminating fine over a week.
+        talk = (r["phone"] or {}).get("talk_minutes", 0.0) if r["phone"] else None
+        r["talk_minutes_total"] = talk
+        r["talk_minutes_per_active_day"] = (round(talk / max(1, r["active_days"]), 1)
+                                            if talk is not None else None)
         r["insufficient_data"] = (r["tickets_touched"] < MIN_TICKETS_TO_SCORE
                                   or r["minutes"] < MIN_MINUTES_TO_SCORE)
 
@@ -1837,7 +1854,7 @@ def _tech_block(r: Dict[str, Any], narrative: str = "") -> str:
         kv("handled alone",
            f'{r["solo_closed_pct"]}%' if r["solo_closed_pct"] is not None else "n/a",
            f'{r["solo_closed"]} of {r["tickets_closed"]} closes'),
-        kv("active days", f'{r["active_days"]} of {r["working_days_in_window"]}',
+        kv("active days", f'{r["active_days"]} of {r["days_in_window"]}',
            f'{len(r["dormant_days"])} working day(s) unaccounted' if r["dormant_days"]
            else "nothing unaccounted"),
     ]))
