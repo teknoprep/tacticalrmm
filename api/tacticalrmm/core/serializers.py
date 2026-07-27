@@ -202,6 +202,45 @@ class AIProviderSerializer(serializers.ModelSerializer):
     def get_api_key_set(self, obj) -> bool:
         return bool(obj.api_key)
 
+    def validate_api_key(self, value):
+        """Refuse anything that plainly is not an API key.
+
+        A whole HTML error page was once saved here and dutifully sent to OpenAI, which
+        answered `Incorrect API key provided: <!doctyp****tml>`. The field accepted it
+        because nothing ever looked: it is a CharField, and any 139 characters fit. The
+        cost of that is paid much later and somewhere else - the chat fails with a
+        provider error that says nothing about the settings page it came from.
+
+        Deliberately shape-based, not format-based: keys differ per provider and new ones
+        appear, so this rejects what cannot be a key rather than allow-listing prefixes.
+        Surrounding whitespace is stripped rather than rejected - a trailing newline from a
+        copy/paste is the single most common way a valid key silently fails to work.
+        """
+        if value is None:
+            return value
+        v = str(value).strip()
+        if not v:
+            return v
+        if "<" in v or ">" in v:
+            raise serializers.ValidationError(
+                "That does not look like an API key - it contains HTML. If you copied an "
+                "error message by mistake, copy the key from the provider's dashboard instead."
+            )
+        if any(c.isspace() for c in v):
+            raise serializers.ValidationError(
+                "An API key cannot contain spaces or line breaks. Paste only the key itself."
+            )
+        if len(v) < 16:
+            raise serializers.ValidationError(
+                f"That key is only {len(v)} characters, which is too short to be valid."
+            )
+        if not all(32 < ord(c) < 127 for c in v):
+            raise serializers.ValidationError(
+                "That key contains non-printable or non-ASCII characters - it looks like it "
+                "was mangled in copying. Copy it again from the provider's dashboard."
+            )
+        return v
+
 
 class AITaskSerializer(serializers.ModelSerializer):
     hostname = serializers.CharField(source="agent.hostname", read_only=True)
