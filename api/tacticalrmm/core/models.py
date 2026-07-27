@@ -471,6 +471,11 @@ class CoreSettings(BaseAuditModel):
         attachment_filename: Optional[str] = None,
         attachment_type: Optional[str] = None,
         attachment_extension: Optional[str] = None,
+        # Explicit MIME type for an attachment of ANY kind. The attachment_type switch
+        # below only understands pdf/html/plaintext, so a CSV, xlsx or zip had no correct
+        # path through here at all. When this is given it wins, `attachment_filename` is
+        # used verbatim (no extension is appended), and bytes are attached as bytes.
+        attachment_mimetype: Optional[str] = None,
         alert_template: "Optional[AlertTemplate]" = None,
         override_recipients: Optional[List[str]] = [],
         override_from: Optional[str] = None,
@@ -529,7 +534,17 @@ class CoreSettings(BaseAuditModel):
             if html_body:
                 msg.add_alternative(html_body, subtype="html")
 
-            if attachment:
+            if attachment and attachment_mimetype and "/" in attachment_mimetype:
+                maintype, _, subtype = attachment_mimetype.partition("/")
+                fname = attachment_filename or "attachment"
+                if isinstance(attachment, str) and maintype == "text":
+                    msg.add_attachment(attachment, subtype=subtype or "plain", filename=fname)
+                else:
+                    data = (attachment if isinstance(attachment, (bytes, bytearray))
+                            else str(attachment).encode())
+                    msg.add_attachment(data, maintype=maintype or "application",
+                                       subtype=subtype or "octet-stream", filename=fname)
+            elif attachment:
                 match attachment_type:
                     case "pdf":
                         subtype = "pdf"

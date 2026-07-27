@@ -1258,6 +1258,7 @@ class AISendEmail(APIView):
     MAX_RECIPIENTS = 10
     MAX_SUBJECT = 200
     MAX_BODY = 100_000
+    MAX_ATTACH_B64 = 34_000_000          # ~25 MB decoded
 
     def post(self, request):
         from django.core.exceptions import ValidationError
@@ -1294,6 +1295,42 @@ class AISendEmail(APIView):
                 validate_email(e)
             except ValidationError:
                 return notify_error(f"Invalid email address: {e}")
+
+        # ---- optional attachment ------------------------------------------
+        # Sent as base64 by the bridge, whose capture store holds the bytes. The AI never
+        # handles the content (a 500KB export would not survive its context), so this is
+        # the only path by which a large file can be emailed at all.
+        import base64 as _b64
+        import re as _re
+
+        att_b64 = str(request.data.get("attachment_base64") or "")
+        att_name = str(request.data.get("attachment_filename") or "").strip()[:180]
+        att_mime = str(request.data.get("attachment_mimetype") or "").strip()[:100]
+        attachment = None
+        if att_b64:
+            if not att_name:
+                return notify_error("attachment_filename is required when sending an attachment.")
+            if len(att_b64) > self.MAX_ATTACH_B64:
+                return notify_error(
+                    f"Attachment is too large ({len(att_b64)} base64 chars); "
+                    f"limit is {self.MAX_ATTACH_B64}."
+                )
+            try:
+                attachment = _b64.b64decode(att_b64, validate=True)
+            except Exception:
+                return notify_error("attachment_base64 is not valid base64.")
+            # Path traversal and control characters have no business in a filename.
+            att_name = _re.sub(r"[\\/]+", "_", att_name)
+            att_name = _re.sub(r"[\x00-\x1f]", "", att_name) or "attachment"
+            if not att_mime:
+                ext = att_name.rsplit(".", 1)[-1].lower() if "." in att_name else ""
+                att_mime = {
+                    "csv": "text/csv", "txt": "text/plain", "log": "text/plain",
+                    "json": "application/json", "xml": "application/xml",
+                    "html": "text/html", "pdf": "application/pdf", "zip": "application/zip",
+                    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "xls": "application/vnd.ms-excel",
+                }.get(ext, "application/octet-stream")
 
         subject = str(request.data.get("subject") or "").strip()[: self.MAX_SUBJECT]
         body = str(request.data.get("body") or "")[: self.MAX_BODY]
@@ -1350,6 +1387,9 @@ class AISendEmail(APIView):
             override_from=from_address,
             override_from_name=from_name,
             html_body=html_body,
+            attachment=attachment,
+            attachment_filename=att_name if attachment else None,
+            attachment_mimetype=att_mime if attachment else None,
             test=True,
         )
         if not ok:
@@ -1358,11 +1398,13 @@ class AISendEmail(APIView):
         DebugLog.info(
             message=f"AI assistant sent email to {', '.join(recipients)} from {from_address}: "
             f"{subject} (requested by {request.user.username})"
+            + (f" [attachment: {att_name}, {len(attachment)} bytes]" if attachment else "")
         )
         return Response(
             {
                 "ok": True,
-                "detail": f"Email sent to {', '.join(recipients)} from {from_address}",
+                "detail": f"Email sent to {', '.join(recipients)} from {from_address}"
+                + (f" with attachment {att_name} ({len(attachment)} bytes)" if attachment else ""),
             }
         )
 
