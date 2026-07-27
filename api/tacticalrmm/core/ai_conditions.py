@@ -156,6 +156,14 @@ def record_occurrence(hit: Dict[str, Any], *, ticket_ref: str, customer_key: str
     from core.models import AIKnownCondition
 
     pol = hit.get("repeat_policy") or {}
+
+    # WORK WE HAVE TO DO IS NEVER AUTO-CANCELLED. Suppression exists to stop a customer-side
+    # gap or a proven-harmless notification from being re-worked every time it reports itself.
+    # A condition ruled `our_action` or `needs_human` is the opposite of that: it stays open,
+    # every time, however often it recurs. This is the line the owner drew - auto-cancel these
+    # unless we need to take care of it - and it is enforced here rather than in a prompt.
+    _ours = (hit.get("disposition") or "") in ("our_action", "needs_human")
+
     row, created = AIKnownCondition.objects.get_or_create(
         condition_key=hit["condition_key"],
         customer_key=(customer_key or "")[:200],
@@ -168,7 +176,31 @@ def record_occurrence(hit: Dict[str, Any], *, ticket_ref: str, customer_key: str
             "detail": hit.get("title", "")[:2000],
         },
     )
+    # A HUMAN MUTE IS ABOUT THE CONDITION FOR THAT CUSTOMER, NOT ABOUT ONE HOST STRING.
+    # The ledger keys on (condition, customer, host), and the host is extracted from the
+    # notification text - so re-tuning that regex, or a job being renamed, mints a brand-new
+    # identity, resets the counter to "first sighting", and walks straight past the decision a
+    # human already made. That is exactly how a muted Veeam condition came back as a fresh
+    # tracker. A mute recorded for this customer therefore applies to new host variants too.
+    muted_sibling = None
+    if not _ours:
+        muted_sibling = (AIKnownCondition.objects
+                         .filter(condition_key=hit["condition_key"],
+                                 customer_key=(customer_key or "")[:200], state="muted")
+                         .exclude(pk=row.pk).order_by("-occurrences").first())
+
     if created:
+        if muted_sibling:
+            row.state = "muted"
+            row.suppressed = 1
+            row.detail = ((row.detail or "") +
+                          f"\n\nMUTED ON ARRIVAL: this customer's condition is already muted "
+                          f"(see {muted_sibling.tracker_ref}); host identity '{row.host}' is a "
+                          f"variant of '{muted_sibling.host}'. Suppressing rather than opening a "
+                          f"new tracker.")[:4000]
+            row.save()
+            return {"action": "suppress", "row": row, "muted": True,
+                    "muted_by": muted_sibling.tracker_ref, "inherited": True}
         return {"action": "track", "row": row, "first": True}
 
     row.occurrences = (row.occurrences or 0) + 1
@@ -178,10 +210,24 @@ def record_occurrence(hit: Dict[str, Any], *, ticket_ref: str, customer_key: str
     if row.procedure_id is None and hit.get("procedure"):
         row.procedure = hit["procedure"]
 
-    # A human who muted this condition outranks the policy.
+    # A HUMAN WHO MUTED THIS CONDITION OUTRANKS THE POLICY - AND MUTED MEANS MUTED.
+    # This used to return "open", which meant the caller never cancelled: cancelling the tracker
+    # to say "stop telling me about this" silently switched suppression OFF and every later
+    # notification was worked as new. The ledger showed it plainly - ten occurrences, one
+    # suppression - while the row's own note claimed "repeats stay suppressed". They did not.
+    # A mute is an explicit human instruction, so it suppresses regardless of repeat_policy;
+    # only work we must do ourselves is exempt.
     if row.state == "muted":
-        row.save(update_fields=["occurrences", "last_ticket_ref", "tracker_ref", "procedure", "last_seen"])
-        return {"action": "open", "row": row, "reason": "condition muted by a human"}
+        if _ours:
+            row.save(update_fields=["occurrences", "last_ticket_ref", "tracker_ref",
+                                    "procedure", "last_seen"])
+            return {"action": "open", "row": row,
+                    "reason": "muted, but this condition is ours to fix"}
+        row.suppressed = (row.suppressed or 0) + 1
+        row.save(update_fields=["occurrences", "suppressed", "last_ticket_ref", "tracker_ref",
+                                "procedure", "last_seen"])
+        return {"action": "suppress", "row": row, "muted": True,
+                "muted_by": row.tracker_ref}
 
     # It came back after we thought it had stopped: reopen the tracking, do not suppress
     # silently - something changed.
@@ -195,6 +241,12 @@ def record_occurrence(hit: Dict[str, Any], *, ticket_ref: str, customer_key: str
     if row.tracker_ref == ticket_ref:
         row.save(update_fields=["occurrences", "last_ticket_ref", "procedure", "last_seen"])
         return {"action": "open", "row": row, "reason": "this IS the tracker"}
+
+    if _ours:
+        row.save(update_fields=["occurrences", "last_ticket_ref", "tracker_ref", "procedure",
+                                "last_seen"])
+        return {"action": "open", "row": row,
+                "reason": "we have to act on this condition, so it is never auto-cancelled"}
 
     if not pol.get("suppress_repeats"):
         row.save(update_fields=["occurrences", "last_ticket_ref", "tracker_ref", "procedure", "last_seen"])

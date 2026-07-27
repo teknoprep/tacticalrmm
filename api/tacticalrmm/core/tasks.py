@@ -1888,19 +1888,42 @@ def triage_ai_ticket(state_pk, force=False):
                     except Exception as e:
                         DebugLog.error(message=f"tracker-stage check failed for {row.tracker_ref}: {e}")
                 if dec["action"] == "suppress":
-                    note = (
-                        f"Known condition - suppressed automatically.\n\n"
-                        f"This is the same condition already tracked on {row.tracker_ref}: "
-                        f"\"{hit['title']}\" on {row.host or 'this system'}. "
-                        f"Occurrence {row.occurrences} of this condition; {row.suppressed} "
-                        f"notification(s) suppressed so far. Nothing new has happened and the "
-                        f"customer has already been advised, so this duplicate is cancelled "
-                        f"instead of being worked again.\n\n"
-                        f"The condition itself is NOT closed - it stays open on {row.tracker_ref} "
-                        f"until it stops recurring or a human resolves it. Matched by the approved "
-                        f"procedure \"{hit['title']}\" (condition key: {hit['condition_key']}); "
-                        f"no AI judgement was involved in this decision."
-                    )
+                    if dec.get("muted"):
+                        # A human cancelled the tracker for this condition. Saying "tracked on
+                        # <ref>" would point at a ticket they deliberately closed, so say what
+                        # actually happened instead.
+                        note = (
+                            f"Known condition - MUTED by a human, suppressed automatically.\n\n"
+                            f"\"{hit['title']}\" on {row.host or 'this system'}. A technician "
+                            f"closed the tracker for this condition ({dec.get('muted_by') or row.tracker_ref}), "
+                            f"which is a decision not to hold a ticket open for it, so this "
+                            f"notification is cancelled rather than worked again."
+                            + (" The host identity in this notification is a variant of the muted "
+                               "one, so it is treated as the same condition."
+                               if dec.get("inherited") else "") +
+                            f"\n\nOccurrence {row.occurrences} of this condition; "
+                            f"{row.suppressed} notification(s) suppressed so far. The condition "
+                            f"is still on the books and still counted - it is reported in the "
+                            f"open-ticket review - it just no longer creates work. Un-mute it to "
+                            f"start holding tickets open again.\n\n"
+                            f"Matched by the approved procedure \"{hit['title']}\" (condition key: "
+                            f"{hit['condition_key']}); no AI judgement was involved, and nothing "
+                            f"that we have to fix ourselves is ever cancelled this way."
+                        )
+                    else:
+                        note = (
+                            f"Known condition - suppressed automatically.\n\n"
+                            f"This is the same condition already tracked on {row.tracker_ref}: "
+                            f"\"{hit['title']}\" on {row.host or 'this system'}. "
+                            f"Occurrence {row.occurrences} of this condition; {row.suppressed} "
+                            f"notification(s) suppressed so far. Nothing new has happened and the "
+                            f"customer has already been advised, so this duplicate is cancelled "
+                            f"instead of being worked again.\n\n"
+                            f"The condition itself is NOT closed - it stays open on {row.tracker_ref} "
+                            f"until it stops recurring or a human resolves it. Matched by the approved "
+                            f"procedure \"{hit['title']}\" (condition key: {hit['condition_key']}); "
+                            f"no AI judgement was involved in this decision."
+                        )
                     try:
                         _hd_op("cancel_ticket", {"ticket": st.ticket_ref, "reason": note})
                     except Exception as e:
