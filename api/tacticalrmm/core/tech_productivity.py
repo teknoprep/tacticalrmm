@@ -338,102 +338,371 @@ def match_pbx(tech_names: List[str], extensions: Dict[str, str],
 # Complexity, 1-5
 # --------------------------------------------------------------------------------------
 
-# Owner's ruling: "figuring out hack attempts and creating new servers is high up".
-COMPLEXITY_RULES: List[Tuple[int, str, str]] = [
-    (5, "security incident", r"\b(hack|hacked|hacking|breach|compromis|intrusion|ransomware|"
-                             r"crypto ?lock|malware|trojan|rootkit|exfiltrat|brute ?force|"
-                             r"unauthorized access|unauthorised access|security incident|"
-                             r"fraud|spoof|impersonat|bec\b|account takeover|data ?loss)"),
-    (5, "server build / infrastructure", r"\b(new server|build (a )?server|provision|"
-                                         r"domain controller|hyper-?v|esxi|vmware|proxmox|"
-                                         r"virtual machine|vm build|migrat|cutover|"
-                                         r"forest|new site|new tenant|failover|cluster|"
-                                         r"raid|san\b|hypervisor|datacenter|data centre)"),
-    (4, "network / firewall / VPN", r"\b(firewall|fortigate|sonicwall|meraki|pfsense|vlan|"
-                                    r"subnet|routing|route|bgp|ospf|vpn|ipsec|site-?to-?site|"
-                                    r"switch stack|dhcp scope|dns zone|wan|isp outage|"
-                                    r"packet loss|latency|certificate|ssl|tls)"),
-    (4, "identity / directory / tenant", r"\b(active directory|azure ad|entra|group policy|gpo|"
-                                         r"sso|saml|oauth|mfa|conditional access|"
-                                         r"tenant|licen[cs]e|exchange online|mailbox migration|"
-                                         r"offboard|onboard)"),
-    (4, "backup / restore / recovery", r"\b(restore|recover|corrupt|data loss|veeam|"
-                                       r"backup fail|replication|bare ?metal|disaster)"),
-    (3, "VoIP / telephony", r"\b(voip|pbx|sip|extension|ivr|voicemail|did\b|call quality|"
-                            r"one-?way audio|dial ?plan|ring group|fax)"),
-    (3, "application / device fix", r"\b(install|reinstall|upgrade|update|driver|printer|"
-                                    r"scanner|mapped drive|share|permission|outlook|office|"
-                                    r"quickbooks|sage|adobe|crash|slow|freez|blue ?screen|"
-                                    r"bsod|profile|sync)"),
-    (2, "account / access request", r"\b(password|reset|unlock|locked out|new user|"
-                                    r"distribution list|signature|forward|alias|"
-                                    r"add user|remove user|access to)"),
-    (2, "how-to / question", r"\b(how do i|how to|question|request|please add|can you|"
-                             r"training|walk ?through)"),
+# WHAT MAKES A TICKET HARD - and what does not.
+#
+# The first version of this rated a ticket on the HIGHER of "subject matter" and "effort
+# evidence", where effort evidence meant message count, number of participants and elapsed time.
+# Reviewed against real tickets, that was plainly wrong in both directions:
+#
+#   * "Tony's Apple ID" scored 4/5 - thirteen messages and six people. It is a password-tier task
+#     that generated a lot of email. Chatter is COORDINATION FRICTION, not technical difficulty.
+#   * "Appointment Request" scored 4/5 for the same reason. It is a scheduling message.
+#   * "[SQL Performance] SQL25-1 - High-impact missing indexes on Sage 100" scored 3/5, and
+#     "[Hardware] FBAG pve245 - NVMe boot disk reporting recurring media/read errors" scored 3/5.
+#     Index tuning on a live ERP and a failing hypervisor boot disk are specialist work.
+#   * "Proxmox Backup Report - 2026-07-25" scored 5/5 off a single automated message, because the
+#     word "Proxmox" appeared. A machine posting a clean report is not work at all.
+#   * "Network Scan for Cyber Insurance Renewal" scored 1/5.
+#
+# So the model changed shape. Message volume is REMOVED from complexity entirely and reported on
+# its own axis as coordination load. Complexity is now driven by the skill the work required,
+# with evidence-based adjustments:
+#
+#   tier      what class of work is this, from a precise taxonomy (the dominant term)
+#   + rarity  is this work only one person on this desk actually does? (computed, not assumed -
+#             this is the "only Chris can do that" signal, and it also exposes key-person risk)
+#   + depth   did someone actually get their hands on a machine, or was it all conversation?
+#   + scope   does it hit a whole site, production, or many users?
+#   + reopen  did it come back?
+#
+# Automated noise is caught FIRST and cannot be promoted by keywords: a clean report is tier 1
+# however much infrastructure vocabulary it contains, while the same subject carrying a fault is
+# rated on the fault.
+
+# A machine-generated message: recurring report shapes this desk actually receives.
+RE_MACHINE = re.compile(
+    r"(vzdump|backup status|backup report|proxmox backup report|zfs|\bsmart\b report|"
+    r"weekly .{0,20}(review|report|summary)|daily .{0,20}(report|summary)|"
+    r"report - \d{4}-\d{2}-\d{2}|status:|health ?check)", re.I)
+# Words that mean the machine is reporting a PROBLEM rather than a clean run.
+RE_FAULT = re.compile(
+    r"(fail(ed|ure|ing)?|error|critical|warning|\bdown\b|offline|detected|"
+    r"issue|problem|degraded|exceeded|expired|stale|missing|corrupt|"
+    r"not running|unreachable|denied|breach|full\b)", re.I)
+RE_CLEAN = re.compile(
+    r"(success(ful)?|completed|no (issues|findings|action)|healthy|\bok\b|"
+    r"nothing to report|all good|passed)", re.I)
+
+# (tier, category, human label, pattern). ALL rules are tested and the HIGHEST tier wins, so a
+# ticket mentioning both a password and a domain controller is rated as domain-controller work.
+WORK_TAXONOMY: List[Tuple[int, str, str, str]] = [
+    # ---- 5: expert, high-risk, or business-stopping ----
+    (5, "security_incident", "security incident",
+     r"\b(hack(ed|ing)?|breach|compromis(e|ed|ing)|ransom ?ware|crypto ?lock(er)?|"
+     r"exfiltrat|intrusion|brute ?force|account takeover|unauthori[sz]ed access|"
+     r"unauthorised access|malware|trojan|rootkit|keylogger|impersonat|"
+     r"user at risk|risky (user|sign-?in)|fraud(ulent)?|\bbec\b|"
+     r"business email compromise|phishing (attack|campaign)|spoof(ed|ing))\b"),
+    (5, "outage", "production outage",
+     r"(\b(is |are |site |server |network |everything )?down\b|outage|"
+     r"\boffline\b|entire (office|site|network|company)|all (users|staff|employees)|"
+     r"everyone (is|can'?t|cannot)|nobody can|no one can|business stopped|"
+     r"cannot work|can'?t work at all)"),
+    (5, "infra_project", "server / infrastructure project",
+     r"\b(domain controller|\bdc\b promotion|active directory (migration|forest|"
+     r"domain) |forest|hyper-?v (host|cluster|setup)|esxi|vmware|vcenter|"
+     r"proxmox (cluster|node|host|ve\b)|hypervisor|decomission|decommission|"
+     r"new server (build|setup|install)|server (build|rebuild|migration)|"
+     r"migrat(e|ion|ing) (server|domain|tenant|mailboxes|data)|cutover|"
+     r"failover|\bcluster\b|\bsan\b|\braid\b|storage array|"
+     r"bare ?metal|disaster recovery|\bdr\b test)\b"),
+    (4, "server_admin", "server administration",
+     r"(\bservers?\b[ -]{0,3}(upgrade|update|patch|maintenance|reboot|restart|migration|"
+     r"build|rebuild|install|setup|config|provision|down|offline|issue|problem|error|"
+     r"fail|crash|hang)|"
+     r"(upgrade|patch|update|maintenance|reboot|restart|rebuild|provision|configure)"
+     r"[ -]{0,3}(the )?\bservers?\b|"
+     r"\bhost\b (down|offline|reboot|maintenance)|windows server \d)"),
+    (5, "data_recovery", "data loss / recovery",
+     r"(data loss|lost (all )?data|database (corrupt|recovery)|corrupt(ed|ion) "
+     r"(database|volume|array)|restore (the )?(server|database|domain))"),
+    # ---- 4: advanced / specialist, bounded in scope ----
+    (4, "server_hardware", "server hardware fault",
+     r"(\bnvme\b|boot disk|\bssd\b (fail|error)|disk (fail|error|dying)|"
+     r"smart (error|fail|warning)|media (error|read error)|read errors?|"
+     r"degraded (array|raid|pool)|power supply|\bpsu\b|controller fail(ure)?|"
+     r"memory (error|fault)|\becc\b error|overheat)"),
+    (4, "database", "database / ERP performance",
+     r"(\bsql\b|mssql|sql server|\bdatabase\b|missing index|index(es)? "
+     r"(opportunit|recommend)|query (plan|performance)|deadlock|"
+     r"mas ?90|mas_?fbi|sage ?100|\berp\b|quickbooks (server|database)|"
+     r"table scan|tempdb)"),
+    (4, "rds_vdi", "RDS / terminal services",
+     r"(\brds\b|remote desktop (services|licensing|gateway)|terminal server|"
+     r"session host|rd licensing|licensing grace|thin client|citrix|"
+     r"published (app|desktop)|remote app)"),
+    (4, "directory", "directory / identity infrastructure",
+     r"(group polic|\bgpo\b|active directory|\bad\b (user|group|ou\b|sync)|"
+     r"\bdns\b (zone|record|server|resolution)|dhcp (scope|server)|"
+     r"kerberos|\bldap\b|sysvol|ad ?connect|replication|\bou\b structure|"
+     r"trust relationship|secure channel)"),
+    (4, "m365_tenant", "M365 / mail infrastructure",
+     r"(tenant|exchange online|mail ?flow|\bspf\b|\bdkim\b|\bdmarc\b|"
+     r"mx record|mailbox (migration|move)|conditional access|\bentra\b|"
+     r"azure ad|smtp relay|mail (not )?(routing|delivery)|"
+     r"quarantine|transport rule|journal)"),
+    (4, "network_infra", "network infrastructure",
+     r"(firewall|fortigate|forti ?os|sonicwall|meraki|pfsense|"
+     r"\bvlan\b|subnet|\bbgp\b|\bospf\b|\bvpn\b|ipsec|site-?to-?site|"
+     r"\bswitch\b|switch stack|\bstp\b|spanning tree|trunk port|"
+     r"wireless (controller|infrastructure)|access point|\bap\b (issue|down|"
+     r"offline)|\bptp\b|backhaul|\buisp\b|ubiquiti|unifi|"
+     r"packet loss|latency|jitter|throughput|bandwidth|"
+     r"certificate|\bssl\b|\btls\b|public ip|port forward|\bnat\b)"),
+    (4, "backup_fault", "backup / replication fault",
+     r"(backup (fail|error|issue|problem|missed|not running)|"
+     r"vzdump.{0,40}(fail|error)|veeam.{0,30}(fail|error)|"
+     r"replication (fail|error|behind)|no recent (backup|restore point)|"
+     r"backup configuration)"),
+    (4, "security_hardening", "security assessment / hardening",
+     r"(security (audit|scan|assessment|finding|review)|vulnerabilit|"
+     r"\bcve-|pen ?test|penetration test|hardening|cis benchmark|"
+     r"antivirus exclusion|\bav\b exclusion|\bedr\b|defender (policy|exclusion)|"
+     r"cyber (insurance|liability)|compliance (scan|review)|"
+     r"windows update (service )?(disabled|stale|failing))"),
+    (4, "automation", "monitoring / automation build",
+     r"(monitoring (solution|system|setup)|build (a |an )?(monitor|dashboard|report|"
+     r"alert)|alerting|\bscript(ing)?\b|\bapi\b integration|automat(e|ion)|"
+     r"powershell|\bcron\b|scheduled task|webhook|\brmm\b (policy|script))"),
+    (4, "fleet_project", "fleet-wide assessment / rollout",
+     r"(all (machines|computers|workstations|devices|pcs)|fleet|"
+     r"windows 11 (compatib|readiness|upgrade)|company-?wide|"
+     r"roll ?out|deployment|inventory (audit|review)|refresh (project|cycle))"),
+    # ---- 3: standard technical break/fix ----
+    (3, "workstation", "workstation / application fix",
+     r"(printer|print(ing|er) (queue|spooler)|scanner|scan to|driver|"
+     r"blue ?screen|\bbsod\b|crash(es|ing)?|freez(e|es|ing)|hang(s|ing)?|"
+     r"\bslow\b|performance|profile (corrupt|issue|roaming)|mapped drive|"
+     r"network (drive|share)|share permission|folder permission|"
+     r"outlook|\boffice\b|excel|\bword\b|onedrive|sharepoint (sync|library)|"
+     r"\bteams\b|adobe|acrobat|reinstall|re-?image|imaging|"
+     r"new (laptop|pc|workstation|computer|machine)|"
+     r"docking station|\bdock\b|\bmonitors?\b|\busb\b|keyboard|mouse|webcam|headset|"
+     r"laptop|desktop|workstation|\bpc\b)"),
+    (3, "disk_space", "disk space / cleanup",
+     r"(disk space|drive .{0,12}full|\bc:\s*drive|low (disk|space)|"
+     r"storage full|cleanup|clean ?up)"),
+    (3, "voip_user", "VoIP / telephony (user level)",
+     r"(\bvoip\b|\bpbx\b|\bsip\b|extension \d|\bext\b \d|voicemail|"
+     r"\bivr\b|auto ?attendant|\bdid\b|call quality|one-?way audio|"
+     r"dial ?plan|ring group|\bfax(es|ing)?\b|call forward|caller id|"
+     r"after-?hours (routing|message)|holiday (message|greeting))"),
+    (3, "email_user", "email / mailbox (user level)",
+     r"(not receiving email|email (not )?(sending|receiving|delivered)|"
+     r"bounce|undeliverable|junk (folder|mail)|spam filter|"
+     r"mailbox full|archive|retention|shared mailbox (access|permission)|"
+     r"calendar (share|permission|sync))"),
+    # ---- 2: routine account and administrative tasks ----
+    (2, "account_access", "account / access task",
+     r"(password|\breset\b|unlock|locked out|\bmfa\b|\b2fa\b|"
+     r"apple ?id|icloud|google account|"
+     r"new (user|hire|employee|starter)|on-?board|off-?board|"
+     r"disable (user|account)|terminate|distribution (list|group)|"
+     r"email signature|out of office|auto ?reply|forward(ing)? (email|mail)|"
+     r"\balias\b|licen[cs]e (assign|add|request)|add .{0,25}to .{0,25}group|"
+     r"access to (the )?(folder|share|drive|mailbox|system)|permission to)"),
+    (2, "request_admin", "request / scheduling / info",
+     r"(how (do|can) i|how to|\bquestion\b|please (add|send|provide|update|change)|"
+     r"appointment|schedul(e|ing)|availabilit|training|inquir|"
+     r"\bquote\b|pricing|\border\b|purchase|\bpo\b \d|"
+     r"equipment (return|pickup|disposal)|decommissioned .{0,20}equipment|"
+     r"\brenewal\b|contract|invoice)"),
+    # ---- 1: automated noise and non-technical ----
+    (1, "junk", "junk / non-IT",
+     r"(unsubscribe|newsletter|marketing|webinar|promotion|"
+     r"sales (enquiry|inquiry|call)|cold call|partnership opportunity)"),
 ]
 
+_COMPILED_TAXONOMY = [(tier, cat, label, re.compile(pat, re.I))
+                      for tier, cat, label, pat in WORK_TAXONOMY]
 
-def complexity_1_5(ticket: Dict[str, Any]) -> Dict[str, Any]:
-    """Rate one ticket 1-5 for difficulty, from evidence plus subject matter.
+TIER_WORDS = {1: "no real work / automated", 2: "routine task", 3: "standard technical",
+              4: "advanced / specialist", 5: "expert or business-critical"}
 
-    Two independent readings, and the HIGHER wins: subject matter (a breach is hard even if it
-    was solved in one message by someone who has seen it before) and effort signals (a printer
-    that took nine messages, three people and two days was, in fact, hard). Taking the maximum
-    is deliberate - taking an average would flatten both signals into a permanent 3.
+RE_SCOPE = re.compile(
+    r"(all (users|staff|machines|computers|devices|employees)|"
+    r"entire (office|site|network|company|building)|everyone|multiple (users|people|sites)|"
+    r"whole (office|site|company)|site-?wide|company-?wide|"
+    r"\bproduction\b|business critical|mission critical)", re.I)
+
+
+def classify_work(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    """What KIND of work is this, and what skill tier does it sit at? No effort signals here.
+
+    Returns the highest-tier match across the whole taxonomy, so the hardest thing mentioned is
+    what the ticket is about. Machine-generated messages are resolved first, because otherwise
+    their vocabulary ("Proxmox", "backup", "SQL") drags routine noise up to expert tier.
     """
-    subj = f'{ticket.get("subject") or ""} {(ticket.get("body") or "")[:400]}'.lower()
+    subj = (ticket.get("subject") or "").strip()
+    body = (ticket.get("body") or "")[:600]
+    text = f"{subj} {body}"
+
+    # Bracketed prefixes are this desk's own alert taxonomy and are strong, cheap signal.
+    prefix = ""
+    m = re.match(r"^\s*\[([^\]]{2,30})\]", subj)
+    if m:
+        prefix = m.group(1).strip().lower()
+
+    machine = bool(RE_MACHINE.search(subj)) or prefix in (
+        "success", "warning", "alert", "hardware", "disk space", "sql performance",
+        "performance", "networking", "security audit", "rds", "backup")
+    fault = bool(RE_FAULT.search(text))
+    clean = bool(RE_CLEAN.search(subj)) and not fault
+
+    # A machine reporting a clean run is not work, whatever words it contains.
+    if machine and clean:
+        return {"tier": 1, "category": "automated_ok", "label": "automated report, nothing wrong",
+                "machine": True, "fault": False}
+
+    # Categories judged on the SUBJECT ALONE. An outage is announced in the subject line; a
+    # customer writing "the internet was down yesterday" in the body of a routine request is not
+    # reporting one, and letting body text reach tier 5 made a monitoring-build ticket read as a
+    # production outage.
+    subject_only = {"outage"}
+    best = (0, "", "")
+    for tier, cat, label, rx in _COMPILED_TAXONOMY:
+        haystack = subj if cat in subject_only else text
+        if tier > best[0] and rx.search(haystack):
+            best = (tier, cat, label)
+    # PRECEDENCE: building something that watches for outages is a project, not an outage.
+    # "Build monitoring solution to pinpoint intermittent internet drops and site down events"
+    # matched both, and taking the maximum rated a planned piece of engineering as a live
+    # emergency. The same applies to fleet rollouts that mention machines being down.
+    if best[1] == "outage":
+        for tier, cat, label, rx in _COMPILED_TAXONOMY:
+            if cat in ("automation", "fleet_project") and rx.search(text):
+                best = (4, cat, label)
+                break
+
+    if best[0]:
+        tier, cat, label = best
+    elif machine and fault:
+        tier, cat, label = 3, "machine_fault", "automated alert with a fault"
+    elif machine:
+        tier, cat, label = 1, "automated_ok", "automated report"
+    elif not subj:
+        tier, cat, label = 1, "unknown", "no subject"
+    else:
+        tier, cat, label = 2, "unclassified", "unclassified request"
+
+    # A machine alert that nobody could classify above tier 2 is still a real fault to chase.
+    if machine and fault and tier < 3:
+        tier, cat, label = 3, "machine_fault", "automated alert with a fault"
+    return {"tier": tier, "category": cat, "label": label, "machine": machine, "fault": fault}
+
+
+def coordination_1_5(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    """How much CHASING did this take? Message volume, people involved, elapsed time.
+
+    Its own axis, deliberately. This is what used to contaminate the complexity rating: real work
+    and endless email are both expensive, but they are different problems with different fixes,
+    and averaging them into one number hid both.
+    """
     events = ticket.get("events") or []
-    reasons: List[str] = []
-
-    topic, topic_label = 1, ""
-    for level, label, pattern in COMPLEXITY_RULES:
-        if re.search(pattern, subj):
-            if level > topic:
-                topic, topic_label = level, label
-            break
-    if topic_label:
-        reasons.append(topic_label)
-
-    cls = ticket.get("class") or ""
-    if cls == "alert_clean":
-        topic = min(topic, 1)
-        reasons = ["automated alert, nothing wrong"]
-    elif cls == "alert_actionable" and topic <= 2:
-        topic = max(topic, 2)
-
     msgs = len(events)
-    staff_msgs = sum(1 for e in events if e.get("kind") == "staff")
     participants = len({e.get("actor") for e in events})
-    span_h = 0.0
     times = sorted([t for t in (_parse(e.get("at")) for e in events) if t])
-    if len(times) >= 2:
-        span_h = (times[-1] - times[0]).total_seconds() / 3600.0
+    span_h = (times[-1] - times[0]).total_seconds() / 3600.0 if len(times) >= 2 else 0.0
 
-    # Calibrated against this desk's real distribution. The first cut made 4 the most common
-    # rating on the desk, which is useless: if most work is "hard", the word has stopped
-    # meaning anything. Participant counts in particular are weak evidence - the customer, the
-    # bot and two techs on a thread is four "participants" and often a trivial ticket - so they
-    # no longer promote a ticket on their own.
-    effort = 1
-    if msgs >= 4 or staff_msgs >= 2:
-        effort = 2
-    if msgs >= 8 or (msgs >= 6 and participants >= 4):
-        effort = 3
-    if msgs >= 16 or (msgs >= 12 and participants >= 5) or span_h >= 120:
-        effort = 4
-    if msgs >= 28 or (msgs >= 20 and span_h >= 168):
-        effort = 5
-    if effort >= 3:
-        reasons.append(f"{msgs} messages, {participants} people"
-                       + (f", {round(span_h / 24, 1)}d elapsed" if span_h >= 24 else ""))
+    score = 1
+    if msgs >= 4 or participants >= 3:
+        score = 2
+    if msgs >= 8 or participants >= 4 or span_h >= 48:
+        score = 3
+    if msgs >= 14 or participants >= 5 or span_h >= 120:
+        score = 4
+    if msgs >= 22 or participants >= 6 or span_h >= 240:
+        score = 5
+    bits = [f"{msgs} messages", f"{participants} people"]
+    if span_h >= 24:
+        bits.append(f"{round(span_h / 24, 1)} days")
+    return {"score": score, "why": ", ".join(bits), "msgs": msgs,
+            "participants": participants, "span_hours": round(span_h, 1)}
 
-    score = max(topic, effort)
-    if ticket.get("reopened"):
-        score = min(5, score + 1)
-        reasons.append("reopened")
-    return {"score": int(max(1, min(5, score))),
-            "why": ", ".join(reasons[:3]) or "routine, little activity recorded",
-            "topic": topic, "effort": effort}
+
+def rate_tickets(tickets: List[Dict[str, Any]], tech_names: set,
+                 hands_on_refs: Optional[set] = None) -> Dict[str, Any]:
+    """Rate every ticket 1-5 for complexity, in three passes over the whole set.
+
+    Rarity cannot be judged one ticket at a time - "only one person on this desk does this" is a
+    fact about the desk, so the categories have to be counted first. That is the owner's point
+    about work only one technician can do, and it is also how key-person risk becomes visible.
+    """
+    hands_on_refs = hands_on_refs or set()
+
+    # Pass 1: what kind of work is each ticket, and how much chasing did it take.
+    for t in tickets:
+        w = classify_work(t)
+        t["work"] = w
+        t["coordination"] = coordination_1_5(t)
+
+    # Pass 2: who handles each category across the desk.
+    cat_closers: Dict[str, set] = {}
+    cat_counts: Dict[str, int] = {}
+    for t in tickets:
+        cat = t["work"]["category"]
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        for actor in (t.get("actor_minutes") or {}):
+            if actor in tech_names:
+                cat_closers.setdefault(cat, set()).add(actor)
+
+    # Categories that are real specialist ground: enough volume to be a pattern, but only one
+    # person on the desk ever touches them.
+    specialist_cats = {c for c, who in cat_closers.items()
+                       if len(who) == 1 and cat_counts.get(c, 0) >= 2
+                       and c not in ("automated_ok", "junk", "unknown", "unclassified")}
+
+    # Pass 3: final complexity.
+    for t in tickets:
+        w = t["work"]
+        tier = w["tier"]
+        reasons = [w["label"]]
+        boosts = 0
+
+        cat = w["category"]
+        if cat in specialist_cats and tier >= 3:
+            boosts += 1
+            reasons.append(f"only one tech on this desk handles {w['label']}")
+        if t.get("ref") in hands_on_refs and tier >= 2:
+            boosts += 1
+            reasons.append("hands-on device work, not just correspondence")
+        if RE_SCOPE.search(f'{t.get("subject") or ""} {(t.get("body") or "")[:400]}') and tier >= 2:
+            boosts += 1
+            reasons.append("affects a whole site or production")
+        if t.get("reopened"):
+            boosts += 1
+            reasons.append("reopened")
+
+        # Noise stays noise however it is decorated.
+        score = 1 if cat in ("automated_ok", "junk") else min(5, tier + min(2, boosts))
+        t["cx5"] = int(max(1, score))
+        t["cx5_why"] = ", ".join(reasons[:3])
+        t["cx5_tier"] = tier
+        t["cx5_category"] = cat
+        t["cx5_specialist"] = cat in specialist_cats
+        t["coord5"] = t["coordination"]["score"]
+        t["coord_why"] = t["coordination"]["why"]
+
+    return {"specialist_categories": sorted(specialist_cats),
+            "category_closers": {c: sorted(w) for c, w in cat_closers.items()},
+            "category_counts": cat_counts}
+
+
+def ticket_hands_on_refs(hours: int) -> set:
+    """Tickets where somebody actually worked on a machine, from the ledger.
+
+    Distinguishes "solved it" from "talked about it", which no amount of subject-line parsing can.
+    """
+    from django.utils import timezone as djangotime
+
+    from core.models import TicketWorkEntry
+
+    since = djangotime.now() - timedelta(hours=max(1, int(hours or 24)))
+    return set(TicketWorkEntry.objects
+               .filter(started_at__gte=since, superseded_by=None,
+                       surface__in=("rmm_activity", "device_chat"))
+               .exclude(ticket_ref="")
+               .values_list("ticket_ref", flat=True))
 
 
 def _parse(v) -> Optional[datetime]:
@@ -515,6 +784,18 @@ def score_relative(value: Optional[float], peers: List[float], higher_is_better=
         return 2
     return 1
 
+
+# Units for the measured values, so the figures table can be read without decoding field names.
+UNITS = {
+    "throughput": "closed per active day",
+    "complexity": "avg difficulty, 1-5",
+    "efficiency": "minutes per complexity point",
+    "ai_leverage": "% of their time with the AI",
+    "documentation": "internal notes per ticket",
+    "communication": "median minutes to first reply",
+    "autonomy": "% of closes handled alone",
+    "phone": "minutes of talk time",
+}
 
 SCALE_WORDS = {1: "needs attention", 2: "below desk norm", 3: "solid / on par",
                4: "strong", 5: "excellent"}
@@ -607,14 +888,11 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
     if phone.get("ok"):
         pbx = match_pbx(names, phone.get("extensions") or {}, pbx_overrides)
 
-    # Rate every ticket 1-5 once, up front: several people can touch one ticket and the rating
-    # must be identical wherever it appears.
-    for t in tickets:
-        cx = complexity_1_5(t)
-        t["cx5"] = cx["score"]
-        t["cx5_why"] = cx["why"]
-
     tech_names = set(names)
+    # Rate every ticket 1-5 once, up front: several people can touch one ticket and the rating
+    # must be identical wherever it appears. Needs the whole set at once, because "only one person
+    # on this desk does this kind of work" is a fact about the desk, not about a ticket.
+    rating = rate_tickets(tickets, tech_names, hands_on_refs=ticket_hands_on_refs(hours))
     by_ref = {t.get("ref"): t for t in tickets}
     today = djangotime.localtime(djangotime.now()).date()
     days_in_window = max(1, int(round(hours / 24.0)))
@@ -670,6 +948,12 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
         cx_closed = [t["cx5"] for t in closed]
         dist = {n: sum(1 for t in touched if t["cx5"] == n) for n in range(1, 6)}
         hard = [t for t in touched if t["cx5"] >= 4]
+        # WORK ONLY THIS PERSON DOES. The owner's point: some of what a senior tech handles is not
+        # merely hard, it is unshared - which is both a strength and a key-person risk, and neither
+        # is visible if it is averaged into a complexity number.
+        specialist = [t for t in touched if t.get("cx5_specialist")]
+        spec_cats = sorted({t["work"]["label"] for t in specialist})
+        coord_heavy = [t for t in touched if (t.get("coord5") or 0) >= 4]
 
         # Time. The ledger is authoritative where it has entries; the message-derived estimate
         # from the activity report is the fallback so a tech with no ledger rows is not erased.
@@ -739,6 +1023,15 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
             "complexity_weighted_closed": cx_weighted_closed,
             "hard_tickets": len(hard),
             "hard_tickets_closed": sum(1 for t in hard if t.get("terminal")),
+            "specialist_tickets": len(specialist),
+            "specialist_areas": spec_cats,
+            "coordination_heavy": len(coord_heavy),
+            "avg_coordination": round(sum(t.get("coord5") or 1 for t in touched)
+                                      / max(1, len(touched)), 2),
+            "work_mix": dict(sorted(
+                ((t["work"]["label"], sum(1 for x in touched
+                                          if x["work"]["label"] == t["work"]["label"]))
+                 for t in touched), key=lambda kv: -kv[1])),
             "ai_time_share_pct": ai_share,
             "ai_tickets": tickets_with_ai,
             "ai_ticket_share_pct": ai_ticket_share,
@@ -762,6 +1055,8 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
                 {"ref": t.get("ref"), "url": t.get("url"), "subject": (t.get("subject") or "")[:90],
                  "company": t.get("company") or "", "stage": t.get("stage") or "",
                  "closed_at": t.get("last_activity") or "", "cx5": t["cx5"], "cx5_why": t["cx5_why"],
+                 "work": t["work"]["label"], "coord5": t.get("coord5"),
+                 "specialist": bool(t.get("cx5_specialist")),
                  "minutes": (t.get("actor_minutes") or {}).get(name, 0),
                  "msgs": t.get("msgs") or 0,
                  "first_response_min": t.get("first_response_minutes"),
@@ -773,6 +1068,8 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
                 {"ref": t.get("ref"), "url": t.get("url"), "subject": (t.get("subject") or "")[:90],
                  "company": t.get("company") or "", "stage": t.get("stage") or "",
                  "cx5": t["cx5"], "last_activity": t.get("last_activity") or "",
+                 "work": t["work"]["label"], "coord5": t.get("coord5"),
+                 "specialist": bool(t.get("cx5_specialist")),
                  "minutes": (t.get("actor_minutes") or {}).get(name, 0)}
                 for t in sorted(open_assigned, key=lambda t: t.get("last_activity") or "")
             ],
@@ -793,7 +1090,11 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
         "team_unanswered_calls": phone.get("team_unanswered", 0) if phone.get("ok") else None,
         "dormant_day_count": sum(len(r["dormant_days"]) for r in rows),
     }
-    return {"rows": rows, "desk": desk, "pbx": pbx, "phone_ok": bool(phone.get("ok")),
+    desk["specialist_categories"] = rating["specialist_categories"]
+    desk["specialist_owners"] = {c: rating["category_closers"].get(c, [])
+                                 for c in rating["specialist_categories"]}
+    return {"rows": rows, "desk": desk, "pbx": pbx, "rating": rating,
+            "phone_ok": bool(phone.get("ok")),
             "phone_error": phone.get("error", ""),
             "phone_dedup_dropped": phone.get("dedup_dropped", 0),
             "window_days": days_in_window}
@@ -973,6 +1274,22 @@ def integrity_checks(payload: Dict[str, Any], hours: int) -> List[Dict[str, str]
                         "effect": "The absolute thresholds are not discriminating this period; use "
                                   "the relative column for this dimension."})
 
+    # If a large share of tickets cannot be classified, every complexity-derived number is soft.
+    unc = 0
+    tot_t = 0
+    for r in rows:
+        for t in r["closed_tickets"] + r["open_ticket_list"]:
+            tot_t += 1
+            if t.get("work") in ("unclassified request", "no subject"):
+                unc += 1
+    if tot_t and round(100.0 * unc / tot_t) >= 25:
+        out.append({"severity": "warn", "area": "complexity",
+                    "finding": f"{round(100.0 * unc / tot_t)}% of tickets ({unc} of {tot_t}) have "
+                               f"subjects too vague to classify (\"IT stuff\", \"Service Laptop\") "
+                               f"and default to a routine rating of 2/5.",
+                    "effect": "Complexity is understated for whoever writes terse subjects. Better "
+                              "ticket titles would improve this directly."})
+
     # Complexity that piles into one band tells the manager nothing.
     dist: Dict[int, int] = {}
     for r in rows:
@@ -1051,10 +1368,18 @@ def audit(payload: Dict[str, Any], checks: List[Dict[str, str]], hours: int,
         "period_hours": hours,
         "desk": payload["desk"],
         "how_each_figure_is_derived": {
-            "complexity_1_5": "max(subject-matter rating, effort-evidence rating). Security "
-                              "incidents and server builds rate 5; password resets rate 2; clean "
-                              "automated alerts rate 1. Effort uses message count, participants "
-                              "and elapsed time.",
+            "complexity_1_5": "skill tier from a work taxonomy (security incident / outage / "
+                              "infrastructure project = 5, specialist infrastructure = 4, standard "
+                              "break-fix = 3, account tasks = 2, automated reports = 1), plus at "
+                              "most +2 for: work only one tech on the desk handles, hands-on device "
+                              "evidence in the ledger, whole-site or production impact, reopened. "
+                              "Message volume is deliberately EXCLUDED - it is reported separately "
+                              "as coordination_1_5, because chatter is not difficulty.",
+            "coordination_1_5": "messages, participants and elapsed days. Reported on its own axis "
+                                "so heavy chasing is never mistaken for technical difficulty.",
+            "specialist_areas": "categories of work exactly one technician handled in the period "
+                                "(minimum two tickets in the category). Expertise and key-person "
+                                "risk in the same number.",
             "time": "work ledger: attention measured from AI chat transcripts, ticket message "
                     "bursts and RMM audit activity. Falls back to estimating from ticket "
                     "messages where no ledger entry exists. Cannot see on-site work, meetings, "
@@ -1129,6 +1454,10 @@ def _coach(rows: List[Dict[str, Any]]) -> None:
 
         if r["hard_tickets_closed"] >= 2:
             good.append(f'closed {r["hard_tickets_closed"]} genuinely hard ticket(s) (complexity 4-5)')
+        if r.get("specialist_tickets"):
+            good.append(f'{r["specialist_tickets"]} ticket(s) in work nobody else on the desk does '
+                        f'({", ".join(r["specialist_areas"][:3])}) - real expertise, and a '
+                        f'single point of failure worth spreading')
         if (s["complexity"]["absolute"] or 0) >= 4:
             good.append(f'takes on difficult work (avg complexity {r["avg_complexity"]}/5)')
         if (s["throughput"]["absolute"] or 0) >= 4:
@@ -1179,8 +1508,18 @@ def _coach(rows: List[Dict[str, Any]]) -> None:
             gap.append(f'slow relative to difficulty ({r["minutes_per_complexity_point"]}m per '
                        f'complexity point) - may be stuck without asking for help')
         if (s["complexity"]["absolute"] or 5) <= 2 and r["tickets_touched"] >= 5:
-            gap.append(f'work is mostly low-complexity (avg {r["avg_complexity"]}/5) - ready to be '
-                       f'stretched onto harder tickets')
+            gap.append(f'work is mostly low-complexity (avg {r["avg_complexity"]}/5) and none of it '
+                       f'is specialist - the clearest development step is to pair them onto the '
+                       f'harder categories (infrastructure, database, network, security) that '
+                       f'currently sit with one person')
+        if (r.get("avg_coordination") or 0) - (r.get("avg_complexity") or 0) >= 0.6:
+            gap.append(f'their tickets take more chasing than they take skill (coordination '
+                       f'{r["avg_coordination"]}/5 against complexity {r["avg_complexity"]}/5) - '
+                       f'worth checking whether they are waiting on customers, or on us')
+        if r.get("coordination_heavy", 0) >= 5 and (r.get("avg_coordination") or 0) >= 2.8:
+            good.append(f'carried {r["coordination_heavy"]} ticket(s) with heavy coordination '
+                        f'(many people, many days) - chasing work to a close is real effort even '
+                        f'when the technical content is routine')
         if r["still_open"] >= 10:
             gap.append(f'{r["still_open"]} ticket(s) still open on their plate')
         if r["dormant_days"]:
@@ -1237,24 +1576,32 @@ def _bar(dist: Dict[int, int]) -> str:
 
 
 def _cards(desk: Dict[str, Any], payload: Dict[str, Any]) -> str:
-    def card(label, value, sub="", colour="#1a3c6e"):
-        return (f'<td style="border:1px solid #d8dee7;padding:12px 14px;background:#f7f9fc;text-align:center">'
-                f'<div style="font-size:22px;font-weight:700;color:{colour}">{value}</div>'
-                f'<div style="font-size:11px;color:#666;text-transform:uppercase">{label}</div>'
-                f'<div style="font-size:10.5px;color:#999">{sub}</div></td>')
-    h = ['<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%"><tr>']
-    h.append(card("technicians", desk["techs"]))
-    h.append(card("tickets closed", desk["tickets_closed"], f'{desk["tickets_touched"]} touched'))
-    h.append(card("avg complexity", f'{desk["avg_complexity"]}/5', "across the desk"))
-    h.append(card("tech time", fmt_mins(desk["minutes"]), "measured, on tickets"))
-    h.append(card("with the AI", fmt_mins(desk["ai_collab_minutes"]),
-                  f'{round(100.0 * desk["ai_collab_minutes"] / max(1.0, desk["minutes"]))}% of tech time',
-                  "#166534"))
+    """Desk headline figures. Fixed to four per row so they stay legible whether there are five
+    of them or seven - a single stretched row of seven tiles was unreadable on a phone."""
+    def card(value, label, sub="", cls=""):
+        return (f'<td class="cd"><div class="cv {cls}">{value}</div>'
+                f'<div class="cl">{label}</div><div class="cs">{sub or "&nbsp;"}</div></td>')
+
+    cards = [
+        card(desk["techs"], "technicians", "with ticket activity"),
+        card(desk["tickets_closed"], "tickets closed", f'{desk["tickets_touched"]} touched'),
+        card(f'{desk["avg_complexity"]}/5', "avg complexity", "across the desk"),
+        card(fmt_mins(desk["minutes"]), "tech time", "measured, on tickets"),
+        card(fmt_mins(desk["ai_collab_minutes"]), "with the AI",
+             f'{round(100.0 * desk["ai_collab_minutes"] / max(1.0, desk["minutes"]))}% of tech time',
+             "cg"),
+    ]
     if payload.get("phone_ok"):
-        h.append(card("talk time", fmt_mins(desk["talk_minutes"]), f'{desk["calls"]} calls'))
+        cards.append(card(fmt_mins(desk["talk_minutes"]), "talk time", f'{desk["calls"]} calls'))
     if desk.get("dormant_day_count"):
-        h.append(card("unaccounted days", desk["dormant_day_count"], "open work, no activity", "#92400e"))
-    h.append("</tr></table>")
+        cards.append(card(desk["dormant_day_count"], "unaccounted days",
+                          "open work, no activity", "ca"))
+    h = ['<table cellspacing="0" cellpadding="0" class="cdt">']
+    for i in range(0, len(cards), 4):
+        row = cards[i:i + 4]
+        h.append("<tr>" + "".join(row)
+                 + '<td class="cd pad"></td>' * (4 - len(row)) + "</tr>")
+    h.append("</table>")
     return "".join(h)
 
 
@@ -1300,55 +1647,107 @@ def _provenance(payload: Dict[str, Any], hours: int) -> str:
             + "<br>".join(bits) + "</div>")
 
 
+def _rel_mark(score: Optional[int]) -> str:
+    """The relative score as a direction plus a digit.
+
+    A bare second number next to the absolute one was the readability problem: two pills in a
+    cell with nothing saying which was which. An arrow states the direction against the desk at a
+    glance, and the digit is still there for anyone who wants the detail.
+    """
+    if score is None:
+        return '<span class="nn">&ndash;</span>'
+    glyph, cls = {5: ("&#9650;", "up"), 4: ("&#9652;", "up"), 3: ("&#8211;", "eq"),
+                  2: ("&#9662;", "dn"), 1: ("&#9660;", "dn")}[score]
+    return f'<span class="{cls}">{glyph}&#8202;{score}</span>'
+
+
 def _scorecard(rows: List[Dict[str, Any]]) -> str:
-    h = ['<h3 style="font-size:15px;color:#1a3c6e;margin:26px 0 4px">'
-         "Scorecard &mdash; every scale is 1 to 5, where 5 is best</h3>",
-         '<div style="font-size:11.5px;color:#777;margin-bottom:6px">'
-         "Each cell shows <b>absolute</b> (against fixed standards) then <b>relative</b> "
-         "(against this desk, where 3 is the desk median). Both are shown because a small team "
-         "can be uniformly strong or uniformly slipping, and only one of the two views notices.</div>",
-         '<table cellspacing="0" cellpadding="6" style="border-collapse:collapse;'
-         'font-size:12px;width:100%">']
-    head = ["Technician"] + [d[1] for d in DIMENSIONS] + ["Overall"]
-    h.append("<tr>" + "".join(
-        f'<th class="hd">{c}</th>' for c in head) + "</tr>")
-    for i, r in enumerate(sorted(rows, key=lambda x: -(x["overall_absolute"] or 0))):
-        td = 'class="s"' if i % 2 == 0 else 'class="s z"'
-        h.append(f'<tr><td {td}><b>{esc(r["name"])}</b>'
-                 + (f'<div style="font-size:10px;color:#888">ext {r["pbx"]["ext"]}</div>' if r.get("pbx") else "")
-                 + "</td>")
-        for key, _l, _f, _t, _hi, _w in DIMENSIONS:
-            s = r["scores"][key]
-            val = s["value"]
-            vs = "" if val is None else (f'{val:g}' if isinstance(val, (int, float)) else str(val))
-            h.append(f'<td {td} align="center">{_pill(s["absolute"])} {_pill(s["relative"])}'
-                     f'<div style="font-size:10px;color:#888">{esc(vs)}</div></td>')
+    """Two tables, deliberately: the scores, then the measurements they came from.
+
+    The first version put the absolute score, the relative score and the raw measured value in
+    one cell, eight times across a row - three numbers per cell with nothing labelling them, which
+    read as scattered noise. Scales are now rows (they have names and definitions, so they need
+    the width), technicians are columns, and each technician gets two fixed sub-columns: "std"
+    against fixed standards, "desk" against this desk. Raw values move to their own table so a
+    measurement is never mistaken for a score.
+    """
+    if not rows:
+        return ""
+    order = sorted(rows, key=lambda x: -(x["overall_absolute"] or 0))
+    n = len(order)
+
+    def name_head(r):
+        ext = f'<div class="sub">ext {r["pbx"]["ext"]}</div>' if r.get("pbx") else ""
+        return f'{esc(r["name"])}{ext}'
+
+    h = ['<h3 class="h3">Scorecard</h3>',
+         '<div class="note">Every scale runs <b>1&ndash;5, where 5 is best</b> (complexity is the '
+         'one exception: there 5 means hardest, not best). <b>std</b> scores against fixed '
+         'standards &mdash; is this good work, full stop. <b>desk</b> scores against this desk\'s '
+         'own median &mdash; &#9650; above it, &#8211; on par, &#9660; below it. Both are shown '
+         'because a small team can be uniformly strong or uniformly slipping, and only one of '
+         'those two views notices.</div>',
+         '<table cellspacing="0" cellpadding="0" class="sc">',
+         '<colgroup><col width="34%">' + ('<col><col>' * n) + "</colgroup>",
+         '<tr><th class="hd" rowspan="2">Scale</th>'
+         + "".join(f'<th class="hd ctr" colspan="2">{name_head(r)}</th>' for r in order)
+         + "</tr>",
+         "<tr>" + "".join('<th class="hd2 ctr">std</th><th class="hd2 ctr">desk</th>'
+                          for _ in order) + "</tr>"]
+
+    for i, (key, label, _f, _t, _hi, why) in enumerate(DIMENSIONS):
+        cls = "sr" if i % 2 == 0 else "sr z"
+        h.append(f'<tr class="{cls}"><td class="sn"><b>{esc(label)}</b>'
+                 f'<div class="sub">{esc(why)}</div></td>')
+        for r in order:
+            sc = r["scores"][key]
+            inv = (key == "complexity")
+            h.append(f'<td class="ctr sv">{_pill(sc["absolute"], invert=inv)}</td>'
+                     f'<td class="ctr sv">{_rel_mark(sc["relative"])}</td>')
+        h.append("</tr>")
+
+    h.append('<tr class="sr tot"><td class="sn"><b>Overall</b>'
+             '<div class="sub">mean of the scales above</div></td>')
+    for r in order:
         if r.get("insufficient_data"):
-            h.append(f'<td {td} align="center"><b style="font-size:11px;color:#92400e">withheld</b>'
-                     f'<div style="font-size:10px;color:#888">too little data</div></td></tr>')
+            h.append('<td class="ctr sv" colspan="2"><b class="wh">withheld</b></td>')
         else:
-            h.append(f'<td {td} align="center"><b style="font-size:14px;color:#1a3c6e">'
-                     f'{r["overall_absolute"]}</b>'
-                     f'<div style="font-size:10px;color:#888">rel {r["overall_relative"]}</div></td></tr>')
+            h.append(f'<td class="ctr sv"><b class="ov">{r["overall_absolute"]}</b></td>'
+                     f'<td class="ctr sv"><b class="ov2">{r["overall_relative"]}</b></td>')
+    h.append("</tr></table>")
+
+    # The measurements, on their own, with units.
+    h.append('<div class="note" style="margin-top:14px"><b>The measurements those scores come '
+             'from.</b> Same scales, actual figures.</div>')
+    h.append('<table cellspacing="0" cellpadding="0" class="sc">'
+             '<colgroup><col width="34%">' + ("<col>" * n) + "</colgroup>"
+             '<tr><th class="hd">Measurement</th>'
+             + "".join(f'<th class="hd ctr">{esc(r["name"].split()[0])}</th>' for r in order)
+             + "</tr>")
+    for i, (key, label, _f, _t, _hi, _why) in enumerate(DIMENSIONS):
+        cls = "sr" if i % 2 == 0 else "sr z"
+        h.append(f'<tr class="{cls}"><td class="sn">{esc(label)}'
+                 f'<div class="sub">{esc(UNITS.get(key, ""))}</div></td>')
+        for r in order:
+            v = r["scores"][key]["value"]
+            txt = "&ndash;" if v is None else f"{v:g}" if isinstance(v, (int, float)) else esc(str(v))
+            h.append(f'<td class="ctr mv">{txt}</td>')
+        h.append("</tr>")
     h.append("</table>")
+
     flatd = (rows[0].get("_flat_dimensions") if rows else None) or []
     if flatd:
-        h.append('<div style="font-size:11.5px;color:#92400e;'
-                 'background:#fffbeb;border:1px solid #fcd34d;padding:6px 9px;margin:5px 0">'
-                 f'<b>No material spread on {esc(", ".join(flatd))}</b> &mdash; the desk is tightly '
-                 "clustered there, so every relative score on those dimensions is 3 by rule, not "
-                 "by measurement. Read the absolute column for those.</div>")
+        h.append('<div class="warn"><b>No material spread on '
+                 f'{esc(", ".join(flatd))}</b> &mdash; the desk is tightly clustered there, so '
+                 'every "desk" score on those scales is 3 by rule, not by measurement. Read the '
+                 '"std" column for those.</div>')
     if any(r.get("insufficient_data") for r in rows):
         who = ", ".join(esc(r["name"]) for r in rows if r.get("insufficient_data"))
-        h.append('<div style="font-size:11.5px;color:#92400e;'
-                 'background:#fffbeb;border:1px solid #fcd34d;padding:6px 9px;margin:5px 0">'
-                 f'<b>Overall score withheld for {who}</b> &mdash; fewer than '
+        h.append(f'<div class="warn"><b>Overall score withheld for {who}</b> &mdash; fewer than '
                  f'{MIN_TICKETS_TO_SCORE} tickets or under {MIN_MINUTES_TO_SCORE} minutes of '
                  "recorded time in the period. Their individual figures are still shown, but they "
                  "cannot fairly be compared with a colleague who has a full week of recorded "
                  "work.</div>")
-    h.append('<div style="font-size:11px;color:#888;margin:4px 0 0">'
-             + " &middot; ".join(f'<b>{esc(d[1])}</b>: {esc(d[5])}' for d in DIMENSIONS) + "</div>")
     return "".join(h)
 
 
@@ -1361,160 +1760,221 @@ def _ticket_rows(items: List[Dict[str, Any]], closed=True) -> str:
     defeated the requirement that all of it be in the email. A monthly run is several hundred
     rows, so this has to scale.
     """
-    cols = (["86", "", "130", "26", "52", "34", "52", "26", "92"] if closed
-            else ["86", "", "130", "26", "52", "90", "92"])
+    cols = (["84", "", "116", "128", "26", "26", "50", "48", "24", "86"] if closed
+            else ["84", "", "116", "128", "26", "26", "50", "84", "86"])
     h = ['<table cellspacing="0" cellpadding="4" class="tt">',
          "<colgroup>" + "".join(f'<col width="{w}">' if w else "<col>" for w in cols) + "</colgroup>"]
-    head = (["Ticket", "Subject", "Company", "Cx", "Time", "Msgs", "1st resp", "AI", "Closed"]
-            if closed else ["Ticket", "Subject", "Company", "Cx", "Time", "Stage", "Last activity"])
+    head = (["Ticket", "Subject", "Company", "Type of work", "Cx", "Co", "Time", "1st resp",
+             "AI", "Closed"] if closed else
+            ["Ticket", "Subject", "Company", "Type of work", "Cx", "Co", "Time", "Stage",
+             "Last activity"])
     h.append("<tr>" + "".join(f"<th>{c}</th>" for c in head) + "</tr>")
     for i, t in enumerate(items):
         tr = "<tr>" if i % 2 == 0 else '<tr class="z">'
         link = f'<a href="{esc(t.get("url"))}" class="lk">{esc(t.get("ref"))}</a>'
+        # A star marks work only this person on the desk does - the owner's "only Chris can do
+        # that" made visible per ticket rather than buried in an average.
+        work = esc(t.get("work") or "")
+        if t.get("specialist"):
+            work = f'<span class="spec" title="only one tech on this desk handles this">&#9733;</span> {work}'
+        common = (f"{tr}<td>{link}</td>"
+                  f'<td>{esc(t.get("subject"))}</td>'
+                  f'<td>{esc((t.get("company") or "")[:24])}</td>'
+                  f'<td class="wk">{work}</td>'
+                  f'<td class="m">{_pill(t.get("cx5"), invert=True)}</td>'
+                  f'<td class="m">{_pill(t.get("coord5"), invert=True)}</td>'
+                  f'<td class="r">{fmt_mins(t.get("minutes"))}</td>')
         if closed:
             fr = t.get("first_response_min")
-            h.append(
-                f"{tr}<td>{link}</td>"
-                f'<td>{esc(t.get("subject"))}</td>'
-                f'<td>{esc((t.get("company") or "")[:26])}</td>'
-                f'<td class="m">{_pill(t.get("cx5"), invert=True)}</td>'
-                f'<td class="r">{fmt_mins(t.get("minutes"))}</td>'
-                f'<td class="m">{t.get("msgs")}</td>'
-                f'<td class="r">{fmt_mins(fr) if fr is not None else "&ndash;"}</td>'
-                f'<td class="m">{"&#10003;" if t.get("ai") else ""}</td>'
-                f'<td>{esc((t.get("closed_at") or "")[:16])}</td></tr>')
+            h.append(common
+                     + f'<td class="r">{fmt_mins(fr) if fr is not None else "&ndash;"}</td>'
+                     + f'<td class="m">{"&#10003;" if t.get("ai") else ""}</td>'
+                     + f'<td>{esc((t.get("closed_at") or "")[:16])}</td></tr>')
         else:
-            h.append(
-                f"{tr}<td>{link}</td>"
-                f'<td>{esc(t.get("subject"))}</td>'
-                f'<td>{esc((t.get("company") or "")[:26])}</td>'
-                f'<td class="m">{_pill(t.get("cx5"), invert=True)}</td>'
-                f'<td class="r">{fmt_mins(t.get("minutes"))}</td>'
-                f'<td>{esc(t.get("stage"))}</td>'
-                f'<td>{esc((t.get("last_activity") or "")[:16])}</td></tr>')
+            h.append(common
+                     + f'<td>{esc(t.get("stage"))}</td>'
+                     + f'<td>{esc((t.get("last_activity") or "")[:16])}</td></tr>')
     h.append("</table>")
     return "".join(h)
 
 
 def _tech_block(r: Dict[str, Any], narrative: str = "") -> str:
+    """One technician's page: headline figures, their scores, their review, then their tickets.
+
+    The figures are grouped into labelled sections - work, time, phone, communication - rather
+    than one long row of twelve tiles. Twelve numbers in a strip with no grouping is the same
+    readability failure as the old scorecard cells: everything present, nothing findable.
+    """
     ph = r.get("phone") or {}
+
     def kv(label, value, note=""):
         return (f'<td class="k"><div class="kv">{value}</div><div class="kl">{label}</div>'
                 + (f'<div class="kn">{note}</div>' if note else "") + "</td>")
 
-    h = [f'<div style="border:1px solid #d8dee7;border-top:3px solid #1a3c6e;margin:22px 0 0;'
-         f'padding:12px 14px">'
-         f'<div style="font-size:17px;font-weight:700;'
-         f'color:#1a3c6e">{esc(r["name"])}'
-         + (f'<span style="font-size:12px;font-weight:400;color:#666"> &mdash; extension '
-            f'{r["pbx"]["ext"]} ({esc(r["pbx"]["how"])})</span>' if r.get("pbx") else
-            '<span style="font-size:12px;font-weight:400;color:#b91c1c"> &mdash; no PBX match</span>')
-         + ('<span style="float:right;font-size:12px;color:#92400e">overall score withheld</span>'
+    def group(title, cards):
+        return (f'<tr><td class="gh" colspan="4">{title}</td></tr><tr>'
+                + "".join(cards) + ("<td class='k pad'></td>" * (4 - len(cards))) + "</tr>")
+
+    h = ['<div class="tb">',
+         f'<div class="tn">{esc(r["name"])}'
+         + (f'<span class="tx"> &mdash; extension {r["pbx"]["ext"]} '
+            f'({esc(r["pbx"]["how"])})</span>' if r.get("pbx") else
+            '<span class="tx" style="color:#b91c1c"> &mdash; no PBX match</span>')
+         + ('<span class="to" style="color:#92400e">overall score withheld</span>'
             if r.get("insufficient_data") else
-            f'<span style="float:right;font-size:13px;color:#1f2937">overall '
-            f'<b>{r["overall_absolute"]}</b>/5 absolute &middot; '
-            f'<b>{r["overall_relative"]}</b>/5 vs desk</span>')
+            f'<span class="to">overall <b>{r["overall_absolute"]}</b>/5 vs standards '
+            f'&middot; <b>{r["overall_relative"]}</b>/5 vs desk</span>')
          + "</div>"]
     if r.get("coverage_note"):
-        h.append('<div style="font-size:11.5px;color:#92400e;'
-                 'background:#fffbeb;border:1px solid #fcd34d;padding:6px 9px;margin:8px 0">'
-                 f'{esc(r["coverage_note"])}.</div>')
+        h.append(f'<div class="warn">{esc(r["coverage_note"])}.</div>')
 
-    h.append('<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%;margin:10px 0"><tr>')
-    h.append(kv("closed", r["tickets_closed"], f'{r["tickets_touched"]} touched, {r["still_open"]} still open'))
-    h.append(kv("avg complexity", f'{r["avg_complexity"]}/5',
-                f'{r["hard_tickets_closed"]} hard one(s) closed'))
-    h.append(kv("time on tickets", fmt_mins(r["minutes"]),
-                (f'{r["measured_share"]}% transcript-measured' if r["time_is_measured"]
-                 else "estimated from messages, no ledger entries")))
-    h.append(kv("avg per ticket", fmt_mins(r["avg_minutes_per_ticket"]),
-                f'{fmt_mins(r["avg_minutes_per_closed"])} per close' if r["avg_minutes_per_closed"] else ""))
-    h.append(kv("with the AI", fmt_mins(r["ai_collab_minutes"]),
-                f'{r["ai_time_share_pct"]}% of their time &middot; {r["ai_driven_actions"]} actions'))
-    h.append(kv("hands-on / RMM", fmt_mins(r["hands_on_minutes"]), "remote sessions, device work"))
-    h.append("</tr><tr>")
+    h.append('<table cellspacing="0" cellpadding="0" class="kt">')
+    h.append(group("Work", [
+        kv("closed", r["tickets_closed"],
+           f'{r["tickets_touched"]} touched, {r["still_open"]} still open'),
+        kv("avg complexity", f'{r["avg_complexity"]}/5',
+           f'{r["hard_tickets_closed"]} hard one(s) closed'),
+        kv("handled alone",
+           f'{r["solo_closed_pct"]}%' if r["solo_closed_pct"] is not None else "n/a",
+           f'{r["solo_closed"]} of {r["tickets_closed"]} closes'),
+        kv("active days", f'{r["active_days"]} of {r["working_days_in_window"]}',
+           f'{len(r["dormant_days"])} working day(s) unaccounted' if r["dormant_days"]
+           else "nothing unaccounted"),
+    ]))
+    h.append(group("Time", [
+        kv("on tickets", fmt_mins(r["minutes"]),
+           (f'{r["measured_share"]}% transcript-measured' if r["time_is_measured"]
+            else "estimated from messages")),
+        kv("avg per ticket", fmt_mins(r["avg_minutes_per_ticket"]),
+           f'{fmt_mins(r["avg_minutes_per_closed"])} per close'
+           if r["avg_minutes_per_closed"] else ""),
+        kv("with the AI", fmt_mins(r["ai_collab_minutes"]),
+           f'{r["ai_time_share_pct"]}% of their time &middot; {r["ai_driven_actions"]} actions'),
+        kv("hands-on / RMM", fmt_mins(r["hands_on_minutes"]), "remote sessions, device work"),
+    ]))
     if ph:
-        h.append(kv("talk time", fmt_mins(ph.get("talk_minutes")),
-                    f'{ph.get("calls_in", 0)} in, {ph.get("calls_out", 0)} out'))
-        h.append(kv("avg call", fmt_mins(ph.get("avg_call_minutes")),
-                    f'longest {fmt_mins(ph.get("longest_call_minutes"))}'))
+        h.append(group("Phone", [
+            kv("talk time", fmt_mins(ph.get("talk_minutes")),
+               f'{ph.get("calls_in", 0)} answered in, {ph.get("calls_out", 0)} out'),
+            kv("avg call", fmt_mins(ph.get("avg_call_minutes")),
+               f'longest {fmt_mins(ph.get("longest_call_minutes"))}'),
+            kv("total accounted", fmt_mins(r["minutes_incl_phone"]), "tickets + phone"),
+        ]))
     else:
-        h.append(kv("talk time", "n/a", "no PBX identity matched"))
-        h.append(kv("avg call", "n/a", ""))
-    h.append(kv("total accounted", fmt_mins(r["minutes_incl_phone"]), "tickets + phone"))
+        h.append(group("Phone", [kv("talk time", "n/a", "no PBX identity matched")]))
     fr = r["median_first_response_min"]
-    h.append(kv("1st response", fmt_mins(fr) if fr is not None else "n/a", "median, to the customer"))
-    h.append(kv("wrote", f'{r["replies_written"]} replies',
-                f'{r["notes_written"]} notes &middot; avg {r["avg_reply_chars"]} chars'))
-    h.append(kv("active days", f'{r["active_days"]} of {r["working_days_in_window"]}',
-                f'{len(r["dormant_days"])} working day(s) unaccounted' if r["dormant_days"]
-                else "nothing unaccounted"))
-    h.append("</tr></table>")
+    h.append(group("Communication", [
+        kv("1st response", fmt_mins(fr) if fr is not None else "n/a",
+           "median, to the customer"),
+        kv("replies written", r["replies_written"], f'avg {r["avg_reply_chars"]} chars'),
+        kv("internal notes", r["notes_written"], f'{r["notes_per_ticket"]} per ticket'),
+        kv("closed w/o reply", r["closed_without_reply"],
+           "never wrote to the customer" if r["closed_without_reply"] else "none"),
+    ]))
+    h.append("</table>")
 
-    h.append('<table cellspacing="0" cellpadding="0" style="width:100%"><tr>'
-             '<td style="font-size:11.5px;color:#555;'
-             'padding-right:10px" width="210">Complexity mix of their tickets<br>'
-             + _bar(r["complexity_distribution"]) + "</td>"
-             '<td style="font-size:11.5px;color:#555">'
-             + " &middot; ".join(
-                 f'<b>{esc(l)}</b> {_pill(r["scores"][k]["absolute"])}/{_pill(r["scores"][k]["relative"])}'
-                 for k, l, *_ in DIMENSIONS)
-             + "</td></tr></table>")
+    # Their scores as a proper table: one scale per row, numbers in fixed columns.
+    h.append('<table cellspacing="0" cellpadding="0" class="ms"><tr>'
+             '<th class="hd2">Scale</th><th class="hd2 ctr">std</th>'
+             '<th class="hd2 ctr">desk</th><th class="hd2">measured</th>'
+             '<th class="hd2" width="150">Complexity mix</th></tr>')
+    for i, (key, label, _f, _t, _hi, _why) in enumerate(DIMENSIONS):
+        sc = r["scores"][key]
+        v = sc["value"]
+        txt = "&ndash;" if v is None else f"{v:g}" if isinstance(v, (int, float)) else esc(str(v))
+        cls = "" if i % 2 == 0 else ' class="z"'
+        bar = (f'<td rowspan="{len(DIMENSIONS)}" class="bc">'
+               + _bar(r["complexity_distribution"])
+               + '<div class="sub">1 = trivial &rarr; 5 = very hard</div></td>') if i == 0 else ""
+        h.append(f'<tr{cls}><td class="sn2">{esc(label)}</td>'
+                 f'<td class="ctr">{_pill(sc["absolute"], invert=(key == "complexity"))}</td>'
+                 f'<td class="ctr">{_rel_mark(sc["relative"])}</td>'
+                 f'<td class="mv2">{txt} <span class="sub">{esc(UNITS.get(key, ""))}</span></td>'
+                 f'{bar}</tr>')
+    h.append("</table>")
+
+    mix = list((r.get("work_mix") or {}).items())[:7]
+    if mix:
+        total_mix = sum(v for _k, v in (r.get("work_mix") or {}).items()) or 1
+        h.append('<table cellspacing="0" cellpadding="0" class="wm"><tr>'
+                 '<td valign="top" width="52%"><div class="lbl nb-b">What they worked on</div>'
+                 '<table cellspacing="0" cellpadding="0" class="wmi">'
+                 + "".join(
+                     f'<tr><td class="wmn">{esc(k)}</td>'
+                     f'<td class="wmc">{v}</td>'
+                     f'<td class="wmb"><div class="bar" style="width:'
+                     f'{max(4, round(100.0 * v / total_mix))}%">&nbsp;</div></td></tr>'
+                     for k, v in mix)
+                 + "</table></td>")
+        if r.get("specialist_areas"):
+            h.append('<td valign="top" width="48%" class="spcell">'
+                     '<div class="lbl nb-p">Work nobody else on the desk does</div>'
+                     '<ul class="ul">'
+                     + "".join(f'<li><span class="spec">&#9733;</span> {esc(a)}</li>'
+                               for a in r["specialist_areas"])
+                     + f'</ul><div class="sub">{r["specialist_tickets"]} of their '
+                       f'{r["tickets_touched"]} ticket(s). Real expertise &mdash; and '
+                       f'key-person risk if they are away.</div></td>')
+        else:
+            h.append('<td valign="top" width="48%" class="spcell">'
+                     '<div class="lbl nb-b">Specialist areas</div>'
+                     '<div class="sub">Nothing in this period that another technician on the desk '
+                     'does not also handle. That is good for cover, and it also means there is '
+                     'room to grow into the harder categories.</div></td>')
+        h.append("</tr></table>")
 
     if narrative:
         if isinstance(narrative, dict):
-            colours = {"strengths": ("#166534", "Doing well"), "concerns": ("#b45309", "Concerns"),
-                       "actions": ("#1a3c6e", "For the one-to-one"), "watch": ("#6b21a8", "Watch next week")}
+            labels = {"strengths": ("nb-g", "Doing well"), "concerns": ("nb-a", "Concerns"),
+                      "actions": ("nb-b", "For the one-to-one"),
+                      "watch": ("nb-p", "Watch next week")}
             inner = []
             for key in ("strengths", "concerns", "actions", "watch"):
                 if not narrative.get(key):
                     continue
-                col, lbl = colours[key]
-                inner.append(
-                    f'<div style="margin:0 0 7px"><span style="'
-                    f'font-size:10.5px;font-weight:700;color:{col};text-transform:uppercase">{lbl}</span>'
-                    f'<div style="font-size:12.5px;'
-                    f'line-height:1.55;color:#1f2937">{narrative[key]}</div></div>')
+                cls, lbl = labels[key]
+                inner.append(f'<div class="nb"><div class="lbl {cls}">{lbl}</div>'
+                             f'<div class="nbt">{narrative[key]}</div></div>')
             if inner:
-                h.append('<div style="border-left:4px solid #1a3c6e;background:#f8fafc;'
-                         'padding:10px 13px;margin:10px 0">' + "".join(inner) + "</div>")
+                h.append('<div class="rev"><div class="revh">AI review</div>'
+                         + "".join(inner) + "</div>")
         else:
-            h.append('<div style="border-left:4px solid #1a3c6e;background:#f8fafc;padding:9px 12px;'
-                     'margin:10px 0;font-size:12.5px;'
-                     f'line-height:1.55;color:#1f2937">{narrative}</div>')
+            h.append(f'<div class="rev"><div class="nbt">{narrative}</div></div>')
 
-    if r["strengths"]:
-        h.append('<div style="font-size:12px;color:#166534;'
-                 'margin:8px 0 2px"><b>Doing well:</b></div><ul style="margin:0 0 6px 18px;'
-                 'font-size:12px;color:#1f2937">'
-                 + "".join(f"<li>{esc(x)}</li>" for x in r["strengths"]) + "</ul>")
-    if r["gaps"]:
-        h.append('<div style="font-size:12px;color:#b45309;'
-                 'margin:6px 0 2px"><b>Worth a conversation:</b></div><ul style="margin:0 0 6px 18px;'
-                 'font-size:12px;color:#1f2937">'
-                 + "".join(f"<li>{esc(x)}</li>" for x in r["gaps"]) + "</ul>")
+    if r["strengths"] or r["gaps"]:
+        h.append('<table cellspacing="0" cellpadding="0" class="sg"><tr>')
+        h.append('<td width="50%" valign="top">'
+                 + ('<div class="lbl nb-g">Computed strengths</div><ul class="ul">'
+                    + "".join(f"<li>{esc(x)}</li>" for x in r["strengths"]) + "</ul>"
+                    if r["strengths"] else "")
+                 + "</td>")
+        h.append('<td width="50%" valign="top">'
+                 + ('<div class="lbl nb-a">Worth a conversation</div><ul class="ul">'
+                    + "".join(f"<li>{esc(x)}</li>" for x in r["gaps"]) + "</ul>"
+                    if r["gaps"] else "")
+                 + "</td></tr></table>")
 
     if r["dormant_days"]:
-        h.append('<div style="font-size:11.5px;color:#92400e;'
-                 'background:#fffbeb;border:1px solid #fcd34d;padding:7px 10px;margin:6px 0">'
-                 "<b>Working days with open tickets and no recorded activity:</b> "
+        h.append('<div class="warn"><b>Working days with open tickets and no recorded activity:</b> '
                  + ", ".join(f'{esc(d["date"])} ({d["open_tickets_waiting"]} open)'
                              for d in r["dormant_days"])
                  + ". This is not proof of idleness &mdash; on-site work and projects leave no "
                    "trace in these systems. It is a question to ask.</div>")
 
-    h.append(f'<div style="font-size:12.5px;color:#1a3c6e;'
-             f'font-weight:700;margin:12px 0 2px">All {len(r["closed_tickets"])} ticket(s) '
-             f'{esc(r["name"])} completed in this period</div>')
+    h.append(f'<div class="tlh">All {len(r["closed_tickets"])} ticket(s) '
+             f'{esc(r["name"])} completed in this period</div>'
+             '<div class="note"><b>Cx</b> = complexity 1&ndash;5 (skill the work needed). '
+             '<b>Co</b> = coordination 1&ndash;5 (messages, people and days it took to land). '
+             'They are separate on purpose: an Apple ID reset with six people on the thread is '
+             'heavy coordination, not hard technical work. '
+             '<span class="spec">&#9733;</span> marks work nobody else on the desk does.</div>')
     if r["closed_tickets"]:
         h.append(_ticket_rows(r["closed_tickets"], closed=True))
     else:
-        h.append('<div style="font-size:12px;color:#888;'
-                 'margin-bottom:8px">Nothing closed in this period.</div>')
+        h.append('<div class="note">Nothing closed in this period.</div>')
 
     if r["open_ticket_list"]:
-        h.append(f'<div style="font-size:12.5px;color:#92400e;'
-                 f'font-weight:700;margin:8px 0 2px">Still open and assigned to them '
+        h.append(f'<div class="tlh tlo">Still open and assigned to them '
                  f'({len(r["open_ticket_list"])}) &mdash; oldest activity first</div>')
         h.append(_ticket_rows(r["open_ticket_list"], closed=False))
     h.append("</div>")
@@ -1525,8 +1985,18 @@ DEFAULT_TP_PROMPT = """You are an experienced service-desk manager writing the c
 for a weekly one-to-one with each technician at an MSP. Your reader is the owner of the business.
 He has asked for depth, not brevity: more detail is better than less.
 
-You are given computed figures per technician: tickets touched and closed, ticket complexity rated
-1-5, measured working time, time spent solving problems with the AI assistant, phone talk time from
+You are given computed figures per technician. Two DIFFERENT 1-5 ratings appear, and confusing
+them would make your review wrong:
+  * COMPLEXITY (1-5) is the skill the work required - what class of work it was, whether only one
+    person on the desk does that kind of work, whether they got hands on a machine, and whether it
+    hit a whole site. 5 means expert or business-critical, 1 means an automated report.
+  * COORDINATION (1-5) is how much chasing it took - messages, people involved, days elapsed. A
+    password reset with six people on the thread scores high here and low on complexity. It is
+    real effort, but it is a different problem with a different fix.
+Also given: which categories of work only ONE technician on the desk handles ("specialist_areas"),
+which is simultaneously that person's expertise and the desk's key-person risk.
+
+Further figures: tickets touched and closed, measured working time, time spent solving problems with the AI assistant, phone talk time from
 the PBX, response times, documentation volume, autonomy, days with no recorded activity, examples
 of the hardest tickets they closed, and 1-5 scores (absolute against fixed standards, and relative
 to this desk's median).
@@ -1547,6 +2017,10 @@ Rules you must follow:
   frame them as "worth asking about", never as "did nothing".
 - Complexity 5 means hard, not good. Someone closing lots of simple tickets is not failing - they
   may be ready to be stretched. Someone slow on genuinely hard tickets may need help, not pressure.
+- Never treat a high coordination score as achievement OR as failure by itself - ask what caused
+  it. Never describe a low-complexity, high-coordination ticket as difficult work.
+- Where someone owns specialist work alone, say both things: it is a genuine strength, and it is a
+  risk to the business if they are the only one who can do it. Suggest who could learn it.
 - A technician whose work is mostly phone-based will look weak on ticket metrics. Say so if the
   phone figures support it.
 - If AI usage is low, say it plainly and explain what they are missing - it is the single biggest
@@ -1684,6 +2158,87 @@ table{border-collapse:collapse}
 .pg4{background:#15803d}.pg5{background:#166534}
 .ph1{background:#64748b}.ph2{background:#0369a1}.ph3{background:#a16207}
 .ph4{background:#c2410c}.ph5{background:#b91c1c}
+h3.h3,.h3{font-size:15px;color:#1a3c6e;margin:26px 0 5px;font-weight:700}
+.note{font-size:11.5px;color:#6b7280;line-height:1.5;margin:0 0 7px}
+.sub{font-size:10px;color:#9099a8;font-weight:400;line-height:1.35}
+.warn{font-size:11.5px;color:#92400e;background:#fffbeb;border:1px solid #fcd34d;
+    padding:7px 10px;margin:7px 0}
+/* scorecard: scales as rows, technicians as column pairs */
+.sc{width:100%;font-size:12px;margin:0 0 4px}
+.sc .hd{background:#1a3c6e;color:#fff;text-align:left;padding:7px 8px;font-size:11.5px;
+    border:1px solid #16325c;vertical-align:middle}
+.sc .hd .sub{color:#b8c6de}
+.hd2{background:#eef2f7;color:#42506b;padding:4px 6px;font-size:10px;font-weight:700;
+    text-transform:uppercase;border:1px solid #dbe2ec;text-align:left}
+.sc .sr td{border:1px solid #e3e8ef;padding:6px 8px;vertical-align:middle}
+.sc .sn{line-height:1.35}
+.sc .sv{white-space:nowrap}
+.sc .mv{font-size:12.5px;color:#1f2937;font-weight:600;white-space:nowrap}
+.sc .tot td{background:#eef2f7;border-top:2px solid #1a3c6e}
+.ov{font-size:15px;color:#1a3c6e}.ov2{font-size:13px;color:#5b6b86}
+.wh{font-size:11px;color:#92400e;font-weight:700}
+.up{color:#15803d;font-weight:700;font-size:11.5px;white-space:nowrap}
+.eq{color:#94a3b8;font-weight:700;font-size:11.5px}
+.dn{color:#c2410c;font-weight:700;font-size:11.5px;white-space:nowrap}
+.nn{color:#b9c0cc}
+/* per-technician block */
+.tb{border:1px solid #d8dee7;border-top:3px solid #1a3c6e;margin:22px 0 0;padding:12px 14px}
+.tn{font-size:17px;font-weight:700;color:#1a3c6e;margin-bottom:2px}
+.tx{font-size:12px;font-weight:400;color:#666}
+.to{float:right;font-size:12.5px;color:#1f2937;font-weight:400}
+.kt{width:100%;margin:8px 0 4px}
+.kt .gh{font-size:10px;font-weight:700;color:#5b6b86;text-transform:uppercase;
+    letter-spacing:.4px;padding:9px 0 3px;border:0}
+.kt .k{width:25%}
+.kt .pad{border:0;background:none}
+.ms{width:100%;font-size:12px;margin:10px 0 2px}
+.ms td{border:1px solid #e3e8ef;padding:5px 8px;vertical-align:middle}
+.ms .sn2{color:#42506b;width:31%}
+.ms .mv2{color:#1f2937;font-weight:600;white-space:nowrap}
+.ms .bc{text-align:center;vertical-align:middle;background:#fbfcfe}
+.lbl{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;
+    margin-bottom:2px}
+.nb-g{color:#166534}.nb-a{color:#b45309}.nb-b{color:#1a3c6e}.nb-p{color:#6b21a8}
+.rev{border:1px solid #dde5f0;border-left:4px solid #1a3c6e;background:#f8fafc;
+    padding:10px 13px;margin:12px 0}
+.revh{font-size:10px;font-weight:700;color:#8798b5;text-transform:uppercase;
+    letter-spacing:.4px;margin-bottom:6px}
+.nb{margin:0 0 8px}
+.nbt{font-size:12.5px;line-height:1.6;color:#1f2937}
+.sg{width:100%;margin:8px 0 4px}
+.sg td{padding-right:14px}
+.ul{margin:2px 0 6px 16px;padding:0;font-size:12px;line-height:1.5;color:#1f2937}
+.ul li{margin:0 0 3px}
+.tlh{font-size:12.5px;color:#1a3c6e;font-weight:700;margin:14px 0 3px;
+    border-top:1px solid #e3e8ef;padding-top:9px}
+.tlo{color:#92400e}
+.tt .wk{font-size:10.5px;color:#5b6b86;line-height:1.3}
+.spec{color:#a16207;font-weight:700}
+.wm{width:100%;margin:10px 0 2px}
+.wm>tbody>tr>td{padding-right:16px}
+.wmi{width:100%;font-size:11.5px}
+.wmi td{padding:2px 6px 2px 0;vertical-align:middle}
+.wmn{color:#42506b}
+.wmc{color:#1f2937;font-weight:700;text-align:right;width:26px}
+.wmb{width:46%}
+.bar{background:#9db4d4;height:9px;border-radius:2px}
+.spcell{border-left:1px solid #e3e8ef;padding-left:14px}
+.kpr{border:1px solid #e2d6f0;border-left:4px solid #6b21a8;background:#fbf8ff;
+    padding:11px 15px;margin:14px 0 0}
+.cdt{width:100%;margin:6px 0 4px}
+.cd{border:1px solid #d8dee7;background:#f7f9fc;text-align:center;padding:11px 8px;width:25%}
+.cd.pad{border:0;background:none}
+.cv{font-size:21px;font-weight:700;color:#1a3c6e;line-height:1.2}
+.cv.cg{color:#166534}.cv.ca{color:#92400e}
+.cl{font-size:10.5px;color:#5b6b86;text-transform:uppercase;letter-spacing:.3px}
+.cs{font-size:10px;color:#9099a8}
+.hdr{font-size:20px;font-weight:700;color:#1a3c6e;border-bottom:3px solid #1a3c6e;
+    padding-bottom:6px}
+.hsub{font-size:12.5px;color:#5b6b86;margin:7px 0 12px;line-height:1.5}
+.deskb{border:1px solid #cfe3d5;border-left:4px solid #166534;background:#f7fbf8;
+    padding:13px 17px;margin:0 0 16px}
+.foot{font-size:11px;color:#8b93a1;margin-top:26px;border-top:1px solid #e3e8ef;
+    padding-top:9px;line-height:1.6}
 """
 
 
@@ -1773,29 +2328,22 @@ def render(payload: Dict[str, Any], hours: int, core=None, options=None,
          '<meta name="viewport" content="width=device-width,initial-scale=1">'
          f"<style>{HEAD_CSS}</style></head><body>",
          '<div style="max-width:1100px">',
-         '<div style="font-size:20px;font-weight:700;'
-         'color:#1a3c6e;border-bottom:3px solid #1a3c6e;padding-bottom:6px">'
-         "Technician Productivity Analysis</div>",
-         f'<div style="font-size:12.5px;color:#555;'
-         f'margin:6px 0 12px">{esc(label.capitalize())} &middot; '
+         '<div class="hdr">Technician Productivity Analysis</div>',
+         f'<div class="hsub">{esc(label.capitalize())} &middot; '
          f'{desk["techs"]} technician(s) with ticket activity &middot; '
          f'complexity, time, AI collaboration and phone work, per person. '
          f'Every scale runs 1&ndash;5.</div>']
 
     if narr.get("__desk__"):
-        h.append('<div style="border:1px solid #d8dee7;border-left:4px solid #166534;'
-                 'background:#f7fbf8;padding:13px 17px;margin:0 0 14px">'
-                 '<div style="font-size:11px;color:#166534;'
-                 'text-transform:uppercase;font-weight:700;margin-bottom:4px">The desk overall</div>'
-                 '<div style="font-size:13.5px;line-height:1.6;'
-                 f'color:#1f2937">{narr["__desk__"]}</div></div>')
+        h.append('<div class="deskb"><div class="lbl nb-g">The desk overall</div>'
+                 f'<div class="nbt" style="font-size:13.5px">{narr["__desk__"]}</div></div>')
     elif narr.get("__error__"):
         h.append('<div style="font-size:12.5px;color:#92400e;'
                  'background:#fffbeb;border:1px solid #fcd34d;padding:10px;margin-bottom:12px">'
                  f'AI narrative unavailable ({esc(narr["__error__"])}). All figures below are '
                  "computed locally and are unaffected.</div>")
 
-    h.append('<div style="font-size:11px;color:#888;margin:0 0 10px">'
+    h.append('<div class="note" style="margin:0 0 10px">'
              "This report lists <b>every</b> ticket each technician completed, so it is long by "
              "design. If your mail client truncates it, the complete report is also attached to "
              "this email as an HTML file &mdash; open that and nothing is missing.</div>")
@@ -1804,27 +2352,46 @@ def render(payload: Dict[str, Any], hours: int, core=None, options=None,
     h.append(_provenance(payload, hours))
     h.append(_scorecard(rows))
 
+    owners = desk.get("specialist_owners") or {}
+    if owners:
+        by_person: Dict[str, List[str]] = {}
+        for cat, who in owners.items():
+            for w in who:
+                by_person.setdefault(w, []).append(cat.replace("_", " "))
+        h.append('<div class="kpr"><div class="lbl nb-p">Key-person risk</div>'
+                 '<div class="nbt" style="font-size:12.5px">Categories of work that exactly one '
+                 "technician handled in this period. This is where the desk is strongest and most "
+                 "exposed at the same time &mdash; if that person is away, this work has nobody.<br>"
+                 + "<br>".join(f'<b>{esc(who)}</b> alone handled: {esc(", ".join(sorted(cats)))}'
+                               for who, cats in sorted(by_person.items()))
+                 + "</div></div>")
+
     if desk.get("team_unanswered_calls"):
-        h.append('<div style="font-size:12px;color:#555;'
-                 'margin:10px 0 0">'
+        h.append('<div class="note" style="margin:10px 0 0;font-size:12px">'
                  f'<b>Team-wide:</b> {desk["team_unanswered_calls"]} inbound call(s) rang the desk '
                  "and nobody answered. Inbound rings every extension at once, so this belongs to "
                  "the team, not to any individual.</div>")
 
-    h.append('<h3 style="font-size:15px;color:#1a3c6e;'
-             'margin:26px 0 0">Technician by technician</h3>')
+    h.append('<h3 class="h3">Technician by technician</h3>')
     for r in sorted(rows, key=lambda x: -(x["overall_absolute"] or 0)):
         h.append(_tech_block(r, narr.get(r["name"], "")))
 
     h.append(
-        '<div style="font-size:11px;color:#888;margin-top:26px;'
-        'border-top:1px solid #e3e8ef;padding-top:8px">'
-        "<b>How this is calculated.</b> <u>Complexity 1&ndash;5</u> is the higher of two readings: "
-        "subject matter (security incidents and server builds rate 5; password resets and how-to "
-        "questions rate 2; clean automated alerts rate 1) and effort evidence (message count, "
-        "people involved, elapsed time). Taking the maximum is deliberate &mdash; a breach solved "
-        "in one message was still hard, and a printer that took nine messages and three people "
-        "was also hard. <u>Time</u> comes from the work ledger: attention measured from AI chat "
+        '<div class="foot">'
+        "<b>How this is calculated.</b> <u>Complexity 1&ndash;5</u> rates <b>the skill the work "
+        "required</b>, from a taxonomy of the work itself: security incidents, production outages "
+        "and infrastructure projects rate 5; specialist infrastructure &mdash; database and ERP "
+        "performance, server hardware, RDS, directory services, mail and network infrastructure, "
+        "backup faults, security hardening &mdash; rates 4; standard workstation and application "
+        "break/fix rates 3; account and access tasks rate 2; automated reports with nothing wrong "
+        "rate 1. A ticket then gains up to two points for work <b>only one technician on this desk "
+        "handles</b>, for hands-on device evidence in the ledger rather than correspondence alone, "
+        "for whole-site or production impact, and for being reopened. "
+        "<b>Message volume is deliberately excluded from complexity</b> and reported separately as "
+        "<u>coordination 1&ndash;5</u>: an Apple ID reset with thirteen messages and six people is "
+        "heavy coordination and routine technical work, and an earlier version of this report rated "
+        "it 4/5 for difficulty while rating SQL index tuning on a live ERP 3/5. Both numbers are "
+        "shown per ticket so the difference is visible. <u>Time</u> comes from the work ledger: attention measured from AI chat "
         "transcripts, ticket message bursts and RMM activity, refreshed immediately before this "
         "report ran"
         + (f" ({esc(ledger_note)})" if ledger_note else "") +
