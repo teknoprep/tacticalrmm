@@ -1105,10 +1105,108 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
     desk["specialist_owners"] = {c: rating["category_closers"].get(c, [])
                                  for c in rating["specialist_categories"]}
     return {"rows": rows, "desk": desk, "pbx": pbx, "rating": rating,
+            "ai_worker": ai_worker(data, tickets, actors, tech_names, by_ref, rating, desk),
             "phone_ok": bool(phone.get("ok")),
             "phone_error": phone.get("error", ""),
             "phone_dedup_dropped": phone.get("dedup_dropped", 0),
             "window_days": days_in_window}
+
+
+def ai_worker(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str, Any],
+              tech_names: set, by_ref: Dict[str, Any], rating: Dict[str, Any],
+              desk: Dict[str, Any]) -> Dict[str, Any]:
+    """The AI's own workload, reported in a HUMAN time frame.
+
+    The owner's requirement: if the AI is credited with work, that has to be visible, and the
+    time has to be expressed in the same units a person's time is - even though the machine
+    finishes in seconds what takes a person half an hour.
+
+    HOW THE TIME FIGURE IS BUILT. The AI's minutes come from the SAME estimator used for every
+    technician in this report (`_dr_estimate`: message bursts grouped into sessions, priced at
+    this desk's own minutes-per-message, then multiplied by the ticket's 1-5 complexity). So the
+    headline number answers one question only: **what this desk's own time model would have
+    charged a person for the work the AI actually did.** It is a HUMAN-EQUIVALENT figure, not a
+    claim about how long the machine ran - and it is labelled that way everywhere it appears.
+
+    Wall-clock elapsed is reported beside it, measured from the AI's own first-to-last action
+    within each burst. The ratio of the two is the leverage multiple, which is the honest way to
+    show "quicker than a human" without making the contribution look small.
+    """
+    ai_actors = [a for a in actors.values() if a.get("kind") == "ai"]
+    if not ai_actors:
+        return {"present": False}
+
+    names = sorted(a["name"] for a in ai_actors)
+    equiv_minutes = round(sum(a["minutes"] for a in ai_actors), 1)
+    sessions = sum(a.get("sessions", 0) for a in ai_actors)
+    refs = set()
+    for a in ai_actors:
+        refs |= set(a.get("tickets") or set())
+    worked = [by_ref[r] for r in refs if r in by_ref]
+
+    # Wall-clock the AI actually occupied: its own event bursts per ticket, 30-minute gap (the
+    # same session boundary the human estimator uses), summed. Measured, not modelled.
+    elapsed = 0.0
+    for t in worked:
+        times = sorted(_parse(e.get("at")) for e in (t.get("events") or [])
+                       if e.get("kind") == "ai" and _parse(e.get("at")))
+        if not times:
+            continue
+        start = prev = times[0]
+        for cur in times[1:]:
+            if (cur - prev).total_seconds() > 30 * 60:
+                elapsed += (prev - start).total_seconds() / 60.0
+                start = cur
+            prev = cur
+        elapsed += (prev - start).total_seconds() / 60.0
+
+    # AUTONOMOUS vs DIRECTED. A ticket the AI worked with no technician's time on it at all is
+    # work the desk did not have to touch; one with a person's time on it is collaboration, and
+    # that person is already credited in their own scorecard.
+    autonomous = [t for t in worked
+                  if not {n for n in (t.get("actor_minutes") or {}) if n in tech_names}]
+    collaborative = [t for t in worked if t not in autonomous]
+    auto_minutes = round(sum((t.get("ai_minutes") or 0) for t in autonomous), 1)
+
+    closed_auto = [t for t in autonomous if t.get("terminal")]
+    closed_collab = [t for t in collaborative if t.get("terminal")]
+    cx = [t["cx5"] for t in worked if t.get("cx5")]
+    cx_auto = [t["cx5"] for t in autonomous if t.get("cx5")]
+
+    # Human-directed AI messages: the person composed the intent, the machine typed it. Counted
+    # here for transparency, but the CREDIT for those sits with the technician, not the AI.
+    directed_msgs = sum(int(t.get("driven_messages") or 0) for t in worked)
+    ai_msgs = sum(int(t.get("ai_messages") or 0) for t in worked)
+
+    human_minutes = desk.get("minutes") or 0.0
+    return {
+        "present": True,
+        "names": names,
+        "equiv_minutes": equiv_minutes,
+        "elapsed_minutes": round(elapsed, 1),
+        "leverage_x": (round(equiv_minutes / elapsed, 1) if elapsed >= 1 else None),
+        "sessions": sessions,
+        "tickets_worked": len(worked),
+        "tickets_autonomous": len(autonomous),
+        "tickets_collaborative": len(collaborative),
+        "closed_autonomous": len(closed_auto),
+        "closed_collaborative": len(closed_collab),
+        "autonomous_equiv_minutes": auto_minutes,
+        "avg_complexity": round(statistics.mean(cx), 2) if cx else 0,
+        "avg_complexity_autonomous": round(statistics.mean(cx_auto), 2) if cx_auto else 0,
+        "ai_messages": ai_msgs,
+        "directed_messages": directed_msgs,
+        # How the AI's human-equivalent workload compares with the desk's measured human time.
+        "pct_of_desk_human_time": (round(100.0 * equiv_minutes / human_minutes, 1)
+                                   if human_minutes else None),
+        "companies": sorted({t.get("company") for t in worked if t.get("company")}),
+        "top_autonomous": [
+            {"ref": t.get("ref"), "url": t.get("url") or "", "subject": t.get("subject") or "",
+             "company": t.get("company") or "", "stage": t.get("stage") or "",
+             "cx5": t.get("cx5"), "equiv_minutes": round(t.get("ai_minutes") or 0, 1)}
+            for t in sorted(autonomous, key=lambda x: -(x.get("ai_minutes") or 0))[:25]
+        ],
+    }
 
 
 # The six dimensions the owner approved, plus phone engagement. 5 is always best.
@@ -2321,6 +2419,114 @@ def _audit_html(checks: List[Dict[str, str]], ai: Dict[str, Any]) -> str:
     return "".join(h)
 
 
+def _ai_block(ai: Dict[str, Any], desk: Dict[str, Any]) -> str:
+    """The AI's workload as its own section - deliberately NOT a row in the technician table.
+
+    Kept separate on the owner's instruction, and it is the right call: putting a tool in the same
+    ranked list as people makes "top scorer" meaningless and invites comparing a person's 4.2/5
+    against a machine. The AI is not scored 1-5 on any dimension here for the same reason - the
+    six dimensions measure how a technician is doing their job, and none of them mean anything
+    applied to software.
+    """
+    if not ai.get("present"):
+        return ('<h3 class="h3">The AI as a worker</h3>'
+                '<div class="note">No AI activity on tickets in this window.</div>')
+
+    eq = fmt_mins(ai["equiv_minutes"])
+    el = fmt_mins(ai["elapsed_minutes"])
+    lev = ai.get("leverage_x")
+    h = ['<h3 class="h3">The AI as a worker</h3>',
+         '<div class="note" style="margin:0 0 8px">'
+         'Reported separately from the technicians on purpose: the AI is a tool, so it is not '
+         'ranked against people and is not scored 1&ndash;5 on any dimension &mdash; those scales '
+         'measure how a person is doing their job. What follows is <b>what it did</b> and '
+         '<b>what that work would have cost in human time</b>.</div>']
+
+    # Headline cards.
+    h.append('<table class="tt" style="margin:0 0 8px"><tr>')
+    cards = [
+        (eq, "human-equivalent time",
+         "what this desk's own time model would charge a person for this work"),
+        (el, "actual elapsed", "measured wall-clock the machine occupied"),
+        (f"{lev}&times;" if lev else "&mdash;",
+         "leverage multiple", "human-equivalent &divide; actual elapsed"),
+        (str(ai["tickets_worked"]), "tickets worked",
+         f'{ai["tickets_autonomous"]} with no technician time on them'),
+        (str(ai["closed_autonomous"]), "closed with no human",
+         "work the desk never had to pick up"),
+        (f'{ai["pct_of_desk_human_time"]}%' if ai.get("pct_of_desk_human_time") is not None else "&mdash;",
+         "vs desk human time", f'desk measured {fmt_mins(desk.get("minutes"))}'),
+    ]
+    for val, lbl, note in cards:
+        h.append(f'<td class="k"><div class="kv">{val}</div>'
+                 f'<div class="kl">{lbl}</div><div class="kn">{esc(note)}</div></td>')
+    h.append("</tr></table>")
+
+    # How the equivalent figure is built - stated inline, not buried in the footer, because a
+    # number in "hours" that is not really hours is exactly the kind of thing that gets
+    # misread in a review.
+    h.append('<div class="warn" style="margin:0 0 8px">'
+             f'<b>Read the {eq} as human-equivalent effort, not machine runtime.</b> It is '
+             'produced by running the AI\'s own activity through the <i>same</i> estimator used '
+             'for every technician above (message bursts &rarr; sessions &rarr; this desk\'s '
+             'minutes-per-message &times; ticket complexity). The AI actually occupied '
+             f'{el} of wall-clock'
+             + (f', so it delivered that work about {lev}&times; faster than the desk\'s human '
+                'time model would price it.' if lev else '.')
+             + ' Neither figure is a timesheet.</div>')
+
+    # Autonomous vs collaborative - who the credit belongs to.
+    h.append('<table class="tt"><tr>'
+             '<th>How the AI worked</th><th class="m">Tickets</th><th class="m">Closed</th>'
+             '<th class="m">Avg complexity</th><th>Human-equivalent time</th>'
+             '<th>Who is credited</th></tr>')
+    h.append(f'<tr><td class="c"><b>Autonomously</b><div class="sub">no technician put '
+             f'measured time on the ticket</div></td>'
+             f'<td class="c m">{ai["tickets_autonomous"]}</td>'
+             f'<td class="c m">{ai["closed_autonomous"]}</td>'
+             f'<td class="c m">{ai["avg_complexity_autonomous"] or "&mdash;"}/5</td>'
+             f'<td class="c">{fmt_mins(ai["autonomous_equiv_minutes"])}</td>'
+             f'<td class="c">The AI. No person is credited for these.</td></tr>')
+    collab_eq = round(ai["equiv_minutes"] - ai["autonomous_equiv_minutes"], 1)
+    h.append(f'<tr class="z"><td class="c"><b>Alongside a technician</b><div class="sub">a person '
+             f'also had measured time on the ticket</div></td>'
+             f'<td class="c m">{ai["tickets_collaborative"]}</td>'
+             f'<td class="c m">{ai["closed_collaborative"]}</td>'
+             f'<td class="c m">{ai["avg_complexity"] or "&mdash;"}/5</td>'
+             f'<td class="c">{fmt_mins(collab_eq)}</td>'
+             f'<td class="c">The technician, in their own scorecard. '
+             f'{ai["directed_messages"]} message(s) here were composed by a person and typed by '
+             f'the AI.</td></tr>')
+    h.append("</table>")
+
+    if ai.get("top_autonomous"):
+        h.append('<div class="note" style="margin:8px 0 4px">'
+                 '<b>Largest tickets the AI handled with no technician time.</b> Worth a skim: if '
+                 'any of these should have had a person in the loop, that is a routing decision, '
+                 'not a productivity one.</div>')
+        h.append('<table class="tt"><tr><th>Ticket</th><th>Customer</th><th>Stage</th>'
+                 '<th class="m">Cx</th><th class="r">Human-equiv</th></tr>')
+        for i, t in enumerate(ai["top_autonomous"]):
+            ref = esc((t["ref"] or "").replace("TICKET/", "#"))
+            link = (f'<a class="lk" href="{esc(t["url"])}">{ref}</a>' if t.get("url") else ref)
+            zrow = ' class="z"' if i % 2 else ""
+            h.append(f'<tr{zrow}>'
+                     f'<td class="c">{link}<div class="sub">{esc((t["subject"] or "")[:70])}</div></td>'
+                     f'<td class="c">{esc((t["company"] or "").split(",")[0])}</td>'
+                     f'<td class="c">{esc(t["stage"])}</td>'
+                     f'<td class="c m">{t["cx5"] or "&mdash;"}</td>'
+                     f'<td class="c r">{fmt_mins(t["equiv_minutes"])}</td></tr>')
+        h.append("</table>")
+
+    h.append('<div class="note" style="margin:6px 0 0">'
+             '<b>What this section cannot tell you.</b> Human-equivalent time is a <i>pricing</i> '
+             'of the AI\'s output using a model built for people, so it inherits that model\'s '
+             'assumptions &mdash; it is a defensible way to size the contribution, not a measured '
+             'saving. It also cannot judge <i>quality</i>: a ticket the AI closed without a person '
+             'is counted here whether the customer was well served or not.</div>')
+    return "".join(h)
+
+
 def render(payload: Dict[str, Any], hours: int, core=None, options=None,
            ledger_note: str = "") -> str:
     """The whole email."""
@@ -2392,6 +2598,10 @@ def render(payload: Dict[str, Any], hours: int, core=None, options=None,
     h.append('<h3 class="h3">Technician by technician</h3>')
     for r in sorted(rows, key=lambda x: -(x["overall_absolute"] or 0)):
         h.append(_tech_block(r, narr.get(r["name"], "")))
+
+    # LAST, below every technician (owner's instruction). The people come first; the machine's
+    # workload is context for their numbers, not a peer to them.
+    h.append(_ai_block(payload.get("ai_worker") or {}, desk))
 
     h.append(
         '<div class="foot">'
