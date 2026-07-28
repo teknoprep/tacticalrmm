@@ -210,6 +210,17 @@ class CoreSettings(BaseAuditModel):
     # so it can be selected the same day, instead of waiting for a package upgrade.
     ai_model_autoregister = models.BooleanField(default=True)
 
+    # PI AI OPERATOR / DESKTOP ACCESS. This is policy only: the standalone Operator
+    # owns browser execution and its runtime. The RMM stores which existing agent(s)
+    # may receive Operator tools and which configured AI model should be selected when
+    # an Operator-capable Pi Chat / AI Decision session starts.
+    ai_operator_enabled = models.BooleanField(default=False)
+    ai_operator_default_model = models.ForeignKey(
+        "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="operator_default_for",
+    )
+    ai_operator_allowed_agent_ids = models.JSONField(default=list, blank=True)
+
     # SCHEDULED RUNTIME UPDATE - upgrading the AI runtime restarts the bridge, which drops
     # live chats and in-flight background runs. So it happens (a) only inside a window an
     # operator chose, and (b) only once nothing is running. If the new version is not
@@ -946,9 +957,23 @@ class AITask(BaseAuditModel):
     ]
 
     name = models.CharField(max_length=255)
+    # PRIMARY machine: the one this task is created/listed on (AI Tasks tab, dedup,
+    # history keying). Unchanged from before multi-machine support existed.
     agent = models.ForeignKey(
         "agents.Agent", related_name="ai_tasks", on_delete=models.CASCADE
     )
+    # Optional operator-written note on what the PRIMARY machine's role/job is in this
+    # task. Blank is fine (ordinary single-machine tasks never need it).
+    primary_role = models.CharField(max_length=400, blank=True, default="")
+    # Multi-machine mode (optional). ADDITIONAL machines beyond the primary, each an
+    # {agent_id, role} object - mirrors the interactive multi-machine chat's shape
+    # (agents/views.py PiMultiSession) so the SAME buildTools({machines}) mechanism in
+    # the bridge targets them: every device tool gains a required `machine` parameter
+    # and the model must name one of the roster's labels to act on it. Empty list =
+    # ordinary single-machine task (the pre-existing behavior, unchanged).
+    # See docs/SCHEDULING.md in the pi-ai-helpdesk repo for how to author a
+    # multi-machine task's prompt (role-labels, sequencing, failure handling).
+    machines = models.JSONField(default=list, blank=True)  # [{agent_id, role}]
     prompt = models.TextField()
     model = models.ForeignKey(
         "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL
@@ -995,7 +1020,21 @@ class AITask(BaseAuditModel):
     last_output = models.TextField(null=True, blank=True)
 
     def __str__(self) -> str:
-        return f"{self.name} ({self.agent.hostname})"
+        extra = f" +{len(self.machines)}" if self.machines else ""
+        return f"{self.name} ({self.agent.hostname}{extra})"
+
+    @property
+    def is_multi(self) -> bool:
+        return bool(self.machines)
+
+    def secondary_agent_ids(self):
+        """agent_ids of the additional (non-primary) machines, in order, deduped."""
+        seen = []
+        for m in self.machines or []:
+            aid = str((m or {}).get("agent_id") or "").strip()
+            if aid and aid != self.agent.agent_id and aid not in seen:
+                seen.append(aid)
+        return seen
 
     @staticmethod
     def serialize(obj):

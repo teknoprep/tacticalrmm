@@ -66,6 +66,32 @@ class CoreSettingsSerializer(HostedCoreMixin, serializers.ModelSerializer):
         require_custom("default_shell_linux", "default_shell_linux_custom")
         require_custom("default_shell_darwin", "default_shell_darwin_custom")
 
+        operator_ids = get_value("ai_operator_allowed_agent_ids") or []
+        if not isinstance(operator_ids, list):
+            raise serializers.ValidationError(
+                {"ai_operator_allowed_agent_ids": "Operator workstations must be a list."}
+            )
+        operator_ids = [str(value or "").strip() for value in operator_ids]
+        if any(not value for value in operator_ids) or len(operator_ids) > 8 or len(set(operator_ids)) != len(operator_ids):
+            raise serializers.ValidationError(
+                {"ai_operator_allowed_agent_ids": "Choose 1-8 unique existing workstations."}
+            )
+        if operator_ids:
+            from agents.models import Agent
+
+            found = Agent.objects.filter(agent_id__in=operator_ids).count()
+            if found != len(operator_ids):
+                raise serializers.ValidationError(
+                    {"ai_operator_allowed_agent_ids": "One of the Operator workstations no longer exists."}
+                )
+        attrs["ai_operator_allowed_agent_ids"] = operator_ids
+
+        operator_model = get_value("ai_operator_default_model")
+        if operator_model and (not operator_model.enabled or not operator_model.provider.enabled):
+            raise serializers.ValidationError(
+                {"ai_operator_default_model": "Desktop default model and provider must both be enabled."}
+            )
+
         return attrs
 
     class Meta:
@@ -246,6 +272,11 @@ class AITaskSerializer(serializers.ModelSerializer):
     hostname = serializers.CharField(source="agent.hostname", read_only=True)
     agent_id = serializers.CharField(source="agent.agent_id", read_only=True)
     model_display = serializers.SerializerMethodField()
+    # Read-only, hostname-resolved view of `machines` (raw field stays [{agent_id,
+    # role}] for editing) so the UI can render "<hostname> - <role>" without a
+    # second round-trip. Missing/renamed agents degrade to hostname="" rather than
+    # erroring - a task must keep working even if a secondary machine was deleted.
+    machines_detail = serializers.SerializerMethodField()
 
     class Meta:
         model = AITask
@@ -253,6 +284,31 @@ class AITaskSerializer(serializers.ModelSerializer):
 
     def get_model_display(self, obj) -> str:
         return obj.model.display_name if obj.model else "(default)"
+
+    def get_machines_detail(self, obj) -> list:
+        from agents.models import Agent
+
+        ids = [str((m or {}).get("agent_id") or "") for m in (obj.machines or [])]
+        by_id = {
+            a.agent_id: a
+            for a in Agent.objects.select_related("site__client").filter(
+                agent_id__in=ids
+            )
+        }
+        out = []
+        for m in obj.machines or []:
+            aid = str((m or {}).get("agent_id") or "")
+            a = by_id.get(aid)
+            out.append(
+                {
+                    "agent_id": aid,
+                    "role": (m or {}).get("role") or "",
+                    "hostname": a.hostname if a else "",
+                    "client": a.site.client.name if a else "",
+                    "site": a.site.name if a else "",
+                }
+            )
+        return out
 
 
 class AITaskRunSerializer(serializers.ModelSerializer):

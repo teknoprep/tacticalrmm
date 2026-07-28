@@ -1754,6 +1754,36 @@ def _pi_device_facts(agent):
     }
 
 
+def _pi_operator_policy(core, user):
+    """Return only allowlisted Operator workstations the current technician may access."""
+    from tacticalrmm.permissions import _has_perm_on_agent
+
+    configured = list(core.ai_operator_allowed_agent_ids or [])
+    if not core.ai_operator_enabled or not configured:
+        return {"enabled": False, "machines": []}
+    permitted = [agent_id for agent_id in configured if _has_perm_on_agent(user, agent_id)]
+    agents = {
+        agent.agent_id: agent
+        for agent in Agent.objects.select_related("site__client")
+        .defer(*AGENT_DEFER)
+        .filter(agent_id__in=permitted)
+    }
+    machines = []
+    for agent_id in configured:
+        agent = agents.get(agent_id)
+        if agent:
+            machines.append({
+                "agent_id": agent.agent_id,
+                "hostname": agent.hostname,
+                "device_facts": _pi_device_facts(agent),
+            })
+    return {
+        "enabled": bool(machines),
+        "machines": machines,
+        "default_model_id": core.ai_operator_default_model_id,
+    }
+
+
 def _pi_model_dict(m):
     # safe for the browser (no api key)
     return {
@@ -1979,8 +2009,15 @@ class AgentPiSession(APIView):
                 "configure providers/models and grant access."
             )
 
-        default_model = next(
-            (m for m in allowed if m.is_default), allowed[0]
+        operator_policy = _pi_operator_policy(core, user)
+        operator_agent_ids = {m["agent_id"] for m in operator_policy["machines"]}
+        operator_default = next(
+            (m for m in allowed if m.pk == operator_policy.get("default_model_id")), None
+        )
+        default_model = (
+            operator_default
+            if agent.agent_id in operator_agent_ids and operator_default
+            else next((m for m in allowed if m.is_default), allowed[0])
         )
 
         # requested model (optional) must be in allowed set
@@ -2054,6 +2091,7 @@ class AgentPiSession(APIView):
                 "api_key": core.ai_helpdesk_api_key or "",
             },
             "helpdesk_code": core.ai_helpdesk_code or "",
+            "operator": operator_policy,
         }
 
         token = create_pi_session(data=blob)
@@ -2080,6 +2118,11 @@ class AgentPiSession(APIView):
                 "allowed_models": [model_dict(m) for m in allowed],
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
+                "operator_enabled": operator_policy["enabled"],
+                "operator_machines": [
+                    {"agent_id": m["agent_id"], "hostname": m["hostname"]}
+                    for m in operator_policy["machines"]
+                ],
             }
         )
 

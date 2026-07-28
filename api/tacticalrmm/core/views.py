@@ -967,9 +967,20 @@ class AIPromptAssist(APIView):
             if getattr(dj_settings, "CORS_ORIGIN_WHITELIST", None)
             else ""
         )
+        # kind: "single" (one-machine AI Task) | "multi" (multi-machine AI Task -
+        # a primary + a roster of role-labeled machines in ONE run) | "bulk" (same
+        # op fanned out independently to many agents, no cross-machine coordination).
+        # See docs/SCHEDULING.md (pi-ai-helpdesk repo) for when each applies.
+        req_kind = request.data.get("kind")
+        kind = req_kind if req_kind in ("single", "multi", "bulk") else "single"
+        # For "multi", pass along the role labels the admin has already entered (if
+        # any) so the assistant writes a prompt that references THOSE exact labels
+        # instead of inventing generic placeholders.
+        machine_roles = request.data.get("machine_roles") or []
         payload = {
             "mode": "task_prompt",
-            "kind": "bulk" if request.data.get("kind") == "bulk" else "single",
+            "kind": kind,
+            "machine_roles": machine_roles if isinstance(machine_roles, list) else [],
             "provider": model.provider.name,
             "model_id": model.model_id,
             "api_key": model.provider.api_key,
@@ -1020,6 +1031,65 @@ class UpdateDeleteAIModel(APIView):
         return Response("ok")
 
 
+# Mirrors agents/views.py PiMultiSession.MAX_MACHINES - the same roster shape
+# (buildTools({machines})) backs both the interactive multi-machine chat and a
+# multi-machine AI Task, so the cap is shared deliberately.
+AI_TASK_MAX_MACHINES = 8
+AI_TASK_MAX_ROLE_LEN = 400
+
+
+def _validate_ai_task_machines(user, primary_agent_id, machines_in):
+    """Validate + normalize the `machines` list for a (possibly multi-machine) AI
+    Task. Returns (clean_machines, error_response). error_response is None on
+    success; clean_machines is [] when machines_in is empty/absent (ordinary
+    single-machine task - unchanged behavior).
+
+    Every rule here mirrors PiMultiSession (agents/views.py), which validates the
+    SAME roster shape for the interactive multi-machine chat: max count, no
+    duplicates, agent exists, caller has permission on it. A scheduled task must not
+    be a looser way to reach a machine than the chat already is.
+    """
+    from agents.models import Agent
+
+    if not machines_in:
+        return [], None
+    if not isinstance(machines_in, list):
+        return None, notify_error("machines must be a list.")
+    if len(machines_in) + 1 > AI_TASK_MAX_MACHINES:
+        return None, notify_error(
+            f"A task may have at most {AI_TASK_MAX_MACHINES} machines total "
+            f"(primary + additional)."
+        )
+    agent_ids = [str((m or {}).get("agent_id") or "").strip() for m in machines_in]
+    if "" in agent_ids:
+        return None, notify_error("Every additional machine needs an agent selected.")
+    if str(primary_agent_id) in agent_ids:
+        return None, notify_error(
+            "A machine cannot be listed as both the primary and an additional machine."
+        )
+    if len(set(agent_ids)) != len(agent_ids):
+        return None, notify_error("The same machine was added more than once.")
+    for aid in agent_ids:
+        if not _has_perm_on_agent(user, aid):
+            return None, notify_error(
+                "You do not have permission on one of the selected machines."
+            )
+    existing = set(
+        Agent.objects.filter(agent_id__in=agent_ids).values_list("agent_id", flat=True)
+    )
+    missing = [a for a in agent_ids if a not in existing]
+    if missing:
+        return None, notify_error("One of the selected machines no longer exists.")
+    clean = [
+        {
+            "agent_id": str((m or {}).get("agent_id") or "").strip(),
+            "role": str((m or {}).get("role") or "").strip()[:AI_TASK_MAX_ROLE_LEN],
+        }
+        for m in machines_in
+    ]
+    return clean, None
+
+
 class GetAddAITask(APIView):
     permission_classes = [IsAuthenticated, AITaskPerms]
 
@@ -1054,6 +1124,12 @@ class GetAddAITask(APIView):
             if not _has_perm_on_agent(request.user, agent.agent_id):
                 raise PermissionDenied()
             data["agent"] = agent.pk
+            clean_machines, err = _validate_ai_task_machines(
+                request.user, agent.agent_id, data.get("machines")
+            )
+            if err is not None:
+                return err
+            data["machines"] = clean_machines
         serializer = AITaskSerializer(data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         obj = serializer.save(
@@ -1101,7 +1177,15 @@ class UpdateDeleteAITask(APIView):
         task = get_object_or_404(AITask.objects.select_related("agent"), pk=pk)
         if not _has_perm_on_agent(request.user, task.agent.agent_id):
             raise PermissionDenied()
-        serializer = AITaskSerializer(instance=task, data=request.data, partial=True)
+        data = request.data.copy()
+        if "machines" in data:
+            clean_machines, err = _validate_ai_task_machines(
+                request.user, task.agent.agent_id, data.get("machines")
+            )
+            if err is not None:
+                return err
+            data["machines"] = clean_machines
+        serializer = AITaskSerializer(instance=task, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         obj = serializer.save(modified_by=request.user.username)
         _apply_once_schedule(obj)
@@ -1958,7 +2042,12 @@ class AIDecisionSession(APIView):
             ) or [m for m in enabled if m.is_default]
         if not allowed:
             return notify_error("No AI models are available. Ask an admin to configure providers/models.")
-        chosen = next((m for m in allowed if m.is_default), allowed[0])
+        from agents.views import _pi_operator_policy
+        operator_policy = _pi_operator_policy(core, user)
+        operator_default = next(
+            (m for m in allowed if m.pk == operator_policy.get("default_model_id")), None
+        )
+        chosen = operator_default or next((m for m in allowed if m.is_default), allowed[0])
         req_id = request.data.get("model_id")
         if req_id:
             match = next((m for m in allowed if m.model_id == req_id), None)
@@ -2028,6 +2117,7 @@ class AIDecisionSession(APIView):
             },
             "helpdesk_code": core.ai_helpdesk_code or "",
             "persist_history": True,
+            "operator": operator_policy,
         }
         pi_token = create_pi_session(data=blob)
         return Response({
@@ -2042,6 +2132,11 @@ class AIDecisionSession(APIView):
             "require_approval": True,
             "autoapprove_allowed": aa,
             "auto_approve": bool(aa and getattr(request.user, "ai_autoapprove_default", False)),
+            "operator_enabled": operator_policy["enabled"],
+            "operator_machines": [
+                {"agent_id": m["agent_id"], "hostname": m["hostname"]}
+                for m in operator_policy["machines"]
+            ],
         })
 
 

@@ -790,12 +790,8 @@ def _resolve_ai_model(model):
     )
 
 
-def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id, reply_register="none"):
-    """Execute one headless AI run on an agent via the bridge. Returns
-    (status, summary, output)."""
-    import requests as _requests
-
-    device_facts = {
+def _ai_device_facts(agent):
+    return {
         "agent_id": agent.agent_id,
         "hostname": agent.hostname,
         "client": agent.client.name,
@@ -811,6 +807,31 @@ def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id, reply_
         "device_url": (f"{settings.CORS_ORIGIN_WHITELIST[0]}/agents/{agent.agent_id}" if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""),
         "ai_notes": agent.ai_notes or "",
     }
+
+
+def _run_prompt_on_agent(
+    *, agent, model, prompt, allow_mutating, run_id, reply_register="none",
+    primary_role="", secondary_machines=None,
+):
+    """Execute one headless AI run via the bridge. Returns (status, summary, output,
+    ticket_error).
+
+    `secondary_machines`, when non-empty, turns this into a MULTI-MACHINE task run:
+    a list of {"agent": Agent, "role": str} for every ADDITIONAL machine beyond the
+    primary `agent`. Mirrors agents/views.py PiMultiSession's blob shape exactly (same
+    bridge-side buildTools({machines}) consumes both) so a scheduled task and the
+    interactive multi-machine chat behave identically: every device tool gains a
+    required `machine` parameter, labeled by hostname (deduped #2/#3.. on collision),
+    and the model can only ever reach the machines named in this roster. See
+    docs/SCHEDULING.md (pi-ai-helpdesk repo) for how to author the prompt for one of
+    these.
+    """
+    import requests as _requests
+
+    device_facts = _ai_device_facts(agent)
+    secondary_machines = secondary_machines or []
+    is_multi = bool(secondary_machines)
+
     payload = {
         "agent_id": agent.agent_id,
         "device_facts": device_facts,
@@ -831,6 +852,25 @@ def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id, reply_
         },
         "helpdesk_code": get_core_settings().ai_helpdesk_code or "",
     }
+    if is_multi:
+        payload["multi"] = True
+        payload["primary_role"] = primary_role or ""
+        payload["machines"] = [
+            {
+                "agent_id": agent.agent_id,
+                "hostname": agent.hostname,
+                "role": primary_role or "",
+                "device_facts": device_facts,
+            }
+        ] + [
+            {
+                "agent_id": sm["agent"].agent_id,
+                "hostname": sm["agent"].hostname,
+                "role": sm.get("role") or "",
+                "device_facts": _ai_device_facts(sm["agent"]),
+            }
+            for sm in secondary_machines
+        ]
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)
     try:
@@ -1047,10 +1087,44 @@ def run_ai_task(task_id, triggered_by="schedule"):
         run.status = "error"; run.summary = msg; run.finished_at = djangotime.now(); run.save()
         return "no model"
 
+    # Multi-machine (optional): resolve the additional-machine roster to live Agent
+    # rows. Fail loud rather than quietly running short-handed - a task written to
+    # reason across a PAIR of machines (e.g. "cert host" + "RD Gateway") produces a
+    # misleading result if one side silently vanishes from the roster.
+    secondary_machines = None
+    if task.machines:
+        from agents.models import Agent as _Agent
+
+        ids = [str((m or {}).get("agent_id") or "") for m in task.machines]
+        by_id = {
+            a.agent_id: a
+            for a in _Agent.objects.select_related("site__client").filter(
+                agent_id__in=ids
+            )
+        }
+        missing = [aid for aid in ids if aid not in by_id]
+        if missing:
+            msg = (
+                f"Task '{task.name}' has {len(missing)} secondary machine(s) that no "
+                f"longer exist ({', '.join(missing)}). Edit the task's machine roster."
+            )
+            AITask.objects.filter(pk=task.pk).update(
+                last_run=djangotime.now(), last_status="error", last_summary=msg
+            )
+            run.status = "error"; run.summary = msg; run.finished_at = djangotime.now(); run.save()
+            _ai_alert_gated(task.agent, task.name, "error", msg, task.alert_threshold, False)
+            return "missing secondary machine"
+        secondary_machines = [
+            {"agent": by_id[str((m or {}).get("agent_id") or "")], "role": (m or {}).get("role") or ""}
+            for m in task.machines
+        ]
+
     status, summary, output, ticket_error = _run_prompt_on_agent(
         agent=task.agent, model=model, prompt=task.prompt,
         allow_mutating=task.allow_mutating, run_id=run_id,
         reply_register=getattr(task, "reply_register", "none"),
+        primary_role=getattr(task, "primary_role", ""),
+        secondary_machines=secondary_machines,
     )
 
     task.last_run = djangotime.now()
