@@ -348,6 +348,23 @@ class CoreSettings(BaseAuditModel):
         default=TerminalModeChoices.NEW,
     )
 
+    # ---- ERP AI integration (inbound) -------------------------------------
+    # Master switch for ERP systems that embed our AI next to a record they are
+    # displaying -- currently the Odoo `ai_pi_bridge` addon, but named
+    # generically because the contract (mint a session, resolve models, execute
+    # nothing) is not Odoo-specific.
+    #
+    # OFF by default and checked on every /core/ai/odoo/ request, so this switch
+    # alone closes the integration without touching nginx or the ERP.
+    ai_erp_integration_enabled = models.BooleanField(default=False)
+    # Origins permitted to embed the chat UI and exchange postMessage with it.
+    # Comma-separated, e.g. "https://erp.blueuc.com". Served to the UI at
+    # runtime so the ERP hostname is never hardcoded in the static page.
+    ai_erp_allowed_origins = models.TextField(blank=True, default="")
+    # Public base the chat UI should open its WebSocket against. Blank = derive
+    # from the request, which is correct unless the API is fronted separately.
+    ai_erp_ws_base = models.CharField(max_length=255, blank=True, default="")
+
     def save(self, *args, **kwargs) -> None:
         from alerts.tasks import cache_agents_alert_template
 

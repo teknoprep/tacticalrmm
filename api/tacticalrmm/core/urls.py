@@ -1,9 +1,22 @@
 from django.urls import path
 from django.conf import settings
 
-from . import views
+from . import odoo_ai, views
 
 urlpatterns = [
+    # Odoo `ai_pi_bridge` addon entry points. Shared-secret authenticated (see
+    # core/odoo_ai.py); they mint a chat session and resolve model permissions.
+    # They hold no Odoo credentials and cannot write to Odoo -- the addon does
+    # all Odoo work itself, as the logged-in Odoo user.
+    path("ai/odoo/health/", odoo_ai.health),
+    path("ai/odoo/identity/", odoo_ai.identity),
+    path("ai/odoo/session/", odoo_ai.session),
+    # Unauthenticated, secret-free: origins + ws base for the embedded chat UI,
+    # so the ERP hostname is never hardcoded in the static page.
+    path("ai/odoo/ui-config/", odoo_ai.ui_config),
+    path("ai/odoo/brand/", odoo_ai.brand),
+    path("ai/odoo/decision/", odoo_ai.decision),
+    path("ai/odoo/work/", odoo_ai.work),
     path("settings/", views.GetEditCoreSettings.as_view()),
     path("version/", views.version),
     path("emailtest/", views.email_test),

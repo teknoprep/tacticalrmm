@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>AI Assistant</title>
+<!--
+  AI Assistant chat UI, embedded by Odoo in an iframe.
+
+  This page is INERT BY DESIGN. It holds no credential of its own, has no Odoo
+  session, and cannot reach the RMM API. Everything it can do:
+
+    1. receive a short-lived pi-session token from the parent Odoo tab,
+    2. open the existing token-authenticated WebSocket with it,
+    3. relay any action the model PROPOSES back to the parent.
+
+  The parent Odoo tab is the only party that can act, and it does so as the
+  logged-in Odoo user after showing that user a preview and getting a
+  confirmation. If this page is opened directly by a stranger there is no
+  opener, no token, and nothing happens.
+
+  Note what is NOT here: no fetch() to Odoo, no fetch() to the RMM API, no
+  stored secret. Adding any of those would move the trust boundary into the
+  browser, which is the thing this split exists to avoid.
+-->
+<style>
+  :root {
+    --bc-primary: #00c4ff;
+    --bc-dark: #1b1319;
+    --bc-border: #dee2e6;
+    --bc-muted: #6c757d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #212529; background: #fff; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 8px 12px; border-bottom: 1px solid var(--bc-border);
+    display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: #adb5bd; }
+  header .dot.on { background: #28a745; }
+  header .dot.err { background: #dc3545; }
+  header .who { font-weight: 600; }
+  header .meta { color: var(--bc-muted); font-size: 12px; }
+  header select { margin-left: auto; max-width: 240px; font-size: 12px; padding: 2px 4px; }
+  .costbar {
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+    padding: 4px 12px; font-size: 12px; color: var(--bc-muted);
+    background: #f8f9fa; border-bottom: 1px solid var(--bc-border); flex: 0 0 auto;
+  }
+  .costbar b { color: #212529; }
+  .cost-warn { color: #b3541e; font-weight: 600; }
+  .statusline {
+    display: flex; gap: 8px; align-items: center; padding: 6px 12px;
+    font-size: 13px; color: var(--bc-muted); background: #f1fbff;
+    border-bottom: 1px solid var(--bc-border); flex: 0 0 auto;
+  }
+  /* Markdown output. Kept close to Odoo's own typography rather than importing
+     a theme, so the panel reads as part of Odoo. */
+  .md > *:first-child { margin-top: 0; }
+  .md > *:last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3 { font-size: 1.05em; font-weight: 600; margin: .7em 0 .3em; }
+  .md p { margin: .4em 0; }
+  .md ul, .md ol { margin: .4em 0; padding-left: 1.3em; }
+  .md li { margin: .15em 0; }
+  .md code {
+    background: #f1f3f5; padding: 1px 4px; border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em;
+  }
+  .md pre {
+    background: #f8f9fa; border: 1px solid var(--bc-border); border-radius: 4px;
+    padding: 8px; overflow-x: auto; margin: .5em 0;
+  }
+  .md pre code { background: none; padding: 0; }
+  .md table { border-collapse: collapse; margin: .5em 0; font-size: .95em; }
+  .md th, .md td { border: 1px solid var(--bc-border); padding: 3px 8px; text-align: left; }
+  .md th { background: #f8f9fa; font-weight: 600; }
+  .md blockquote {
+    border-left: 3px solid var(--bc-primary); margin: .5em 0; padding: .2em .8em;
+    color: var(--bc-muted);
+  }
+  .md strong { font-weight: 600; color: #111; }
+
+  /* Questionnaire */
+  .qcard {
+    border: 1px solid var(--bc-primary); border-radius: 6px; margin: 10px 0;
+    background: #f8fdff; overflow: hidden;
+  }
+  .qhead {
+    display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+    background: #eaf9ff; border-bottom: 1px solid #cdeffb; font-size: 12px;
+  }
+  .qhead .qtitle { font-weight: 600; color: #0b5f78; }
+  .qhead .qmeta { color: var(--bc-muted); margin-left: auto; }
+  .qbar { height: 3px; background: #cdeffb; }
+  .qbar > span { display: block; height: 100%; background: var(--bc-primary); transition: width .2s; }
+  .qbody { padding: 10px 12px; }
+  .qtext { font-weight: 600; font-size: 15px; margin-bottom: 2px; }
+  .qhint { color: var(--bc-muted); font-size: 12px; margin-bottom: 8px; }
+  .qchoices { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .qchoices button {
+    background: #fff; color: #212529; border: 1px solid var(--bc-border);
+    font-weight: 500; padding: 5px 12px;
+  }
+  .qchoices button:hover { border-color: var(--bc-primary); background: #f1fbff; }
+  .qrow { display: flex; gap: 6px; }
+  .qrow input {
+    flex: 1; padding: 6px 8px; border: 1px solid var(--bc-border); border-radius: 4px;
+    font: inherit;
+  }
+  .qdone { color: #157347; font-size: 12px; padding: 2px 10px 8px; }
+  #log { flex: 1 1 auto; overflow-y: auto; padding: 12px; }
+  .msg { margin-bottom: 12px; display: flex; gap: 8px; }
+  .msg .body { white-space: pre-wrap; word-wrap: break-word; flex: 1; }
+  .msg.user .body { background: #f1f3f5; padding: 8px 10px; border-radius: 8px; }
+  .msg .role {
+    flex: 0 0 52px; font-size: 11px; text-transform: uppercase;
+    color: var(--bc-muted); padding-top: 2px; letter-spacing: .04em;
+  }
+  .note {
+    border-left: 3px solid var(--bc-primary); background: #f8fdff;
+    padding: 8px 10px; margin: 8px 0; font-size: 13px;
+  }
+  .note.warn { border-left-color: #ffc107; background: #fffdf5; }
+  .note.err  { border-left-color: #dc3545; background: #fff5f5; }
+  .note.ok   { border-left-color: #28a745; background: #f6fff8; }
+  .note code { font-size: 12px; }
+  footer { flex: 0 0 auto; border-top: 1px solid var(--bc-border); padding: 8px; }
+  form { display: flex; gap: 8px; }
+  textarea {
+    flex: 1; resize: none; min-height: 38px; max-height: 140px; padding: 8px;
+    border: 1px solid var(--bc-border); border-radius: 6px; font: inherit;
+  }
+  button {
+    padding: 8px 16px; border: 0; border-radius: 6px; background: var(--bc-primary);
+    color: var(--bc-dark); font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .spin { display: inline-block; animation: s 1s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .empty { color: var(--bc-muted); text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="who" id="who">Connecting...</span>
+  <span class="meta" id="meta"></span>
+  <select id="models" hidden></select>
+</header>
+
+<div id="costbar" class="costbar" hidden>
+  <span class="cost-item"><b id="cost-session">$0.00</b> session</span>
+  <span class="cost-item" id="cost-turn-wrap">last turn <b id="cost-turn">$0.00</b></span>
+  <span class="cost-item" id="cost-turns-wrap"><b id="cost-turns">0</b> turns</span>
+  <span class="cost-item" id="cost-ctx-wrap"></span>
+  <span class="cost-warn" id="cost-warn" hidden></span>
+</div>
+
+<div id="status" class="statusline" hidden>
+  <span class="spin">&#9696;</span> <span id="status-text">Thinking...</span>
+</div>
+
+<div id="log">
+  <div class="empty" id="empty">Waiting for Odoo to hand over the session...</div>
+</div>
+
+<footer>
+  <form id="form">
+    <textarea id="input" placeholder="Ask about this record..." disabled></textarea>
+    <button id="send" type="submit" disabled>Send</button>
+  </form>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // NOTHING is hardcoded here. Origins and the WebSocket base are fetched at
+  // runtime from TRMM Global Settings (/ai-integration/ui-config, proxied
+  // same-origin, secret-free). ERP hostnames change; a hardcoded origin means
+  // editing and redeploying static assets, and an origin check that is
+  // inconvenient to change is one that eventually gets disabled.
+  var PARENT_ORIGINS = [];   // populated from ui-config
+  var WS_BASE = "";          // populated from ui-config
+  var configReady = false;
+
+  // Queue any handshake that arrives before config has loaded, so a fast parent
+  // is not dropped.
+  var pendingSession = null;
+
+  function originAllowed(origin) {
+    return configReady && PARENT_ORIGINS.indexOf(origin) !== -1;
+  }
+
+  function loadConfig() {
+    return fetch("ui-config", { credentials: "omit" })
+      .then(function (r) { return r.json(); })
+      .then(function (cfg) {
+        if (!cfg.enabled) {
+          el.dot.className = "dot err";
+          el.empty.textContent =
+            "The ERP AI integration is switched off in Tactical RMM.";
+          return false;
+        }
+        PARENT_ORIGINS = cfg.parent_origins || [];
+        WS_BASE = cfg.ws_base || "";
+        configReady = true;
+        if (!PARENT_ORIGINS.length) {
+          addNote("warn",
+            "No ERP origins are configured in Tactical RMM, so this page will " +
+            "not accept a session. Set them in Global Settings.");
+          return false;
+        }
+        return true;
+      })
+      .catch(function () {
+        el.dot.className = "dot err";
+        el.empty.textContent = "Could not load configuration from the RMM server.";
+        return false;
+      });
+  }
+
+  var el = {
+    log: document.getElementById("log"),
+    empty: document.getElementById("empty"),
+    form: document.getElementById("form"),
+    input: document.getElementById("input"),
+    send: document.getElementById("send"),
+    dot: document.getElementById("dot"),
+    who: document.getElementById("who"),
+    meta: document.getElementById("meta"),
+    models: document.getElementById("models"),
+    costbar: document.getElementById("costbar"),
+    costSession: document.getElementById("cost-session"),
+    costTurn: document.getElementById("cost-turn"),
+    costTurns: document.getElementById("cost-turns"),
+    costCtx: document.getElementById("cost-ctx-wrap"),
+    costWarn: document.getElementById("cost-warn"),
+    status: document.getElementById("status"),
+    statusText: document.getElementById("status-text")
+  };
+
+  function money(v) {
+    var n = Number(v || 0);
+    return n < 0.01 && n > 0 ? "$" + n.toFixed(4) : "$" + n.toFixed(2);
+  }
+
+  // Cost frames come straight from the bridge's shared cost meter -- the same
+  // one the device and decision chats use, so the numbers reconcile with the
+  // spend ledger rather than being a second estimate.
+  function onCostUpdate(m) {
+    el.costbar.hidden = false;
+    el.costSession.textContent = m.pricing_known === false ? "-" : money(m.session_cost);
+    el.costTurn.textContent = m.pricing_known === false ? "-" : money(m.turn_cost);
+    el.costTurns.textContent = m.turns || 0;
+    if (m.context_tokens && m.context_window) {
+      var pct = Math.round((m.context_tokens / m.context_window) * 100);
+      el.costCtx.innerHTML = "context <b>" + pct + "%</b> (" +
+        m.context_tokens.toLocaleString() + " / " + m.context_window.toLocaleString() + ")";
+    }
+  }
+
+  function setStatus(text) {
+    if (!text) { el.status.hidden = true; return; }
+    el.statusText.textContent = text;
+    el.status.hidden = false;
+  }
+
+  var ws = null;
+  var session = null;
+  var busy = false;
+  var quiz = null;      // { questions:[], estimate_minutes, title }
+  var quizEl = null;    // the live card, replaced in place on each update
+
+  // --- rendering ---------------------------------------------------------
+  function scroll() { el.log.scrollTop = el.log.scrollHeight; }
+
+  // Markdown -> HTML.
+  //
+  // Deliberately hand-rolled and deliberately small: no CDN dependency (the page
+  // is served from the RMM host under a strict CSP and must work offline), and
+  // no library to keep patched.
+  //
+  // SAFETY: the input is escaped FIRST, then a fixed set of patterns is applied.
+  // Nothing in the model's output can therefore introduce a tag or an attribute
+  // -- it can only be marked up. This matters because assistant text can quote
+  // customer email, which is untrusted.
+  function esc(t) {
+    return String(t == null ? "" : t)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function inlineMd(t) {
+    return t
+      .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+      .replace(/(^|[\s(])_([^_\n]+)_/g, "$1<em>$2</em>")
+      // Links: only http(s), and the URL is already escaped.
+      .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+               '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  }
+
+  function mdToHtml(src) {
+    var lines = esc(src).split(/\r?\n/);
+    var out = [], i = 0;
+
+    function tableAt(start) {
+      var head = lines[start] || "", sep = lines[start + 1] || "";
+      if (head.indexOf("|") === -1) return 0;
+      if (!/^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(sep)) return 0;
+      var cells = function (row) {
+        return row.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|")
+                  .map(function (c) { return inlineMd(c.trim()); });
+      };
+      var html = "<table><thead><tr>" +
+        cells(head).map(function (c) { return "<th>" + c + "</th>"; }).join("") +
+        "</tr></thead><tbody>";
+      var n = start + 2;
+      while (n < lines.length && lines[n].indexOf("|") !== -1) {
+        html += "<tr>" + cells(lines[n]).map(function (c) { return "<td>" + c + "</td>"; }).join("") + "</tr>";
+        n++;
+      }
+      out.push(html + "</tbody></table>");
+      return n - start;
+    }
+
+    while (i < lines.length) {
+      var line = lines[i];
+
+      if (/^\s*```/.test(line)) {                        // fenced code
+        var buf = [];
+        i++;
+        while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++; }
+        i++;
+        out.push("<pre><code>" + buf.join("\n") + "</code></pre>");
+        continue;
+      }
+      var eaten = tableAt(i);
+      if (eaten) { i += eaten; continue; }
+      if (/^\s*#{1,6}\s+/.test(line)) {                  // heading
+        out.push("<h3>" + inlineMd(line.replace(/^\s*#{1,6}\s+/, "")) + "</h3>");
+        i++; continue;
+      }
+      if (/^\s*&gt;\s?/.test(line)) {                    // blockquote
+        var q = [];
+        while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) {
+          q.push(inlineMd(lines[i].replace(/^\s*&gt;\s?/, ""))); i++;
+        }
+        out.push("<blockquote>" + q.join("<br/>") + "</blockquote>");
+        continue;
+      }
+      if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {          // list
+        var ordered = /^\s*\d+[.)]\s+/.test(line), items = [];
+        while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
+          items.push("<li>" + inlineMd(lines[i].replace(/^\s*([-*+]|\d+[.)])\s+/, "")) + "</li>");
+          i++;
+        }
+        out.push((ordered ? "<ol>" : "<ul>") + items.join("") + (ordered ? "</ol>" : "</ul>"));
+        continue;
+      }
+      if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) { out.push("<hr/>"); i++; continue; }
+      if (!line.trim()) { i++; continue; }
+
+      var para = [];                                      // paragraph
+      while (i < lines.length && lines[i].trim() &&
+             !/^\s*(#{1,6}\s|&gt;|```|([-*+]|\d+[.)])\s|-{3,}$)/.test(lines[i]) &&
+             !tableAt(i)) {
+        para.push(inlineMd(lines[i])); i++;
+      }
+      if (para.length) out.push("<p>" + para.join("<br/>") + "</p>");
+    }
+    return out.join("");
+  }
+
+  function addMsg(role, text) {
+    if (el.empty) { el.empty.remove(); el.empty = null; }
+    var wrap = document.createElement("div");
+    wrap.className = "msg " + role;
+    var r = document.createElement("div");
+    r.className = "role";
+    r.textContent = role === "user" ? "You" : "AI";
+    var b = document.createElement("div");
+    if (role === "assistant") {
+      b.className = "body md";
+      b.innerHTML = mdToHtml(text);
+    } else {
+      b.className = "body";
+      b.textContent = text;
+    }
+    wrap.appendChild(r); wrap.appendChild(b);
+    el.log.appendChild(wrap);
+    scroll();
+  }
+
+  function addNote(kind, text) {
+    if (el.empty) { el.empty.remove(); el.empty = null; }
+    var n = document.createElement("div");
+    n.className = "note " + (kind || "");
+    n.textContent = text;
+    el.log.appendChild(n);
+    scroll();
+    return n;
+  }
+
+  // Watchdog: if the socket goes quiet mid-turn, stop pretending work is
+  // happening. Without this the indicator is only ever cleared by a frame that
+  // may never arrive -- a dropped turn, a provider stall, or an event arriving
+  // after the turn already finished all leave it spinning forever, which is
+  // worse than no indicator because it actively misinforms.
+  var idleTimer = null;
+  var IDLE_MS = 45000;
+
+  function pokeWatchdog() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (!busy) return;
+    idleTimer = setTimeout(function () {
+      setBusy(false);
+      setStatus("");
+      addNote("warn", "No response for " + Math.round(IDLE_MS / 1000) +
+        "s \u2014 the turn may have failed. Try again.");
+    }, IDLE_MS);
+  }
+
+  function setBusy(v) {
+    busy = v;
+    el.send.disabled = v || !ws;
+    el.input.disabled = v || !ws;
+    el.send.innerHTML = v ? '<span class="spin">&#9696;</span>' : "Send";
+    // Idle means idle: never leave a status line behind.
+    if (!v) setStatus("");
+    pokeWatchdog();
+  }
+
+  // --- parent channel ----------------------------------------------------
+  // Post to every configured ERP origin with an EXPLICIT target origin. Never
+  // "*": that would broadcast record content to whatever loaded this frame.
+  // ---- questionnaire -----------------------------------------------------
+  //
+  // One question at a time, with a remaining count and a time estimate. The model
+  // re-emits the whole set each turn with answers folded in, so both numbers
+  // track reality as answers change what still needs asking -- a later answer can
+  // remove questions that no longer apply, or add ones that now do.
+  function renderQuiz() {
+    if (quizEl) { quizEl.remove(); quizEl = null; }
+    if (!quiz || !quiz.questions.length) return;
+
+    var pending = quiz.questions.filter(function (q) { return !q.answered; });
+    var done = quiz.questions.length - pending.length;
+
+    var card = document.createElement("div");
+    card.className = "qcard";
+
+    if (!pending.length) {
+      card.innerHTML =
+        '<div class="qhead"><span class="qtitle">' + esc(quiz.title || "Questions") +
+        '</span><span class="qmeta">all answered</span></div>' +
+        '<div class="qbar"><span style="width:100%"></span></div>' +
+        '<div class="qdone">\u2713 ' + done + " of " + done + " answered.</div>";
+      el.log.appendChild(card);
+      quizEl = card;
+      scroll();
+      return;
+    }
+
+    var q = pending[0];
+    var perQ = quiz.estimate_minutes && quiz.questions.length
+      ? quiz.estimate_minutes / quiz.questions.length : 0;
+    var remainMin = Math.max(1, Math.round(perQ * pending.length));
+    var pct = Math.round((done / quiz.questions.length) * 100);
+
+    var head = '<div class="qhead">' +
+      '<span class="qtitle">' + esc(quiz.title || "Questions") + '</span>' +
+      '<span class="qmeta">Question ' + (done + 1) + " of " + quiz.questions.length +
+      " &nbsp;\u2022&nbsp; " + pending.length + " left" +
+      (quiz.estimate_minutes ? " &nbsp;\u2022&nbsp; ~" + remainMin + " min" : "") +
+      '</span></div>' +
+      '<div class="qbar"><span style="width:' + pct + '%"></span></div>';
+
+    var body = '<div class="qbody">' +
+      '<div class="qtext">' + esc(q.q) + '</div>' +
+      (q.hint ? '<div class="qhint">' + esc(q.hint) + "</div>" : "");
+
+    if (q.choices && q.choices.length) {
+      body += '<div class="qchoices">';
+      q.choices.forEach(function (c, idx) {
+        body += '<button data-choice="' + idx + '">' + esc(c) + "</button>";
+      });
+      body += "</div>";
+    }
+    body += '<div class="qrow">' +
+      '<input type="text" placeholder="Type your answer..." data-qinput="1"/>' +
+      '<button data-send="1">Answer</button></div></div>';
+
+    card.innerHTML = head + body;
+    el.log.appendChild(card);
+    quizEl = card;
+
+    var input = card.querySelector("[data-qinput]");
+    function answer(value) {
+      value = (value || "").trim();
+      if (!value || busy) return;
+      q.answered = true;
+      q.answer = value;
+      renderQuiz();
+      // Sent as a normal turn, tagged so the model knows which question it
+      // belongs to and can re-emit the set with it filled in.
+      send("[ANSWER " + q.id + "] " + value, "**" + q.q + "** \u2192 " + value);
+    }
+    card.querySelectorAll("[data-choice]").forEach(function (b) {
+      b.addEventListener("click", function () { answer(q.choices[Number(b.dataset.choice)]); });
+    });
+    card.querySelector("[data-send]").addEventListener("click", function () { answer(input.value); });
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); answer(input.value); }
+    });
+    input.focus();
+    scroll();
+  }
+
+  // Single path for sending a turn, so the transcript and the model stay in step
+  // whether the text came from the composer or from a questionnaire answer.
+  function send(text, displayAs) {
+    if (!ws || ws.readyState !== 1 || busy) return;
+    addMsg("user", displayAs || text);
+    reportTurn("user", displayAs || text);
+    ws.send(JSON.stringify({ type: "user", content: text }));
+    setBusy(true);
+  }
+
+  // Tell Odoo about a turn so it persists in the conversation transcript.
+  function reportTurn(role, body) {
+    toParent("ai.turn", { role: role, body: body });
+  }
+
+  function toParent(type, payload) {
+    if (window.parent === window || !configReady) return;
+    for (var i = 0; i < PARENT_ORIGINS.length; i++) {
+      window.parent.postMessage({ type: type, payload: payload || {} }, PARENT_ORIGINS[i]);
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    // Accept only a configured ERP origin, and only from our actual parent.
+    if (event.source !== window.parent) return;
+    if (!configReady) {
+      // Config still loading: remember it, validate once we know the origins.
+      if (event.data && event.data.type === "ai.session") {
+        pendingSession = { origin: event.origin, payload: event.data.payload };
+      }
+      return;
+    }
+    if (!originAllowed(event.origin)) return;
+    var data = event.data || {};
+    if (typeof data.type !== "string") return;
+
+    if (data.type === "ai.session") {
+      onSession(data.payload || {});
+    } else if (data.type === "ai.intent.result") {
+      onIntentResult(data.payload || {});
+    }
+  });
+
+  function onSession(p) {
+    session = p;
+
+    // Replay the transcript Odoo kept. The chat streams straight from this host,
+    // so the browser has no memory of earlier turns -- Odoo is the durable store
+    // and hands them back on open.
+    if (p.history && p.history.length) {
+      if (el.empty) { el.empty.remove(); el.empty = null; }
+      p.history.forEach(function (m) {
+        if (m.role === "user" || m.role === "assistant") {
+          addMsg(m.role, m.content || "");
+        }
+      });
+      addNote("", "\u2014 resumed, " + p.history.length + " earlier message(s) \u2014");
+    }
+    el.who.textContent = p.user || "AI Assistant";
+    var bits = [];
+    if (p.record && p.record.display) bits.push(p.record.display);
+    if (p.companies && p.companies.length) bits.push(p.companies.join(", "));
+    if (p.model_locked) bits.push("default model only");
+    el.meta.textContent = bits.length ? "\u2022 " + bits.join(" \u2022 ") : "";
+
+    if (!p.token) {
+      el.dot.className = "dot err";
+      addNote("err", "Odoo did not supply a session token.");
+      return;
+    }
+    connect(p.token);
+  }
+
+  function onIntentResult(p) {
+    if (p.rejected) {
+      addNote("warn", "You declined that action. Nothing was changed.");
+    } else if (p.failed) {
+      addNote("err", "The action failed: " + (p.summary || "unknown error"));
+    } else {
+      addNote("ok", p.summary || "Done.");
+    }
+    // Tell the model what actually happened, so it does not assume success.
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: "user",
+        content: "[SYSTEM] Outcome of your proposed action: " +
+          (p.rejected ? "the technician DECLINED it. Nothing was changed."
+            : p.failed ? "it FAILED: " + (p.summary || "")
+              : "it was CONFIRMED and executed. " + (p.summary || ""))
+      }));
+      setBusy(true);
+    }
+  }
+
+  // --- websocket ---------------------------------------------------------
+  function connect(token) {
+    ws = new WebSocket(WS_BASE + encodeURIComponent(token));
+
+    ws.onopen = function () {
+      el.dot.className = "dot on";
+      setBusy(false);
+      if (el.empty) { el.empty.textContent = "Ask anything about this record."; }
+    };
+
+    ws.onclose = function () {
+      setBusy(false);
+      setStatus("");
+      el.dot.className = "dot err";
+      el.input.disabled = true;
+      el.send.disabled = true;
+      addNote("warn", "The AI session closed. Reopen the assistant to continue.");
+    };
+
+    ws.onerror = function () {
+      el.dot.className = "dot err";
+      addNote("err", "Could not reach the AI service.");
+    };
+
+    ws.onmessage = function (event) {
+      var m;
+      try { m = JSON.parse(event.data); } catch (e) { return; }
+      pokeWatchdog();
+
+      switch (m.type) {
+        case "ready":
+          if (m.cost_visible) {
+            el.costbar.hidden = false;
+          } else {
+            el.costbar.hidden = false;
+            el.costSession.textContent = "n/a";
+            el.costTurn.textContent = "n/a";
+            document.getElementById("cost-turn-wrap").title =
+              "Cost is hidden: your RMM role does not grant 'can_view_ai_cost', " +
+              "or this Odoo login has no matching RMM user.";
+          }
+          populateModels(m.models, m.model && m.model.model_id);
+          if (m.intents && m.intents.length) {
+            addNote("", "Actions available here: " +
+              m.intents.map(function (i) { return i.name; }).join(", ") +
+              ". Any change is previewed in Odoo and needs your confirmation.");
+          }
+          break;
+        case "busy":
+          setBusy(!!m.busy);
+          if (!m.busy) setStatus("");
+          else setStatus("Thinking...");
+          break;
+        case "questions":
+          quiz = {
+            questions: m.questions || [],
+            estimate_minutes: m.estimate_minutes || 0,
+            title: m.title || "Questions"
+          };
+          renderQuiz();
+          break;
+        case "cost_update":
+          onCostUpdate(m);
+          break;
+        case "cost_warning":
+          el.costWarn.hidden = false;
+          el.costWarn.textContent = m.message || "";
+          break;
+        case "agent_event":
+          // Drives the progress indicator. The authoritative reply still arrives
+          // as a single "assistant" frame, so this never has to be relied on for
+          // content -- it exists so a long turn does not look like a dead window.
+          onAgentEvent(m.event || {});
+          break;
+        case "assistant":
+          setStatus("");
+          addMsg("assistant", m.content || "");
+          reportTurn("assistant", m.content || "");
+          break;
+        case "intent_proposal":
+          // Hand it to Odoo. Odoo validates it, previews it, and asks the human.
+          // This page never sees whether it is allowed, and cannot run it.
+          addNote("", "Proposed: " + m.intent + " \u2014 sent to Odoo for your review.");
+          toParent("ai.intent.propose", { intent: m.intent, args: m.args || {} });
+          break;
+        case "model_switched":
+          addNote("", "Switched model to " + m.model_id + ".");
+          break;
+        case "error":
+          addNote("err", m.message || "Error.");
+          setBusy(false);
+          setStatus("");
+          break;
+        case "done":
+          setBusy(false);
+          setStatus("");
+          break;
+        default:
+          break;
+      }
+    };
+  }
+
+  // Map the agent event stream onto a short status line. Deliberately coarse:
+  // the point is answering "is anything happening?", not mirroring internals.
+  function onAgentEvent(ev) {
+    // Events can land after the turn has already completed. Acting on those is
+    // what left "Writing..." stuck on screen with nothing running.
+    if (!busy && ev.type !== "agent_end") return;
+    switch (ev.type) {
+      case "agent_start":
+        setStatus("Thinking...");
+        break;
+      case "tool_execution_start":
+        setStatus("Working" + (ev.toolName ? " (" + ev.toolName + ")" : "") + "...");
+        break;
+      case "tool_execution_end":
+        setStatus("Thinking...");
+        break;
+      case "auto_retry_start":
+        setStatus("Provider hiccup, retrying...");
+        break;
+      case "message_update":
+        // Streaming: any assistant activity means tokens are arriving.
+        setStatus("Writing...");
+        break;
+      case "agent_end":
+        setStatus("");
+        break;
+      default:
+        break;
+    }
+  }
+
+  function populateModels(models, current) {
+    if (!models || models.length < 2) return;  // nothing to choose
+    el.models.hidden = false;
+    el.models.innerHTML = "";
+    models.forEach(function (m) {
+      var o = document.createElement("option");
+      o.value = m.model_id;
+      o.textContent = m.name || m.model_id;
+      if (m.model_id === current) o.selected = true;
+      el.models.appendChild(o);
+    });
+    el.models.onchange = function () {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "switch_model", model_id: el.models.value }));
+      }
+    };
+  }
+
+  // --- input -------------------------------------------------------------
+  el.form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var text = el.input.value.trim();
+    if (!text) return;
+    el.input.value = "";
+    send(text);
+  });
+
+  el.input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      el.form.dispatchEvent(new Event("submit"));
+    }
+  });
+
+  // Load config first, then announce readiness; the parent replies with
+  // ai.session.
+  loadConfig().then(function (ok) {
+    if (!ok) return;
+    if (pendingSession) {
+      if (originAllowed(pendingSession.origin)) onSession(pendingSession.payload || {});
+      pendingSession = null;
+      return;
+    }
+    toParent("ai.ready", {});
+  });
+
+  if (window.parent === window) {
+    el.dot.className = "dot err";
+    el.empty.textContent =
+      "This page is the AI chat surface for Odoo. It has no access of its own " +
+      "and must be opened from a record in Odoo.";
+  }
+})();
+</script>
+</body>
+</html>
