@@ -1054,6 +1054,14 @@ for i in rmm.service daphne.service celery.service celerybeat.service; do
   sudo systemctl start ${i}
 done
 
+# Pi.dev AI assistant bridge (idempotent: deploys /rmm/pibridge -> /opt/pi-trmm-bridge,
+# npm deps, systemd unit, env file, service API key, nginx /pi/ block). Non-fatal: a
+# bridge failure must never abort a TRMM install.
+if [ -f /rmm/pibridge/setup.sh ]; then
+  print_green 'Setting up Pi.dev AI assistant bridge'
+  bash /rmm/pibridge/setup.sh || printf >&2 "${RED}Pi bridge setup failed (non-fatal); run /rmm/pibridge/setup.sh manually${NC}\n"
+fi
+
 printf >&2 "${YELLOW}%0.s*${NC}" {1..80}
 printf >&2 "\n\n"
 printf >&2 "${YELLOW}Installation complete!${NC}\n\n"

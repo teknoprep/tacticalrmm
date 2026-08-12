@@ -693,6 +693,14 @@ for i in nats nats-api rmm daphne celery celerybeat nginx; do
   sudo systemctl start ${i}
 done
 
+# Pi.dev AI assistant bridge (idempotent: re-deploys /rmm/pibridge -> /opt/pi-trmm-bridge
+# and restarts the service). Without this an RMM update silently leaves the OLD bridge
+# running against NEW backend code.
+if [ -f /rmm/pibridge/setup.sh ]; then
+  printf >&2 "${GREEN}Updating Pi.dev AI assistant bridge${NC}\n"
+  bash /rmm/pibridge/setup.sh || printf >&2 "${RED}Pi bridge update failed (non-fatal); run /rmm/pibridge/setup.sh manually${NC}\n"
+fi
+
 rm -f $TMP_SETTINGS
 sudo systemctl reload nginx
 printf >&2 "${GREEN}Update finished!${NC}\n"
