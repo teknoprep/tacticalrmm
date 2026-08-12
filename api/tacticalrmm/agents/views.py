@@ -481,6 +481,69 @@ class AgentMeshCentral(APIView):
         return Response(f"Repaired mesh agent on {agent.hostname}")
 
 
+class AgentWebProxy(APIView):
+    """Create a short-lived Remote Web Proxy session that tunnels HTTP/HTTPS
+    to a device on the agent's LAN (e.g. a firewall admin UI) through the agent."""
+
+    permission_classes = [IsAuthenticated, MeshPerms]
+
+    def post(self, request, agent_id):
+        from agents.web_proxy import create_session
+
+        agent = get_object_or_404(
+            Agent.objects.select_related("site__client").defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
+        if agent.hex_mesh_node_id == "error":
+            return notify_error("Missing mesh node id")
+
+        protocol = str(request.data.get("protocol", "https")).lower()
+        if protocol not in ("http", "https"):
+            return notify_error("protocol must be http or https")
+
+        addr = str(request.data.get("address", "")).strip()
+        if not addr:
+            return notify_error("address is required")
+
+        try:
+            port = int(request.data.get("port"))
+            if not (0 < port < 65536):
+                raise ValueError
+        except (TypeError, ValueError):
+            return notify_error("invalid port")
+
+        token = create_session(
+            agent_id=agent.agent_id,
+            hex_node_id=agent.hex_mesh_node_id,
+            protocol=protocol,
+            addr=addr,
+            port=port,
+            username=request.user.username,
+            hostname=agent.hostname,
+        )
+
+        AuditLog.audit_mesh_session(
+            username=request.user.username,
+            agent=agent,
+            debug_info={
+                "ip": request._client_ip,
+                "feature": "web_proxy",
+                "target": f"{protocol}://{addr}:{port}",
+            },
+        )
+
+        return Response(
+            {
+                "url": f"/agentproxy/{token}/",
+                "token": token,
+                "hostname": agent.hostname,
+                "client": agent.client.name,
+                "site": agent.site.name,
+                "target": f"{protocol}://{addr}:{port}",
+            }
+        )
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, AgentPerms])
 def get_agent_versions(request):
@@ -1691,6 +1754,36 @@ def _pi_device_facts(agent):
     }
 
 
+def _pi_operator_policy(core, user):
+    """Return only allowlisted Operator workstations the current technician may access."""
+    from tacticalrmm.permissions import _has_perm_on_agent
+
+    configured = list(core.ai_operator_allowed_agent_ids or [])
+    if not core.ai_operator_enabled or not configured:
+        return {"enabled": False, "machines": []}
+    permitted = [agent_id for agent_id in configured if _has_perm_on_agent(user, agent_id)]
+    agents = {
+        agent.agent_id: agent
+        for agent in Agent.objects.select_related("site__client")
+        .defer(*AGENT_DEFER)
+        .filter(agent_id__in=permitted)
+    }
+    machines = []
+    for agent_id in configured:
+        agent = agents.get(agent_id)
+        if agent:
+            machines.append({
+                "agent_id": agent.agent_id,
+                "hostname": agent.hostname,
+                "device_facts": _pi_device_facts(agent),
+            })
+    return {
+        "enabled": bool(machines),
+        "machines": machines,
+        "default_model_id": core.ai_operator_default_model_id,
+    }
+
+
 def _pi_model_dict(m):
     # safe for the browser (no api key)
     return {
@@ -1792,6 +1885,8 @@ class PiMultiSession(APIView):
             "hostname": hostnames,
             "device_facts": machines[0]["device_facts"],
             "username": user.username,
+            "user_email": getattr(user, "email", "") or "",
+            "user_display": (user.get_full_name() if hasattr(user, "get_full_name") else "") or user.username,
             "provider": chosen.provider.name,
             "model_id": chosen.model_id,
             "thinking_level": chosen.thinking_level,
@@ -1801,6 +1896,15 @@ class PiMultiSession(APIView):
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(
                 is_super or (user.role and user.role.can_use_ai_autoapprove)
+            ),
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(
+                is_super or (user.role and user.role.can_view_ai_cost)
+            ),
+            # Remembered preference - see accounts.User.ai_autoapprove_default.
+            "auto_approve": bool(
+                (is_super or (user.role and user.role.can_use_ai_autoapprove))
+                and getattr(user, "ai_autoapprove_default", False)
             ),
             # mutate_allowed = may this session EVER write (role/super).
             # allow_mutating = initial state; a read_only request (e.g. AI Resolve)
@@ -1865,7 +1969,7 @@ class PiMultiSession(APIView):
 class AgentPiSession(APIView):
     """Create a short-lived Pi.dev AI assistant session bound to one agent.
 
-    Validates permission, computes the caller's allowed
+    Mirrors AgentWebProxy: validates permission, computes the caller's allowed
     models, writes a redis token that the pi-trmm-bridge reads, audits, and
     returns a popup URL + token.
     """
@@ -1911,9 +2015,11 @@ class AgentPiSession(APIView):
                 "configure providers/models and grant access."
             )
 
-        default_model = next(
-            (m for m in allowed if m.is_default), allowed[0]
-        )
+        operator_policy = _pi_operator_policy(core, user)
+        # Pi Chat always opens on the GLOBAL default model (e.g. Sonnet 5).
+        # The Desktop Access model (e.g. Grok) is available in the picker for when the
+        # tech wants it — it is never forced just because Operator tools are enabled.
+        default_model = next((m for m in allowed if m.is_default), allowed[0])
 
         # requested model (optional) must be in allowed set
         req_id = request.data.get("model_id")
@@ -1960,6 +2066,8 @@ class AgentPiSession(APIView):
             "agent_id": agent.agent_id,
             "hostname": agent.hostname,
             "username": user.username,
+            "user_email": getattr(user, "email", "") or "",
+            "user_display": (user.get_full_name() if hasattr(user, "get_full_name") else "") or user.username,
             "provider": chosen["provider"] if isinstance(chosen, dict) else chosen.provider.name,
             "model_id": chosen.model_id,
             "thinking_level": chosen.thinking_level,
@@ -1969,6 +2077,12 @@ class AgentPiSession(APIView):
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(is_super or (user.role and user.role.can_use_ai_autoapprove)),
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
+            # Remembered preference (see accounts.User.ai_autoapprove_default): the device
+            # chat had the same reset-on-refresh behaviour as the ticket chat.
+            "auto_approve": bool((is_super or (user.role and user.role.can_use_ai_autoapprove))
+                                 and getattr(user, "ai_autoapprove_default", False)),
             "mutate_allowed": bool(is_super or (user.role and user.role.can_use_ai_mutate)),
             "allow_mutating": bool(
                 (is_super or (user.role and user.role.can_use_ai_mutate))
@@ -1982,6 +2096,7 @@ class AgentPiSession(APIView):
                 "api_key": core.ai_helpdesk_api_key or "",
             },
             "helpdesk_code": core.ai_helpdesk_code or "",
+            "operator": operator_policy,
         }
 
         token = create_pi_session(data=blob)
@@ -2008,6 +2123,11 @@ class AgentPiSession(APIView):
                 "allowed_models": [model_dict(m) for m in allowed],
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
+                "operator_enabled": operator_policy["enabled"],
+                "operator_machines": [
+                    {"agent_id": m["agent_id"], "hostname": m["hostname"]}
+                    for m in operator_policy["machines"]
+                ],
             }
         )
 

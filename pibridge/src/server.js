@@ -9,14 +9,17 @@ import {
   createAgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { CONFIG } from "./config.js";
-import { buildTools, buildReportTools, buildTicketTriageTools, buildDecisionTools, buildProcedureMiningTools } from "./tools.js";
+import { brandEmailPolicy, BRAND } from "./brand.js";
+import { buildTools, buildReportTools, buildTicketTriageTools, buildDecisionTools, buildProcedureMiningTools, operatorPromptSection } from "./tools.js";
 import { classOf, classSource, allowedOps, SURFACE_CLASSES, CLASSES, CAPS_MODE } from "./capabilities.js";
 import { loadHelpdesk } from "./helpdesk-runtime.js";
 import { loadVerifiers, matchVerifier, inspectVerifiers } from "./verifier-runtime.js";
 import { trmm } from "./trmm.js";
 import * as history from "./history.js";
+import { makeCostMeter, silentStopMessage } from "./cost-meter.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
+import { startOdooChat } from "./odoo-chat.js";
 
 const redis = new Redis(CONFIG.redisUrl);
 
@@ -115,25 +118,49 @@ function shellNoteFor(plat) {
     : "Linux/Unix: each run_command_on_device call is a fresh non-interactive /bin/bash session running as the agent's service account (usually root). Working dir and env do NOT persist between calls, so chain steps with ';' or '&&', use 'cd /path && ...', and you may send full multi-line scripts or heredocs. Add 2>&1 to capture errors.";
 }
 
+// Global/shared KB authoring is deliberately different from proactive per-company
+// memory. Trust only the technician's verbatim chat turns - never the model's claim
+// that it was asked. A later explicit negation cancels an earlier instruction.
+const GLOBAL_KB_ACTION = /\b(create|write|add|make|publish|build|author)\b/i;
+const GLOBAL_KB_TARGET = /(?:\bglobal\b[^.!?]{0,100}\b(kb|knowledge\s*base|article|artical)\b)|(?:\b(kb|knowledge\s*base|article|artical)\b[^.!?]{0,100}\bglobal\b)/i;
+const GLOBAL_KB_NEGATED = /\b(do ?n'?t|dont|do not|never|no need|hold off|not yet|don'?t yet|wait)\b[^.!?]{0,100}\b(create|write|add|make|publish|build|author)\b/i;
+function globalKBAuthorisation(techTurns) {
+  for (let i = techTurns.length - 1; i >= 0; i--) {
+    const line = String(techTurns[i]?.text || "");
+    if (!GLOBAL_KB_TARGET.test(line)) continue;
+    if (GLOBAL_KB_NEGATED.test(line)) return null;
+    if (GLOBAL_KB_ACTION.test(line)) {
+      return { at: techTurns[i].at, text: line.slice(0, 300) };
+    }
+  }
+  return null;
+}
+
 // Friendly, human-readable label for what the AI is doing (for live updates).
 
 // Built-in default for the decision-chat POLICY. Admins can override it in Global
 // Settings (ai_ticket_decision_prompt); this is the fallback when that's empty.
 const DEFAULT_DECISION_POLICY =
   `Work ONLY on this ticket. Do not modify any other ticket unless the technician explicitly names it (you may SUGGEST applying a policy to related tickets, but do not act on them without being told).\n` +
-  `TOOLS: helpdesk_call (get_ticket, reply_to_ticket, add_note, add_follower, cancel_ticket, ai_close_ticket, resolve_ticket, clear_needs_input_tag, upsert_ai_kb_article, resolve_customer...), find_devices (by username + full person_name, or a server HOSTNAME), run_device_command (diagnose/fix a device), schedule_action, send_email, web_search/web_fetch.\n` +
+  `TOOLS: helpdesk_call (get_ticket, reply_to_ticket, add_note, add_follower, cancel_ticket, ai_close_ticket, resolve_ticket, clear_needs_input_tag, upsert_ai_kb_article, create_global_kb_article, resolve_customer...), find_devices (by username + full person_name, or a server HOSTNAME), run_device_command (diagnose/fix a device), schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, sales_call (ERP quotations when enabled), web_search/web_fetch.\n` +
   `FOLLOWERS: to keep someone in the loop on THIS ticket (CC) - even if they aren't the requester, e.g. a customer's IT contact or a vendor - use helpdesk_call add_follower with their email (and name). Prefer this over emailing them separately, so the whole conversation stays on the ticket.\n` +
   `PRIVILEGED ACTIONS (identity/access) - EXTRA AUTHORIZATION GATE: creating/adding a user, disabling/removing/offboarding a user, changing permissions/roles/group membership, granting or revoking access or licenses, adding mailbox delegates / shared mailboxes, or resetting another person's password/MFA - anything that GRANTS or REMOVES ACCESS - is PRIVILEGED and goes BEYOND fixing something already installed. Before doing ANY privileged action automatically, call helpdesk_call check_support_authorization; proceed ONLY if authorized==true (the requester is the company's Primary or a Secondary Support Contact). If false, DO NOT make the change - explain that identity/access changes must be requested/approved by an authorized support contact, and leave it for a human. This gate applies EVEN in Write mode / Auto-approve. Ordinary break/fix on already-installed systems is NOT privileged.\n` +
   `RESEARCH: use web_search/web_fetch for how-to steps or vendor docs, then draft clear steps.\n` +
   `DEVICE FIXING: run_device_command diagnoses/fixes. Non-disruptive fixes run freely; reboots / service-stops / data-loss are REFUSED unless device changes are approved this turn. Diagnose read-only first, explain what you'll change, then do it. Never delete data.\n` +
-  `EMAIL: send_email is for INTERNAL/STAFF/VENDOR mail (purchase recommendations, parts orders). For CUSTOMER communication use reply_to_ticket / resolve_ticket so it stays on the ticket thread.\n` +
-  `MEMORY - TWO SEPARATE STORES, do not mix them:\n` +
+    `MEMORY - TWO SEPARATE STORES, do not mix them:\n` +
   `  - save_device_note = DEVICE-SPECIFIC facts about ONE machine (its role, disk/volume/pool layout, service/container names, hardware quirks, a fix that worked on it, how to verify its health). Anything tied to a specific host goes here, NOT the KB.\n` +
   `  - upsert_ai_kb_article = GENERAL guidance for working with this CLIENT (their standards/preferences, key contacts, naming conventions, recurring procedures that apply across their fleet). Never put a specific device's history or one-off event into the KB.\n` +
+  `  - create_global_kb_article = a NEW GLOBAL/shared article not tied to any client. Use it ONLY when the technician explicitly asks to create/write/publish a GLOBAL KB article. Never choose this proactively, and never substitute the company AI article for a requested global article.\n` +
   `CAPTURE KNOWLEDGE (do this proactively, without being asked): whenever the technician tells you something you did NOT already know - how a machine is set up, where something lives, how a process/workflow at this client works, a quirk or gotcha, or the fix that actually worked - DOCUMENT it right then so future runs start with it. Route it: a fact about ONE machine -> save_device_note (that device's agent_id); general client/process knowledge -> upsert_ai_kb_article. Briefly tell the tech what you saved. NEVER store secrets/passwords - note WHERE they live, not the value. IMPORTANT - recording knowledge is NOT a 'change' and NEVER needs permission, Write mode, or the tech's go-ahead: save_device_note and upsert_ai_kb_article only write to YOUR OWN memory - they do not touch a device, run a command, reboot anything, or contact a customer. So capture durable facts SILENTLY and proactively AS you learn them, EVEN when the tech has said 'don't make changes' or 'don't act without direction' - those rules govern DEVICES and CUSTOMER communication, not your memory. Do not ask 'should I save this?'; just save it and mention it in one line.\n` +
-  `SCHEDULING: only when the tech asks, use schedule_action (device agent_id, ISO 8601 run_at, instruction) - it runs once at that time and updates the ticket.\n` +
+  `SCHEDULING: only when the tech asks, use schedule_action (device agent_id, ISO 8601 run_at, instruction) - it runs once at that time and updates the ticket. When you finish work early, close a ticket, or a later check supersedes an earlier follow-up, ALWAYS list_scheduled_actions for this ticket and cancel_scheduled_action any leftover jobs so they do not fire.\n` +
+  `SALES/ERP: When sales_call is available, create DRAFT quotations in the ERP ONLY when the technician explicitly tells you to create/push the quote in Odoo/ERP. Building numbers in chat or emailing a quote is NOT permission to create an ERP quote. Never confirm a Sales Order. Always show the quotation URL. Partner must come from the ticket — if unclear, stop and ask. After create, add an internal ticket note with quote name/total/URL.\n` +
+
+    `${brandEmailPolicy()}` +
+  `EMAIL HTML READABILITY (MANDATORY — never forget): Email clients strip backgrounds. NEVER white/light text on colored headers. Dark text on light backgrounds only. Follow BLUECLOUD BRAND HTML above for every send_email html and quotation note_html.
+` +
   `CONTENT RULE: reply_to_ticket / resolve_ticket / add_note MUST contain the ACTUAL written text - never call them with empty content (empty messages are rejected, so a blank reply can never reach the customer).\n` +
-  `REPLY FORMATTING: Make every customer reply look like a clean, professional report. HARD RULES: (1) put ANY tabular/columnar data in a TABLE - a markdown table (| col | col | with a |---| header row) OR an HTML <table> with bordered cells and a dark-blue (#1a3c6e) header - NEVER as space-aligned plain text (it collapses into an unreadable blob). (2) put raw command/console output in a fenced triple-backtick code block. (3) use clear section headings, a short intro with the headline conclusion, and a next-steps list when relevant. You may write clean inline-styled HTML OR markdown - both are automatically converted to polished, branded, email-safe HTML - so pick whichever renders the data best (tables for columns, fences for output). Do NOT add your own greeting/sign-off (added automatically).\n` +
+  `REPLY FORMATTING: Make every customer reply look like a clean, professional report. HARD RULES: (1) put ANY tabular/columnar data in a TABLE - a markdown table (| col | col | with a |---| header row) OR an HTML <table> with bordered cells and a dark-blue (#1a3c6e) header - NEVER as space-aligned plain text (it collapses into an unreadable blob). (2) put raw command/console output in a fenced triple-backtick code block. (3) use clear section headings, a short intro with the headline conclusion, and a next-steps list when relevant. (4) TICKET-SAFE COLORS ONLY for reply_to_ticket / resolve_ticket customer_html: dark body text (#24292f / #333), dark-blue headings (#1a3c6e), light page background. NEVER white/light text (#fff, #ffffff, light grays/blues) and NEVER navy/dark hero banners or white-on-navy cards - Odoo strips backgrounds in the ticket chatter and leaves the light text unreadable (email still looks fine; the ticket does not). Tables: put background-color:#1a3c6e AND color:#ffffff on every <th> (not only on <tr>). Markdown is preferred for ticket replies; brochure/marketing HTML belongs only in send_email. Do NOT add your own greeting/sign-off (added automatically).\n` +
+  `QUOTE DUAL-SEND (mandatory): When the reply is a quotation / estimate / proposal / dual-option price / Not-to-Exceed (NTE) for the customer, you MUST do BOTH in the same turn: (a) reply_to_ticket with a TICKET-SAFE light-theme body (simple headings + tables, no white text / dark heroes), AND (b) send_email to the customer (and any internal CC the tech named) with the polished full branded HTML quote. The ticket is the record; the direct email is the nice copy clients actually forward/print. Ordinary non-quote replies stay ticket-only.\n` +
   `TECHNICAL EMAIL: When the tech asks for a "technical email" / "full technical reply" / "detailed technical email", make it thorough (same formatting rules above): a short intro + headline; a findings/specs TABLE of the key values; fenced code blocks for command output/config; an Assessment section; and a prioritized next-steps list. Keep the FULL technical detail and the actual numbers.\n` +
   `COMPLETION POLICY: NEVER close a ticket a person filed without telling the customer. To FINISH a worked ticket, use resolve_ticket with (1) internal_note = a review of what was done, and (2) customer_html = a polished, friendly HTML reply (inline styles) confirming it's resolved + next steps. For a pure monitoring alert with NO human requester, internal_note only (or cancel=true for junk).\n` +
   `SELF-ASSIGNMENT: Only assign this ticket to yourself (claim_ticket) when you are going to work it to COMPLETION now. If you can't finish it (you need a human decision, on-site work, parts, or an approval you don't have), do NOT claim it - leave it unassigned so a human picks it up. Once a tech gives you the input/approval you needed, claiming it to finish it is fine. Never own a ticket you can't finish.\n` +
@@ -353,6 +380,63 @@ function makeWorkRecorder({ ticketRef = "", agentId = "", surface, username, ses
   };
 }
 
+// The model's CONTEXT is not the operator's TRANSCRIPT.
+//
+// After a compaction, pi deliberately collapses history for the LLM: the compacted
+// summary replaces the earlier turns in `buildContextEntries()`, which is correct for
+// the model but means `session.messages` can be EMPTY. The bridge was sending that as
+// the UI history, so resuming a compacted chat opened a BLANK window even though the
+// whole conversation was still on disk. Seen on session 019fcc9e (2026-08-04): the
+// oversized turn blew the context, pi auto-compacted, and the resumed window showed
+// nothing while `getBranch()` still held all 15 entries.
+//
+// So: build what the OPERATOR sees from the durable branch, and mark the compaction
+// point so nobody assumes the model still remembers every line shown above it.
+const TRANSCRIPT_TOOL_RESULT_MAX = Number(process.env.PI_TRANSCRIPT_TOOL_MAX || 8000);
+const COMPACTION_NOTICE =
+  "--- Earlier turns were summarised to free up context. They are shown above for " +
+  "your reference, but the assistant no longer sees them verbatim - only the summary. ---";
+
+function uiTranscript(sessionManager, session) {
+  let branch = [];
+  try {
+    branch = sessionManager?.getBranch?.() || [];
+  } catch {
+    branch = [];
+  }
+  const out = [];
+  for (const entry of branch) {
+    if (entry?.type === "compaction") {
+      out.push({ role: "system", content: [{ type: "text", text: COMPACTION_NOTICE }] });
+      continue;
+    }
+    if (entry?.type !== "message" || !entry.message) continue;
+    const m = entry.message;
+    // Trim huge tool payloads for DISPLAY only - the on-disk record is untouched and
+    // the model's context is unaffected. Without this, replaying a turn like the one
+    // that caused this bug would push ~1.8 MB down the socket on every reconnect.
+    if (m.role === "toolResult" && Array.isArray(m.content)) {
+      out.push({
+        ...m,
+        content: m.content.map((c) =>
+          c?.type === "text" && typeof c.text === "string" && c.text.length > TRANSCRIPT_TOOL_RESULT_MAX
+            ? {
+                ...c,
+                text:
+                  c.text.slice(0, TRANSCRIPT_TOOL_RESULT_MAX) +
+                  `\n...(${c.text.length} bytes total, trimmed for display)`,
+              }
+            : c,
+        ),
+      });
+      continue;
+    }
+    out.push(m);
+  }
+  // Fall back to the live message list for a brand-new session (empty branch).
+  return out.length ? out : session?.messages || [];
+}
+
 // ---- WebSocket session lifecycle -------------------------------------------
 async function startChat(ws, blob) {
   const facts = blob.device_facts;
@@ -406,6 +490,7 @@ async function startChat(ws, blob) {
   const mutateAllowed = !!blob.mutate_allowed;
   let readonly = !blob.allow_mutating;
   if (!mutateAllowed) readonly = true; // can never write
+  const techSaid = [];
   const { tools, mutating, machines: toolMachines } = buildTools({
     machines,
     gate: requestApproval,
@@ -414,6 +499,11 @@ async function startChat(ws, blob) {
     isReadonly: () => readonly,
     helpdeskApi: blob.helpdesk_api || null,
     helpdeskCode: blob.helpdesk_code || "",
+    globalKnowledgeAuthorisation: () => globalKBAuthorisation(techSaid),
+    operatorPolicy: blob.operator || null,
+    operatorActor: blob.username || "",
+    actorEmail: blob.user_email || "",
+    actorName: blob.user_display || blob.username || "",
   });
 
   // WHAT READ-ONLY MEANS: it is a DEVICE control. It scopes what you may change on the
@@ -452,7 +542,8 @@ async function startChat(ws, blob) {
     systemPromptOverride: () =>
       (multi ? systemPromptMulti(toolMachines) : systemPrompt(facts)) +
       roNotice +
-      helpdeskSection(blob, facts?.client),
+      helpdeskSection(blob, facts?.client) +
+      operatorPromptSection(blob.operator),
   });
   await loader.reload();
 
@@ -513,6 +604,35 @@ async function startChat(ws, blob) {
   // busy (device commands can run for minutes) so the stall watchdog must not
   // fire; every TRMM call now has a transport timeout, so tools always settle.
   let toolsInFlight = 0;
+  // Cost meter: gated on the role permission resolved by the RMM (can_view_ai_cost).
+  const costMeter = makeCostMeter({
+    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    log,
+    visible: !!blob.cost_visible,
+    key: agentId,
+    sessionId,
+    contextWindow: Number(model?.contextWindow || 0),
+    // Rates are used ONLY to forecast a model switch; recorded spend comes from pi.
+    rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
+    // Durable spend ledger. Fire-and-forget - a bookkeeping failure must never break a chat.
+    // Bookkeeping must never break a chat, but a SILENT failure means the spend ledger
+    // quietly stops recording - which is how a whole surface went unrecorded on
+    // 2026-08-04. Swallow the error for the chat, but always log it.
+    ledger: (entry) => {
+      trmm.logSpend(entry).catch((e) => {
+        log("spend_ledger_error", entry.surface, entry.session_id,
+            `turn ${entry.turn_index}: ${String(e?.message || e).slice(0, 300)}`);
+      });
+    },
+    context: {
+      surface: "device_chat",
+      actorUsername: blob.username || "",
+      agentId,
+      agentHostname: facts?.hostname || "",
+      client: facts?.client || "",
+      site: facts?.site || "",
+    },
+  });
   const unsubscribe = session.subscribe((event) => {
     lastActivity = Date.now();
     // per-session observability so a "stuck" chat can be diagnosed from the log
@@ -544,6 +664,15 @@ async function startChat(ws, blob) {
           message: `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
         }));
       } catch {}
+    }
+    // Fold usage into the meter and surface any non-answering stop (e.g. "length").
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      costMeter.record(event.message);
+      const silent = silentStopMessage(event.message);
+      if (silent) {
+        log("turn_no_answer", agentId, sessionId, `stopReason=${event.message?.stopReason}`);
+        try { ws.send(JSON.stringify({ type: "error", message: silent })); } catch {}
+      }
     }
     try {
       ws.send(JSON.stringify({ type: "agent_event", event }));
@@ -582,7 +711,12 @@ async function startChat(ws, blob) {
       auto_approve: autoApprove,
       read_only: readonly,
       mutate_allowed: mutateAllowed,
-      history: session.messages,
+      // Whether this operator's role may see the running cost meter.
+      cost_visible: !!blob.cost_visible,
+      context_window: Number(model?.contextWindow || 0),
+      operator_enabled: !!(blob.operator && blob.operator.enabled),
+      operator_machines: (blob.operator && blob.operator.machines) || [],
+      history: uiTranscript(sessionManager, session),
     }),
   );
 
@@ -633,6 +767,7 @@ async function startChat(ws, blob) {
     try {
       switch (msg.type) {
         case "prompt":
+          techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           if (session.isStreaming) {
             await session.prompt(msg.message, { streamingBehavior: "steer" });
           } else {
@@ -640,6 +775,7 @@ async function startChat(ws, blob) {
           }
           break;
         case "steer":
+          techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           await session.steer(msg.message);
           break;
         case "abort":
@@ -669,6 +805,14 @@ async function startChat(ws, blob) {
             );
             break;
           }
+          // Switching model re-caches the WHOLE conversation into the new provider's
+          // cache before it answers anything. Free on some models (grok-4.5 cacheWrite
+          // $0/M), $2.50-$6.25/M on Anthropic - which is how one session spent $2.25 on
+          // cache writes alone. Warn first; the operator still decides.
+          try {
+            const target = modelRegistry.findModel(allowed.provider, allowed.model_id);
+            if (target) costMeter.previewModelSwitch(target, allowed.display_name || allowed.model_id);
+          } catch { /* preview is advisory only */ }
           const newModel = modelRegistry.findModel(allowed.provider, allowed.model_id);
           if (!newModel) {
             ws.send(
@@ -844,6 +988,25 @@ async function startDecisionChat(ws, blob) {
       // a human sees the actual words first. Auto-approve cannot skip this.
       return { ok: await requestApproval(summary) };
     }
+    // CREDENTIALS. The technician must permit each retrieval, in this window, at the time.
+    // No Write mode involvement (this reads nothing on a device), no Auto-approve skip, and
+    // deliberately NO "they already said so earlier in the conversation" shortcut of the kind
+    // `close` and `email` have: those infer authority from a sentence the tech typed about a
+    // ticket, which is a reasonable reading for a reply or a close and an unreasonable one for
+    // handing a live password to a model. If they want it, they can answer the prompt.
+    if (kind === "secret") {
+      const ok = await requestApproval(summary);
+      if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
+      log("credential read permitted by tech", histKey, sessionId, String(summary).slice(0, 160));
+      return { ok: true };
+    }
+    if (kind === "sales") {
+      // Creating/linking ERP quotations always needs an explicit Approve click.
+      const ok = await requestApproval(summary);
+      if (!ok) return { ok: false, reason: "the technician did not approve this Sales/ERP action." };
+      log("sales action permitted by tech", histKey, sessionId, String(summary).slice(0, 160));
+      return { ok: true };
+    }
     if (kind === "close") {
       // Read-only is a DEVICE control and does not block a ticket action.
       //
@@ -875,6 +1038,14 @@ async function startDecisionChat(ws, blob) {
     // directly would throw (temporal dead zone) the moment a ticket chat opened.
     creditSession: () => (typeof sessionId === "string" ? sessionId : ""),
     surface: "decision_chat",   // human driving the ticket; approves each mutating call
+    globalKnowledgeAuthorisation: () => globalKBAuthorisation(techSaid),
+    operatorPolicy: blob.operator || null,
+    operatorActor: blob.username || "",
+    actorEmail: blob.user_email || "",
+    actorName: blob.user_display || blob.username || "",
+    salesEnabled: !!(blob.sales_enabled && blob.sales_code),
+    salesCode: blob.sales_code || "",
+    salesApi: blob.sales_api || blob.helpdesk_api || null,
   });
   if (!hd) { ws.send(JSON.stringify({ type: "error", message: `helpdesk.js failed to load: ${hdError}` })); ws.close(); return; }
 
@@ -890,14 +1061,21 @@ async function startDecisionChat(ws, blob) {
       `\nControls the tech sets in this window: Write mode (DEVICE changes only), Auto-approve (skip prompts), Allow customer email. When not auto-approved, disruptive device commands pop an approval to the tech; non-disruptive diagnostics run freely.\n` +
       `TICKET actions are NOT limited by Write mode - replying, noting, and closing/cancelling this ticket are available in read-only too. Customer replies and closing ALWAYS ask the tech to confirm (Auto-approve never skips those two). So if the tech tells you to close the ticket when you are done, do it: call the close operation and confirm at the prompt - do not tell them to switch modes first.\n` +
       priorText + `\n` +
-      (String(blob.decision_prompt || "").trim() || DEFAULT_DECISION_POLICY) +
+            (String(blob.decision_prompt || "").trim() || DEFAULT_DECISION_POLICY) +
+      (blob.sales_enabled && String(blob.sales_prompt || "").trim()
+        ? ("\n\nSALES INTEGRATION POLICY:\n" + String(blob.sales_prompt).trim() + "\n")
+        : "") +
+      (blob.sales_enabled && blob.sales_code
+        ? "\nYou have the sales_call tool for ERP quotations. Use it ONLY when the tech explicitly asks to create the quote in Odoo/ERP. Draft only — never confirm a Sales Order. Always return the quotation URL.\n"
+        : "") +
       // The HELPDESK POLICY carries the customer-reply standard (register, formatting,
       // signature, and the third-party hand-off rules). It was previously injected only
       // into the DEVICE chat and unattended runs, so the surface that actually answers
       // tickets never saw it - and produced replies that told the customer's vendor to go
       // pull the data we already had the tools to pull. Same policy, every reply surface.
       helpdeskSection(blob, ctx.client) +
-      procedureSection(blob),
+      procedureSection(blob) +
+      operatorPromptSection(blob.operator),
   });
   await loader.reload();
 
@@ -927,6 +1105,30 @@ async function startDecisionChat(ws, blob) {
   let lastActivity = Date.now(), toolsInFlight = 0, postedToTicket = false;
   const work = makeWorkRecorder({ ticketRef, surface: "ticket_chat",
     username: blob.username || "", sessionId });
+  // Cost meter: gated on the role permission resolved by the RMM (can_view_ai_cost).
+  const costMeter = makeCostMeter({
+    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    log,
+    visible: !!blob.cost_visible,
+    key: histKey,
+    sessionId,
+    contextWindow: Number(model?.contextWindow || 0),
+    rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
+    // Bookkeeping must never break a chat, but a SILENT failure means the spend ledger
+    // quietly stops recording - which is how a whole surface went unrecorded on
+    // 2026-08-04. Swallow the error for the chat, but always log it.
+    ledger: (entry) => {
+      trmm.logSpend(entry).catch((e) => {
+        log("spend_ledger_error", entry.surface, entry.session_id,
+            `turn ${entry.turn_index}: ${String(e?.message || e).slice(0, 300)}`);
+      });
+    },
+    context: {
+      surface: "decision_chat",
+      actorUsername: blob.username || "",
+      ticketRef,
+    },
+  });
   const CHATTER_OPS = new Set(["reply_to_ticket", "add_note", "resolve_ticket"]);
   const unsubscribe = session.subscribe((event) => {
     lastActivity = Date.now();
@@ -970,6 +1172,15 @@ async function startDecisionChat(ws, blob) {
         }).catch(() => {});
       }
     }
+    // Fold usage into the meter and surface any non-answering stop (e.g. "length").
+    if (event.type === "message_end" && event.message?.role === "assistant") {
+      costMeter.record(event.message);
+      const silent = silentStopMessage(event.message);
+      if (silent) {
+        log("turn_no_answer", histKey, sessionId, `stopReason=${event.message?.stopReason}`);
+        try { ws.send(JSON.stringify({ type: "error", message: silent })); } catch {}
+      }
+    }
     try { ws.send(JSON.stringify({ type: "agent_event", event })); } catch {}
   });
 
@@ -981,7 +1192,12 @@ async function startDecisionChat(ws, blob) {
     require_approval: true, autoapprove_allowed: autoapproveAllowed, auto_approve: autoApprove,
     read_only: readonly, mutate_allowed: mutateAllowed,
     allow_email: allowEmail,
-    history: [...priorHist, ...session.messages],
+    // Whether this operator's role may see the running cost meter.
+    cost_visible: !!blob.cost_visible,
+    context_window: Number(model?.contextWindow || 0),
+    operator_enabled: !!(blob.operator && blob.operator.enabled),
+    operator_machines: (blob.operator && blob.operator.machines) || [],
+    history: [...priorHist, ...uiTranscript(sessionManager, session)],
   }));
 
   // As soon as the tech actually STARTS TALKING to this chat (first prompt), assign
@@ -1029,6 +1245,8 @@ async function startDecisionChat(ws, blob) {
           if (!allowed) { ws.send(JSON.stringify({ type: "error", message: `Model not permitted: ${msg.model_id}` })); break; }
           const nm = modelRegistry.findModel(allowed.provider, allowed.model_id);
           if (!nm) { ws.send(JSON.stringify({ type: "error", message: `Model not found: ${allowed.model_id}` })); break; }
+          // Warn about the cache rewrite this switch forces (see the device-chat note).
+          try { costMeter.previewModelSwitch(nm, allowed.display_name || allowed.model_id); } catch {}
           await session.setModel(nm);
           if (allowed.thinking_level) { try { session.setThinkingLevel(allowed.thinking_level); } catch {} }
           ws.send(JSON.stringify({ type: "model_changed", model_id: allowed.model_id, display: nm.name }));
@@ -1080,6 +1298,23 @@ async function runHeadless(blob) {
   const agentId = blob.agent_id;
   const runId = blob.run_id || null;
 
+  // Multi-machine (optional): an AI Task authored with a PRIMARY machine (agent_id/
+  // device_facts above, unchanged) plus a roster of ADDITIONAL role-labeled machines
+  // in blob.machines. Same normalization as startChat's interactive multi-machine
+  // mode, so the SAME buildTools({machines}) mechanism backs both: every device tool
+  // gains a required `machine` parameter naming one of these labels.
+  const multi = !!(blob.multi && Array.isArray(blob.machines) && blob.machines.length > 1);
+  const machines = multi
+    ? blob.machines.map((m) => ({
+        agentId: m.agent_id,
+        hostname: (m.device_facts && m.device_facts.hostname) || m.hostname,
+        plat: m.device_facts && m.device_facts.plat,
+        role: m.role || "",
+        facts: m.device_facts,
+      }))
+    : [{ agentId, hostname: facts.hostname, plat: facts.plat, role: blob.primary_role || "", facts }];
+  const hostnameLabel = multi ? machines.map((m) => m.hostname).join(" + ") : facts.hostname;
+
   // Live progress buffer -> redis (browser polls it via Django).
   const live = { status: "running", started: new Date().toISOString(), events: [] };
   async function pushLive(ev) {
@@ -1091,7 +1326,7 @@ async function runHeadless(blob) {
       } catch { /* best effort */ }
     }
   }
-  await pushLive({ type: "status", text: `Starting on ${facts.hostname}` });
+  await pushLive({ type: "status", text: `Starting on ${hostnameLabel}` });
 
   const rt = await piRuntime({ [blob.provider]: blob.api_key });
   const modelRegistry = rt;
@@ -1107,8 +1342,8 @@ async function runHeadless(blob) {
     : "none";
 
   // Unattended: auto-approve everything (no operator). readonly unless allow_mutating.
-  const { tools, verdict, helpdeskState } = buildTools({
-    machines: [{ agentId, hostname: facts.hostname, plat: facts.plat, facts }],
+  const { tools, verdict, helpdeskState, machines: toolMachines } = buildTools({
+    machines,
     gate: () => Promise.resolve(true),
     // No human present, so no closing authority and - unless the task's author explicitly
     // declared a reply register - no customer contact either. This is the surface
@@ -1125,11 +1360,24 @@ async function runHeadless(blob) {
     helpdeskCode: blob.helpdesk_code || "",
   });
 
+  // Multi-machine: same coordination rules as the interactive multi-machine chat
+  // (systemPromptMulti), plus a note explaining WHY there is a roster at all in an
+  // unattended run - the model must not guess it is free to act on anything else.
+  const multiNote = multi
+    ? `\n\nTHIS IS A MULTI-MACHINE SCHEDULED TASK: the machines listed above are the` +
+      ` COMPLETE roster for this run, each with the role its author gave it. Every` +
+      ` device tool takes a required 'machine' parameter - use the EXACT label shown` +
+      ` above (not a guessed hostname) to target one. You cannot reach any machine` +
+      ` outside this roster. Follow the sequencing/dependency the instructions below` +
+      ` describe (e.g. decide on one machine before acting on another) rather than` +
+      ` running every machine in parallel unless told to.`
+    : "";
   const loader = new DefaultResourceLoader({
     agentDir: CONFIG.sessionsRoot,
     cwd: CONFIG.sessionsRoot,
     systemPromptOverride: () =>
-      systemPrompt(facts) +
+      (multi ? systemPromptMulti(toolMachines) : systemPrompt(facts)) +
+      multiNote +
       `\n\nSCHEDULED CHECK MODE:\n- You are running unattended on a schedule. There is no human to chat with.\n- Investigate the request using your tools, then call report_result EXACTLY ONCE with your verdict.\n- status='ok' if healthy, 'warning' for minor/degraded issues, 'alert' for serious problems.\n- Do not ask questions; make a determination from the evidence.${blob.allow_mutating ? "" : "\n- You are in READ-ONLY mode: do not attempt to change the system; only diagnose."}` +
       replyRegisterSection(replyRegister) +
       helpdeskSection(blob, facts?.client),
@@ -2222,18 +2470,53 @@ function assistSystemPrompt(baseUrl, policy, code, trmmUrl) {
   );
 }
 
-function taskPromptAssistSystemPrompt(kind, currentPrompt, currentReport, helpdeskEnabled, trmmUrl) {
+function taskPromptAssistSystemPrompt(kind, currentPrompt, currentReport, helpdeskEnabled, trmmUrl, machineRoles) {
   const isBulk = kind === "bulk";
+  const isMulti = kind === "multi";
+  const roles = Array.isArray(machineRoles) ? machineRoles.filter((r) => r && r.trim()) : [];
   return (
     `You are an expert assistant helping a Tactical RMM admin WRITE THE INSTRUCTIONS for an ` +
     `AI automation. The admin's instructions are handed verbatim to Pi (an AI agent) which then ` +
-    `runs ${isBulk ? "ONCE PER TARGETED DEVICE across many machines" : "on a SINGLE device on a schedule"}. ` +
+    `runs ${
+      isBulk
+        ? "ONCE PER TARGETED DEVICE across many machines"
+        : isMulti
+          ? "ONCE, with tool access to SEVERAL NAMED machines together in one run (a multi-machine AI Task)"
+          : "on a SINGLE device on a schedule"
+    }. ` +
     `Your job is to interview the admin about what they want to accomplish, then produce a clear, ` +
     `safe, unambiguous PROMPT` +
     (isBulk
       ? ` and (if they want one) a COMBINED REPORT instruction that runs ONCE after all devices ` +
         `finish, given every device's individual result, to compile a single summary/ticket.`
       : `.`) +
+    (isMulti
+      ? `\n\nMULTI-MACHINE AI TASK - READ THIS FIRST:\n` +
+        `This is NOT a bulk/fleet command. It is ONE run with tool access to a FIXED, SMALL roster ` +
+        `of named machines the admin picked - typically 2, because one machine's state decides what ` +
+        `happens on the other (e.g. "renew a cert on the Linux host, THEN push it to the Windows RD ` +
+        `Gateway", or "check replication lag on the primary before failing over the secondary"). Use ` +
+        `this instead of a Bulk AI Command whenever the machines must be reasoned about TOGETHER in one ` +
+        `pass, rather than each running the exact same independent check.\n` +
+        (roles.length
+          ? `The admin has already labeled the machines in this task's roster: ${roles.map((r) => `"${r}"`).join(", ")}. ` +
+            `Write the instructions REFERRING TO THESE EXACT LABELS (e.g. "On the machine labeled ` +
+            `'${roles[0]}', run certbot..."), not generic placeholders like "Machine A" or a guessed hostname. ` +
+            `Every device tool call in this run REQUIRES a 'machine' parameter naming one of these labels.\n`
+          : `The admin has not labeled the machines yet. Ask them what each machine's ROLE is in this job ` +
+            `(e.g. "the cert host", "the RD Gateway") and write the instructions referring to those roles - ` +
+            `every device tool call in this run requires a 'machine' parameter naming one of them.\n`) +
+        `Be explicit about SEQUENCE AND DEPENDENCY between the machines: what must be true/decided on one ` +
+        `before acting on the other, and what to do when nothing changed (often: do nothing further - state ` +
+        `that explicitly so Pi does not act on the second machine every run regardless).\n` +
+        `This still runs UNATTENDED (no human present): it can create/update tickets and read/write its own ` +
+        `memory, but it CANNOT close a ticket, email a customer (unless the admin explicitly wants a reply ` +
+        `register - ask), or take routing actions on its own initiative - same rule as a single-machine task.\n` +
+        `If any step produces sensitive material (private keys, passwords, one-time tokens, PFX bytes, ` +
+        `secrets of any kind), tell Pi explicitly to use it in-memory only and NEVER write it into a ticket, ` +
+        `note, KB article, or its own device memory - only that the step happened and any NON-secret result ` +
+        `(e.g. a new expiry date).\n`
+      : ``) +
     `\n\n` +
     `WHAT PI CAN DO ON THE DEVICE (so you scope the instructions realistically):\n` +
     `- Run shell / PowerShell / bash commands on the device and read their output.\n` +
@@ -2337,6 +2620,7 @@ async function runAssist(blob) {
             blob.current_report,
             blob.helpdesk_enabled,
             blob.trmm_base_url,
+            blob.machine_roles,
           )
         : assistSystemPrompt(blob.base_url, blob.current_policy, blob.current_code, blob.trmm_base_url),
   });
@@ -2884,7 +3168,16 @@ server.on("upgrade", async (req, socket, head) => {
       clearInterval(hb);
       activeSessions--;
     });
-    const start = blob.kind === "decision" ? startDecisionChat : startChat;
+    // Three surfaces, deliberately different capability:
+    //   odoo     -> no tools at all; proposes, Odoo executes as the Odoo user
+    //   decision -> helpdesk tool belt (tickets, customer email)
+    //   device   -> machine tool belt
+    const start =
+      blob.kind === "odoo"
+        ? startOdooChat
+        : blob.kind === "decision"
+          ? startDecisionChat
+          : startChat;
     start(ws, blob).catch((e) => {
       try {
         ws.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) }));

@@ -100,11 +100,17 @@ export const trmm = {
   getTasks: (agentId, opts) => req("GET", `/agents/${agentId}/tasks/`, null, opts),
   reboot: (agentId, opts) => req("POST", `/agents/${agentId}/reboot/`, null, opts),
   // Send an email via the RMM server's configured SMTP (TRMM: POST /core/ai/email/)
-  sendEmail: ({ to, subject, body, html, from_address, from_name, job_ref }, opts) =>
+  // attachment_base64/attachment_filename come from the bridge's capture store, so a
+  // large file is emailed without ever passing through the model's context.
+  sendEmail: ({ to, subject, body, html, from_address, from_name, job_ref,
+                actor_email, actor_name,
+                attachment_base64, attachment_filename }, opts) =>
     req(
       "POST",
       `/core/ai/email/`,
-      { to, subject, body, html, from_address, from_name, job_ref },
+      { to, subject, body, html, from_address, from_name, job_ref,
+        actor_email, actor_name,
+        attachment_base64, attachment_filename },
       opts,
     ),
   // Append one durable note to a device's Pi.dev AI memory (TRMM: POST
@@ -117,6 +123,9 @@ export const trmm = {
   creditAction: (credit, opts) => req("POST", `/core/ai/action-credit/`, credit, opts),
   // Work ledger: one entry per burst of real work, posted as the session ends.
   logWork: (entry, opts) => req("POST", `/core/ai/work-entry/`, entry, opts),
+  // Append one billed turn to the AI spend ledger (POST /core/ai/spend-entry/).
+  // Fire-and-forget: bookkeeping must never break a chat.
+  logSpend: (entry, opts) => req("POST", `/core/ai/spend-entry/`, entry, opts),
   listProcedures: ({ q } = {}, opts) =>
     req("GET", `/core/ai/procedures/${q ? `?q=${encodeURIComponent(q)}` : ""}`, null, opts),
 
@@ -132,4 +141,16 @@ export const trmm = {
   // Schedule a future AI action (runs once at run_at). TRMM: POST /core/ai/schedule-action/
   scheduleAction: ({ agent_id, ticket_ref, action, run_at, allow_mutating }, opts) =>
     req("POST", `/core/ai/schedule-action/`, { agent_id, ticket_ref, action, run_at, allow_mutating }, opts),
+  // List pending/past one-shot scheduled actions. Optional filters: agent_id, ticket_ref, status.
+  listScheduledActions: ({ agent_id, ticket_ref, status } = {}, opts) => {
+    const q = new URLSearchParams();
+    if (agent_id) q.set("agent_id", agent_id);
+    if (ticket_ref) q.set("ticket_ref", ticket_ref);
+    if (status) q.set("status", status);
+    const qs = q.toString();
+    return req("GET", `/core/ai/schedule-action/${qs ? `?${qs}` : ""}`, null, opts);
+  },
+  // Cancel/delete a one-shot scheduled action by id. TRMM: DELETE /core/ai/schedule-action/<id>/
+  deleteScheduledAction: (id, opts) =>
+    req("DELETE", `/core/ai/schedule-action/${encodeURIComponent(id)}/`, null, opts),
 };

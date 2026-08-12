@@ -1,8 +1,130 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import crypto from "node:crypto";
 import { trmm } from "./trmm.js";
 import { loadHelpdesk } from "./helpdesk-runtime.js";
+import { loadSales } from "./sales-runtime.js";
 import { gateOp, allowedOps, CAPS_MODE } from "./capabilities.js";
+let operatorPlugin = null;
+try {
+  operatorPlugin = await import("file:///opt/pi-ai-operator/integrations/pi-trmm-bridge/operator-tools.js");
+} catch (error) {
+  if (error?.code !== "ERR_MODULE_NOT_FOUND") console.warn("Pi AI Operator plugin unavailable:", error?.message || error);
+}
+
+// ---- Tool result size caps --------------------------------------------------
+// Unbounded tool output is what silently kills a chat. Measured on a real stalled
+// session (2026-08-04, agent AVgiDUib...): one 7-day get_event_logs returned
+// 750 KB / 3,351 events, a second 693 KB, and get_device_details 246 KB - of which
+// `services` (124 KB), `wmi_detail` (62 KB) and `all_timezones` (10 KB, pure noise)
+// were 80%. A parallel batch of 7 such tools pushed ~609k tokens into a 200k-token
+// context window, so the turn ended with stopReason="length" before the model wrote
+// a single word - and billed $7.52. Every bulk tool now SHAPES its payload
+// (actionable fields first) and HARD-CAPS the bytes it may return.
+const MAX_TOOL_RESULT_BYTES = Number(process.env.PI_MAX_TOOL_RESULT_BYTES || 60000);
+
+/** Truncate a string to a byte budget with an explicit, model-readable marker. */
+function capString(s, maxBytes = MAX_TOOL_RESULT_BYTES, what = "output") {
+  const str = String(s ?? "");
+  const full = Buffer.byteLength(str, "utf8");
+  if (full <= maxBytes) return str;
+  let out = str.slice(0, maxBytes);
+  while (out.length && Buffer.byteLength(out, "utf8") > maxBytes) out = out.slice(0, -512);
+  return (
+    out +
+    `\n\n[TRUNCATED by pi-trmm-bridge: ${what} was ${full} bytes, cap is ${maxBytes}. ` +
+    `Do NOT retry the same broad call - narrow it (fewer days, a filter, a specific name), ` +
+    `or use run_command_on_device with capture_as to hold large output out of context.]`
+  );
+}
+
+/**
+ * Serialize a value under a byte budget. Arrays are truncated ELEMENT-WISE so the
+ * model always receives VALID JSON plus an explicit "showing X of Y" line, which is
+ * far more useful than JSON cut mid-token.
+ */
+function capJson(value, { maxBytes = MAX_TOOL_RESULT_BYTES, what = "result" } = {}) {
+  if (Array.isArray(value)) {
+    const total = value.length;
+    let keep = total;
+    let json = JSON.stringify(value, null, 2);
+    while (keep > 0 && Buffer.byteLength(json, "utf8") > maxBytes) {
+      keep = Math.max(0, Math.floor(keep * 0.7) - 1);
+      json = JSON.stringify(value.slice(0, keep), null, 2);
+    }
+    if (keep < total) {
+      return (
+        `NOTE: showing ${keep} of ${total} ${what} entries (capped at ${maxBytes} bytes). ` +
+        `Narrow the request (filter/fewer days) to see the rest - do not re-run this call as-is.\n\n` +
+        json
+      );
+    }
+    return json;
+  }
+  return capString(JSON.stringify(value, null, 2), maxBytes, what);
+}
+
+// Top-level agent fields that are pure bulk and never worth spending context on.
+// `wmi_detail` and the full `services` table are reachable deliberately via
+// run_command_on_device when a specific question actually needs them.
+const AGENT_BULK_FIELDS = ["all_timezones", "wmi_detail", "services"];
+
+/**
+ * Shape a TRMM agent record for the model: keep every actionable field, replace the
+ * three bulk fields with compact summaries. Stopped-but-Automatic services are the
+ * only part of the 289-row service table that is diagnostically interesting, so that
+ * is what survives.
+ */
+function shapeAgentDetails(agent) {
+  const a = { ...(agent || {}) };
+  const notes = [];
+  const services = Array.isArray(a.services) ? a.services : null;
+  const wmi = a.wmi_detail;
+  for (const k of AGENT_BULK_FIELDS) delete a[k];
+
+  if (services) {
+    const auto = services.filter(
+      (s) => /auto/i.test(String(s?.start_type || s?.startType || "")) &&
+        !/running/i.test(String(s?.status || "")),
+    );
+    a.services_summary = {
+      total: services.length,
+      running: services.filter((s) => /running/i.test(String(s?.status || ""))).length,
+      automatic_but_not_running: auto.slice(0, 40).map((s) => ({
+        name: s?.name,
+        display_name: s?.display_name || s?.displayName,
+        status: s?.status,
+        start_type: s?.start_type || s?.startType,
+      })),
+      automatic_but_not_running_count: auto.length,
+    };
+    notes.push(
+      `full 'services' table (${services.length} rows) omitted to protect context - ` +
+        `query a specific service with run_command_on_device (e.g. Get-Service <name>)`,
+    );
+  }
+  if (wmi) {
+    notes.push(
+      "'wmi_detail' omitted to protect context - if you need a hardware/WMI fact, ask for " +
+        "that one class with run_command_on_device (e.g. Get-CimInstance Win32_PhysicalMemory)",
+    );
+  }
+  notes.push("'all_timezones' omitted (UI data, no diagnostic value)");
+  a._omitted_for_context = notes;
+  return a;
+}
+
+// Exported for the size-cap regression test (test/tool-caps.test.mjs).
+export { capString, capJson, shapeAgentDetails };
+
+/** System-prompt blurb from the Operator plugin (empty when disabled/unavailable). */
+export function operatorPromptSection(operatorPolicy) {
+  try {
+    return operatorPlugin?.operatorPromptSection?.(operatorPolicy) || "";
+  } catch {
+    return "";
+  }
+}
 
 // --- Web research (the bridge host has internet) -----------------------------
 function _stripHtml(h) {
@@ -150,6 +272,57 @@ export function privilegedMatch(command) {
 //
 // Mutating tools go through `gate(summary)` which resolves to true (approved)
 // or false (denied).
+// ---- FILE CAPTURE STORE -----------------------------------------------------------
+// WHY THIS EXISTS. The only route off a managed device is a command's stdout, and stdout
+// normally comes back as the tool RESULT - i.e. straight into the model's context. A
+// 500KB export therefore cost ~130k tokens to read and another ~130k to pass on as a
+// tool argument, so large files were simply impossible to send.
+//
+// A capture keeps the bytes HERE and returns only a receipt (size, lines, sha256,
+// first/last line). The model references the capture by name to attach or email it, so a
+// 50MB file costs the same tokens as a 5KB one - and the model cannot truncate or
+// fabricate what it never handled.
+//
+// One store per toolset build, i.e. per session: captures cannot leak between sessions.
+const CAPTURE_MAX_BYTES = 64 * 1024 * 1024;
+
+function makeCaptureStore() {
+  const captures = new Map();
+  let total = 0;
+  return {
+    names: () => [...captures.keys()],
+    get: (name) => captures.get(String(name || "")),
+    put(name, data, from) {
+      const bytes = Buffer.byteLength(data, "utf8");
+      if (total + bytes > CAPTURE_MAX_BYTES)
+        return { error: `capture store full (${total} bytes held); nothing captured` };
+      const lines = data.length ? data.split(/\r?\n/) : [];
+      while (lines.length && lines[lines.length - 1] === "") lines.pop();
+      const sha256 = crypto.createHash("sha256").update(data, "utf8").digest("hex");
+      if (captures.has(name)) total -= captures.get(name).bytes;
+      captures.set(name, { data, bytes, lines: lines.length, sha256, from, at: Date.now() });
+      total += bytes;
+      return {
+        name, bytes, lines: lines.length, sha256,
+        first_line: lines.length ? lines[0].slice(0, 200) : "",
+        last_line: lines.length > 1 ? lines[lines.length - 1].slice(0, 200) : "",
+      };
+    },
+  };
+}
+
+// The receipt handed back instead of the file content.
+function captureReceipt(rec, extra = "") {
+  return (
+    `Captured ${rec.bytes} bytes (${rec.lines} lines) as "${rec.name}" - the content is held by ` +
+    `the bridge and was NOT loaded into your context.\n` +
+    `sha256: ${rec.sha256}\nfirst line: ${rec.first_line}\n` +
+    (rec.last_line ? `last line: ${rec.last_line}\n` : "") +
+    `Reference it by name to send it${extra}. Do not re-run the command to read the contents; ` +
+    `if you need to inspect it, run a separate command printing only a small sample (e.g. head).`
+  );
+}
+
 export function buildTools({
   machines: machinesIn,
   // legacy single-machine call shape
@@ -179,6 +352,16 @@ export function buildTools({
   // whose author declared a reply register). Intersected with capabilities.GRANTABLE, so
   // this can only ever add `customer` - never closing or routing authority.
   grants = [],
+  // Product code verifies the technician's OWN chat text before global/shared KB
+  // authoring. The model cannot grant this to itself by claiming it was asked.
+  globalKnowledgeAuthorisation = () => null,
+  // Optional standalone Pi AI Operator policy injected by Django after applying the
+  // global machine allowlist and this technician's per-agent permissions.
+  operatorPolicy = null,
+  operatorActor = "",
+  // Session tech identity — used by send_email so SMTP From can be the human, not a bot.
+  actorEmail = "",
+  actorName = "",
 }) {
   if (readonly !== undefined && isReadonly === undefined) {
     // fixed read-only (headless): map onto the new model
@@ -267,11 +450,14 @@ export function buildTools({
   const get_device_details = defineTool({
     name: "get_device_details",
     label: "Get device details",
-    description: `Get full details about ${forThis} (hardware, OS, disks, IPs, checks status, custom fields).`,
+    description:
+      `Get details about ${forThis} (hardware, OS, disks, IPs, checks status, custom fields). ` +
+      `The bulk 'services' table, 'wmi_detail' and 'all_timezones' are summarised/omitted to ` +
+      `protect context - query a specific service or WMI class with run_command_on_device instead.`,
     parameters: params({}),
     execute: async (_id, p, signal) => {
       const a = await trmm.getAgent(target(p).agentId, { signal });
-      return text(JSON.stringify(a, null, 2));
+      return text(capJson(shapeAgentDetails(a), { what: "device detail" }));
     },
   });
 
@@ -331,6 +517,16 @@ export function buildTools({
       timeout: Type.Optional(
         Type.Number({ description: "Max seconds to wait (default 60, max 900)" }),
       ),
+      capture_as: Type.Optional(
+        Type.String({
+          description:
+            "Hold this command's output in the bridge under this name INSTEAD of returning it " +
+            "to you. You get a receipt (size, line count, sha256, first/last line) rather than " +
+            "the content, so the size costs you no context. Use this for files you intend to " +
+            "send - e.g. `cat /tmp/export.csv` with capture_as='export' then attach_capture. " +
+            "For binary files pipe through base64 and set decode_base64 on attach_capture.",
+        }),
+      ),
     }),
     execute: async (_id, p, signal) => {
       const m = target(p);
@@ -372,7 +568,18 @@ export function buildTools({
         { signal },
       );
       const s = typeof out === "string" ? out : JSON.stringify(out);
-      return text(s.length ? s : "(command produced no output; exit assumed success)");
+      // Captured: keep the bytes here and hand back a receipt, not the content.
+      if (p.capture_as && String(p.capture_as).trim()) {
+        const name = String(p.capture_as).trim().slice(0, 80);
+        const rec = capStore.put(name, s, `${m.hostname || m.agentId}: ${p.command.slice(0, 120)}`);
+        if (rec.error) return text(rec.error);
+        return text(captureReceipt(rec, " with attach_capture or send_email"));
+      }
+      return text(
+        s.length
+          ? capString(s, MAX_TOOL_RESULT_BYTES, `output of \`${p.command.slice(0, 80)}\``)
+          : "(command produced no output; exit assumed success)",
+      );
     },
   });
 
@@ -425,11 +632,31 @@ export function buildTools({
   const list_processes = defineTool({
     name: "list_processes",
     label: "List processes",
-    description: `List running processes on ${forThis}.`,
-    parameters: params({}),
+    description:
+      `List running processes on ${forThis}, ranked by CPU then memory. Returns the top ` +
+      `processes plus totals, not the whole table - raise 'limit' only if you truly need more.`,
+    parameters: params({
+      limit: Type.Optional(
+        Type.Number({ description: "How many top processes to return (default 40, max 200)" }),
+      ),
+    }),
     execute: async (_id, p, signal) => {
       const procs = await trmm.listProcesses(target(p).agentId, { signal });
-      return text(JSON.stringify(procs, null, 2));
+      if (!Array.isArray(procs)) return text(capJson(procs, { what: "process" }));
+      const limit = Math.min(Math.max(Number(p.limit) || 40, 1), 200);
+      const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+      const ranked = [...procs].sort(
+        (a, b) => num(b.cpu_percent) - num(a.cpu_percent) || num(b.membytes) - num(a.membytes),
+      );
+      const totalMem = procs.reduce((n, x) => n + num(x.membytes), 0);
+      const payload = {
+        total_processes: procs.length,
+        showing_top: Math.min(limit, ranked.length),
+        ranked_by: "cpu_percent desc, then membytes desc",
+        total_memory_bytes_all_processes: totalMem,
+        processes: ranked.slice(0, limit),
+      };
+      return text(capJson(payload, { what: "process" }));
     },
   });
 
@@ -456,25 +683,83 @@ export function buildTools({
       : "Get Windows event logs from THIS device.",
     parameters: params({
       log_type: Type.String({ description: "Application, System, or Security" }),
-      days: Type.Optional(Type.Number({ description: "How many days back (default 1)" })),
+      days: Type.Optional(Type.Number({ description: "How many days back (default 1, max 30)" })),
+      include_info: Type.Optional(
+        Type.Boolean({
+          description:
+            "Include INFO/SUCCESS events too (default false). INFO is ~95% of a Windows log and " +
+            "will exhaust your context - only set true when hunting a specific informational event.",
+        }),
+      ),
+      source_contains: Type.Optional(
+        Type.String({ description: "Only events whose source matches this text (case-insensitive)" }),
+      ),
+      max_entries: Type.Optional(
+        Type.Number({ description: "Max events to return (default 150, max 500)" }),
+      ),
     }),
     execute: async (_id, p, signal) => {
       const m = target(p);
       if (m.plat !== "windows") {
         throw new Error(`${m.label} is not a Windows machine; event logs are Windows-only.`);
       }
-      const out = await trmm.eventLog(m.agentId, p.log_type, p.days && p.days > 0 ? p.days : 1, { signal });
-      return text(JSON.stringify(out, null, 2));
+      const days = Math.min(Math.max(Number(p.days) || 1, 1), 30);
+      const out = await trmm.eventLog(m.agentId, p.log_type, days, { signal });
+      if (!Array.isArray(out)) return text(capJson(out, { what: "event" }));
+      const total = out.length;
+      const wanted = /^(error|critical|warning)$/i;
+      let rows = p.include_info ? out : out.filter((e) => wanted.test(String(e?.eventType || "")));
+      const droppedInfo = total - rows.length;
+      if (p.source_contains) {
+        const needle = String(p.source_contains).toLowerCase();
+        rows = rows.filter((e) => String(e?.source || "").toLowerCase().includes(needle));
+      }
+      // Newest first, then trim each message - a single stack-trace event can be 8 KB.
+      rows = [...rows].reverse().map((e) => ({
+        ...e,
+        message: capString(String(e?.message ?? ""), 600, "event message"),
+      }));
+      const max = Math.min(Math.max(Number(p.max_entries) || 150, 1), 500);
+      const payload = {
+        log_type: p.log_type,
+        days,
+        total_events_in_window: total,
+        severity_filter: p.include_info ? "ALL (info included)" : "ERROR/CRITICAL/WARNING only",
+        info_events_suppressed: p.include_info ? 0 : droppedInfo,
+        source_contains: p.source_contains || null,
+        returned: Math.min(max, rows.length),
+        matching_after_filter: rows.length,
+        events: rows.slice(0, max),
+      };
+      return text(capJson(payload, { what: "event" }));
     },
   });
 
   const list_software = defineTool({
     name: "list_software",
     label: "List installed software",
-    description: `List installed software on ${forThis}.`,
-    parameters: params({}),
-    execute: async (_id, p, signal) =>
-      text(JSON.stringify(await trmm.listSoftware(target(p).agentId, { signal }), null, 2)),
+    description: `List installed software on ${forThis} (name, version, publisher).`,
+    parameters: params({
+      name_contains: Type.Optional(
+        Type.String({ description: "Only software whose name matches this text (case-insensitive)" }),
+      ),
+    }),
+    execute: async (_id, p, signal) => {
+      const sw = await trmm.listSoftware(target(p).agentId, { signal });
+      const list = Array.isArray(sw?.software) ? sw.software : Array.isArray(sw) ? sw : null;
+      if (!list) return text(capJson(sw, { what: "software" }));
+      let rows = list.map((s) => ({ name: s?.name, version: s?.version, publisher: s?.publisher }));
+      if (p.name_contains) {
+        const needle = String(p.name_contains).toLowerCase();
+        rows = rows.filter((s) => String(s?.name || "").toLowerCase().includes(needle));
+      }
+      return text(
+        capJson(
+          { total_installed: list.length, returned: rows.length, software: rows },
+          { what: "software" },
+        ),
+      );
+    },
   });
 
   const get_checks = defineTool({
@@ -483,7 +768,7 @@ export function buildTools({
     description: `Get monitoring checks and their status for ${forThis}.`,
     parameters: params({}),
     execute: async (_id, p, signal) =>
-      text(JSON.stringify(await trmm.getChecks(target(p).agentId, { signal }), null, 2)),
+      text(capJson(await trmm.getChecks(target(p).agentId, { signal }), { what: "check" })),
   });
 
   const get_tasks = defineTool({
@@ -492,7 +777,7 @@ export function buildTools({
     description: `Get automated tasks for ${forThis}.`,
     parameters: params({}),
     execute: async (_id, p, signal) =>
-      text(JSON.stringify(await trmm.getTasks(target(p).agentId, { signal }), null, 2)),
+      text(capJson(await trmm.getTasks(target(p).agentId, { signal }), { what: "task" })),
   });
 
   const reboot_device = defineTool({
@@ -524,9 +809,11 @@ export function buildTools({
       " provide a readable plain-text `body` too. IMPORTANT: email clients strip" +
       " <style> blocks and external CSS - use INLINE styles only (style=\"...\" on each" +
       " element), a table-based layout, and no <script>. Do NOT put HTML tags in `body`." +
-      " The From address defaults to a unique job-associated address on the server's" +
-      " mail domain; only set from_address if the operator explicitly wants a specific" +
-      " sender.",
+      " From identity is chosen SERVER-SIDE (do not invent it): if the technician's" +
+      " account email is on an allowlisted company domain, From is that tech's address" +
+      " AND display name (their real name). Otherwise From is a unique pi-*@ address" +
+      " with the company brand display name (e.g. BlueCloud Support). Do not pass" +
+      " from_address/from_name unless the operator explicitly asks for a specific sender.",
     parameters: Type.Object({
       to: Type.String({
         description:
@@ -545,17 +832,50 @@ export function buildTools({
       from_address: Type.Optional(
         Type.String({
           description:
-            "Optional sender. A full address (with '@') is used as-is; a bare word" +
-            " is used as the local part on the server's mail domain. Leave empty to" +
-            " auto-generate a unique job-associated sender on the server's domain.",
+            "Usually OMIT. Optional sender override only if the operator asks. A full" +
+            " address (with '@') is used only when its domain is allowlisted; a bare word" +
+            " becomes the local part on the server's mail domain. Display name is still" +
+            " server-chosen (tech name vs company brand) — you cannot set it.",
         }),
       ),
-      from_name: Type.Optional(
-        Type.String({ description: "Optional sender display name" }),
+      attach_capture_name: Type.Optional(
+        Type.String({
+          description:
+            "Name of a capture (from capture_as) to attach to this email. The bridge holds " +
+            "the bytes, so file size costs you no context. This is the ONLY way to email a " +
+            "large file - never paste file contents into `body`.",
+        }),
+      ),
+      attachment_filename: Type.Optional(
+        Type.String({ description: "Filename the recipient sees, e.g. export.csv (required with attach_capture_name)" }),
+      ),
+      decode_base64: Type.Optional(
+        Type.Boolean({ description: "Decode the capture from base64 first (for binary files such as xlsx/pdf)" }),
       ),
     }),
     execute: async (_id, p, signal) => {
-      const ok = await gate(`Send email to ${p.to}: "${p.subject}"`);
+      let att = null;
+      if (p.attach_capture_name) {
+        const cap = capStore.get(p.attach_capture_name);
+        if (!cap)
+          return text(
+            `No capture named "${p.attach_capture_name}". Available: ${capStore.names().join(", ") || "(none)"}.`,
+          );
+        if (!p.attachment_filename)
+          return text("attachment_filename is required when attaching a capture.");
+        att = {
+          attachment_base64: p.decode_base64
+            ? cap.data.replace(/\s+/g, "")
+            : Buffer.from(cap.data, "utf8").toString("base64"),
+          attachment_filename: p.attachment_filename,
+          bytes: cap.bytes,
+          lines: cap.lines,
+        };
+      }
+      const ok = await gate(
+        `Send email to ${p.to}: "${p.subject}"` +
+          (att ? ` WITH ATTACHMENT ${att.attachment_filename} (${att.bytes} bytes, ${att.lines} lines)` : ""),
+      );
       if (!ok) return denied();
       const out = await trmm.sendEmail(
         {
@@ -564,8 +884,12 @@ export function buildTools({
           body: p.body,
           html: p.html,
           from_address: p.from_address,
-          from_name: p.from_name,
+          // from_name is server policy (tech real name vs brand) — never model-supplied
           job_ref: jobRef,
+          actor_email: actorEmail || undefined,
+          actor_name: actorName || undefined,
+          attachment_base64: att ? att.attachment_base64 : undefined,
+          attachment_filename: att ? att.attachment_filename : undefined,
         },
         { signal },
       );
@@ -652,7 +976,21 @@ export function buildTools({
         try { args = JSON.parse(p.args); }
         catch (e) { return text(`args must be valid JSON: ${e.message}`); }
       }
-      if (hd.mutating.has(op)) {
+      let globalKnowledgeAuth = null;
+      if (op === "create_global_kb_article") {
+        try { globalKnowledgeAuth = globalKnowledgeAuthorisation(); } catch (e) { /* deny below */ }
+        if (!globalKnowledgeAuth) {
+          return text(
+            "Not permitted: a GLOBAL KB article may be created only when the technician " +
+              "explicitly asks in this chat to create/write/publish a global KB article. " +
+              "Do not retry or substitute the company-scoped upsert_ai_kb_article operation.",
+          );
+        }
+      }
+      // The technician's direct global-KB instruction is itself the authorisation; do
+      // not ask them to confirm the same action again. All other mutating calls retain
+      // their normal approval behavior.
+      if (hd.mutating.has(op) && !globalKnowledgeAuth) {
         const ok = await gate(`Helpdesk: ${p.summary || op}`);
         if (!ok) return denied();
       }
@@ -763,6 +1101,108 @@ export function buildTools({
     },
   });
 
+  const list_scheduled_actions = defineTool({
+    name: "list_scheduled_actions",
+    label: "List scheduled AI actions",
+    description:
+      "List one-shot AI scheduled jobs (the ones created by schedule_action). Use this before " +
+      "cancelling, or when finishing a ticket to find leftover follow-up jobs that are now " +
+      "superseded. Defaults to status=scheduled for this device.",
+    parameters: params({
+      status: Type.Optional(Type.String({ description: "Filter: scheduled|running|done|error|cancelled (default scheduled)" })),
+      ticket_ref: Type.Optional(Type.String({ description: "Optional ticket ref filter, e.g. TICKET/59074" })),
+    }),
+    execute: async (_id, p) => {
+      const m = target(p);
+      try {
+        const out = await trmm.listScheduledActions({
+          agent_id: m.agentId,
+          ticket_ref: p.ticket_ref || undefined,
+          status: p.status || "scheduled",
+        });
+        return text(JSON.stringify(out, null, 2));
+      } catch (e) { return text("list_scheduled_actions failed: " + (e?.message || e)); }
+    },
+  });
+
+  const cancel_scheduled_action = defineTool({
+    name: "cancel_scheduled_action",
+    label: "Cancel a scheduled AI action",
+    description:
+      "Delete/cancel a one-shot scheduled AI job by id (from list_scheduled_actions or the id " +
+      "returned by schedule_action). Use this when the work is already done, the plan changed, " +
+      "or a later job superseded an earlier one — do NOT leave stale follow-ups to fire.",
+    parameters: params({
+      id: Type.Number({ description: "Scheduled action id (e.g. 31)" }),
+    }),
+    execute: async (_id, p) => {
+      try {
+        const out = await trmm.deleteScheduledAction(p.id);
+        return text(JSON.stringify(out || { ok: true, id: p.id, cancelled: true }));
+      } catch (e) { return text("cancel_scheduled_action failed: " + (e?.message || e)); }
+    },
+  });
+
+  const capStore = makeCaptureStore();
+
+  const attach_capture = defineTool({
+    name: "attach_capture",
+    label: "Attach a captured file to a ticket",
+    description:
+      "Attach a file previously captured with run_command_on_device(capture_as=...) to a " +
+      "ticket. THIS is how you send a large file: the bytes are held by the bridge and " +
+      "never pass through your context, so size costs you nothing. Set to_customer=true " +
+      "to send it as the branded customer reply (an email actually goes out); leave it " +
+      "false to attach it as a staff-only internal note. Use decode_base64=true if the " +
+      "captured output was base64 (i.e. the file is binary, such as xlsx or pdf).",
+    parameters: Type.Object({
+      capture: Type.String({ description: "Name given to capture_as" }),
+      ticket: Type.String({ description: "Ticket reference, e.g. TICKET/55726" }),
+      filename: Type.String({ description: "Filename the recipient sees, e.g. remittance.csv" }),
+      message: Type.String({ description: "The note text, or the customer-facing reply body" }),
+      to_customer: Type.Optional(Type.Boolean({ description: "true = email the customer (default false = internal note)" })),
+      decode_base64: Type.Optional(Type.Boolean({ description: "Decode the capture from base64 first (binary files)" })),
+    }),
+    execute: async (_id, p) => {
+      if (!hd) return text("Helpdesk integration is not configured.");
+      const cap = capStore.get(p.capture);
+      if (!cap)
+        return text(
+          `No capture named "${p.capture}". Available: ${capStore.names().join(", ") || "(none)"}. ` +
+            `Run the command again with capture_as to create one.`,
+        );
+      const op = p.to_customer ? "reply_to_ticket" : "attach_file";
+      // Same capability gate as any other helpdesk write: a customer-visible send is the
+      // "customer" class and is refused on surfaces that may not contact customers.
+      const gateRes = gateOp({ surface, op, opClasses: hd.opClasses, mutating: hd.mutating, grants, ref: jobRef });
+      if (!gateRes.allowed && gateRes.enforced) return text(`Not permitted on this surface: ${gateRes.reason}`);
+      const ok = await gate(
+        `Helpdesk: attach ${p.filename} (${cap.bytes} bytes, ${cap.lines} lines) to ${p.ticket}` +
+          (p.to_customer ? " AND EMAIL IT TO THE CUSTOMER" : " as an internal note"),
+      );
+      if (!ok) return denied();
+      const file = { filename: p.filename };
+      if (p.decode_base64) file.content_base64 = cap.data.replace(/\s+/g, "");
+      else file.content = cap.data;
+      try {
+        const res = await hd.operations[op]({ ticket: p.ticket, message: p.message, files: [file] });
+        if (res && res.error) return text(`attach failed: ${res.error}`);
+        return text(
+          `Attached ${p.filename} to ${p.ticket} (${cap.bytes} bytes, ${cap.lines} lines, ` +
+            `sha256 ${cap.sha256.slice(0, 16)}...). ` +
+            (p.to_customer ? "Customer reply SENT with the file attached." : "Posted as a staff-only internal note.") +
+            ` Result: ${JSON.stringify(res)}`,
+        );
+      } catch (e) {
+        return text(`attach failed: ${e?.message || e}`);
+      }
+    },
+  });
+
+  const operatorTools = operatorPlugin?.buildOperatorTools({
+    Type, defineTool, text, operatorPolicy, operatorActor, surface: "pi-chat",
+  }) || [];
+
   let tools = [
     get_device_details,
     run_command_on_device,
@@ -778,20 +1218,25 @@ export function buildTools({
     save_device_note,
     get_device_notes,
     schedule_action,
+    list_scheduled_actions,
+    cancel_scheduled_action,
   ];
   if (hd) tools.push(helpdesk_call);
+  if (hd) tools.push(attach_capture);
   if (anyWindows) tools.push(get_event_logs);
 
   if (hardReadonly) {
     // no mutate rights at all: drop the destructive actions entirely (a scheduled
     // action could run changes later, so drop it too for read-only-only users).
-    const drop = new Set(["run_script_on_device", "kill_process", "reboot_device", "schedule_action"]);
+    const drop = new Set(["run_script_on_device", "kill_process", "reboot_device", "schedule_action", "cancel_scheduled_action"]);
     tools = tools.filter((t) => !drop.has(t.name));
   }
   if (includeReport) tools.push(report_result);
+  if (operatorTools.length) tools.push(...operatorTools);
 
   // Names that require approval when approval mode is on.
   const mutating = new Set([
+    "attach_capture",
     "run_command_on_device",
     "run_script_on_device",
     "kill_process",
@@ -799,6 +1244,7 @@ export function buildTools({
     "send_email",
     "helpdesk_call",
     "schedule_action",
+    "cancel_scheduled_action",
   ]);
 
   return { tools, mutating, verdict, machines, helpdeskState };
@@ -1096,8 +1542,13 @@ function isDestructive(cmd) {
 }
 
 export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate, surface = null,
-  creditActor = "", creditSession = "" } = {}) {
+  creditActor = "", creditSession = "", globalKnowledgeAuthorisation = () => null,
+  operatorPolicy = null, operatorActor = "",
+  actorEmail = "", actorName = "",
+  salesCode = "", salesApi = null, salesEnabled = false,
+} = {}) {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
+  const capStore = makeCaptureStore();
   let hd = null, hdError = "";
   try { hd = loadHelpdesk(helpdeskCode, helpdeskApi); }
   catch (e) { hdError = e.message; }
@@ -1143,6 +1594,17 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       const cap = gateOp({ surface, op: p.operation, opClasses: hd.opClasses, mutating: hd.mutating, ref: ticketRef });
       if (!cap.allowed && cap.enforced)
         return text(`'${p.operation}' is NOT allowed in this mode: ${cap.reason}. A human must do that in the console. Put your recommendation in an internal note instead.`);
+      if (p.operation === "create_global_kb_article") {
+        let auth = null;
+        try { auth = globalKnowledgeAuthorisation(); } catch (e) { /* deny below */ }
+        if (!auth) {
+          return text(
+            "Not permitted: a GLOBAL KB article may be created only when the technician " +
+              "explicitly asks in this chat to create/write/publish a global KB article. " +
+              "Do not retry or substitute the company-scoped upsert_ai_kb_article operation.",
+          );
+        }
+      }
       // Customer-email gate. In WS mode (gate provided) we ask the tech for approval
       // inline (exactly like a device-command approval); in the legacy POST mode we
       // fall back to the per-turn allowCustomerReply flag.
@@ -1153,6 +1615,26 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         // Provenance for an outbound email goes in an INTERNAL note, never appended to the
         // customer's message - the customer must not read our approval plumbing.
         replyAuth = g.authorised_by || null;
+      }
+      // CREDENTIALS: the technician permits each retrieval at the time. Denied outright on
+      // every other surface by SURFACE_CLASSES, so this branch is the only way in.
+      if (cap.cls === "secret") {
+        const A = p.args || {};
+        const who = p.company_name || p.partner_id || A.company_name || A.partner_id || "this company";
+        const wantsPriv = !!(p.include_privileged || A.include_privileged);
+        const g = gate
+          ? await gate("secret", `Read STORED CREDENTIALS (IT Notebook) for ${who}, requested on ${ticketRef}. ` +
+              `The AI will be able to see the usernames and passwords it returns.` +
+              (wantsPriv
+                ? ` IT IS ALSO ASKING FOR THE PRIVILEGED ROWS, which are normally withheld.`
+                : ` Privileged rows will be withheld.`))
+          : { ok: false, reason: "no approval channel available - credentials can only be read in the ai-decision window." };
+        if (!g.ok)
+          return text(
+            (g.reason || "Reading the stored credentials was not permitted.") +
+              " Do not retry it and do not ask the customer for their password. If you need it, say " +
+              "which system you need it for and let the technician decide.",
+          );
       }
       // Closing a ticket asks a human EVERY time - never auto-approvable (ISSUES.md
       // D2/I7). MANDATE 4.8: "the model never decides that a ticket may be closed"; this
@@ -1231,6 +1713,17 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       shell: Type.String({ description: "powershell | cmd | bash" }),
       command: Type.String({ description: "The command to run" }),
       timeout: Type.Optional(Type.Number({ description: "Seconds (default 45)" })),
+      capture_as: Type.Optional(
+        Type.String({
+          description:
+            "Hold this command's output in the bridge under this name INSTEAD of returning it to " +
+            "you. You get a receipt (size, lines, sha256, first/last line), not the content, so a " +
+            "large file costs you no context. This is how you send a big file: e.g. " +
+            "`cat /tmp/export.csv` with capture_as='export', then attach_capture (to the ticket) " +
+            "or send_email (attach_capture_name='export'). For binary, pipe through base64 and " +
+            "set decode_base64 when sending.",
+        }),
+      ),
     }),
     execute: async (_id, p, signal) => {
       // ALWAYS-ON privileged-action gate (identity/access): adding/removing users,
@@ -1269,7 +1762,14 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           shell: p.shell || "powershell", cmd: p.command,
           timeout: p.timeout && p.timeout > 0 ? p.timeout : 45,
         }, { signal });
-        return text(typeof out === "string" ? out : JSON.stringify(out).slice(0, 20000));
+        const raw = typeof out === "string" ? out : JSON.stringify(out);
+        if (p.capture_as && String(p.capture_as).trim()) {
+          const nm = String(p.capture_as).trim().slice(0, 80);
+          const rec = capStore.put(nm, raw, `${p.agent_id}: ${p.command.slice(0, 120)}`);
+          if (rec.error) return text(rec.error);
+          return text(captureReceipt(rec, " with attach_capture or send_email"));
+        }
+        return text(raw.slice(0, 20000));
       } catch (e) { return text("run_device_command failed: " + (e?.message || e)); }
     },
   });
@@ -1355,6 +1855,48 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     },
   });
 
+  const list_scheduled_actions = defineTool({
+    name: "list_scheduled_actions",
+    label: "List scheduled AI actions",
+    description:
+      "List one-shot AI scheduled jobs (created via schedule_action). ALWAYS check this when " +
+      "finishing/closing a ticket or when a follow-up is no longer needed, then cancel any " +
+      "jobs that are superseded. Defaults to this ticket + status=scheduled.",
+    parameters: Type.Object({
+      ticket_ref: Type.Optional(Type.String({ description: "Ticket ref filter (defaults to this ticket)" })),
+      agent_id: Type.Optional(Type.String({ description: "Optional device agent_id filter" })),
+      status: Type.Optional(Type.String({ description: "scheduled|running|done|error|cancelled (default scheduled)" })),
+    }),
+    execute: async (_id, p) => {
+      try {
+        const out = await trmm.listScheduledActions({
+          agent_id: p.agent_id || undefined,
+          ticket_ref: p.ticket_ref || ticketRef || undefined,
+          status: p.status || "scheduled",
+        });
+        return text(JSON.stringify(out, null, 2));
+      } catch (e) { return text("list_scheduled_actions failed: " + (e?.message || e)); }
+    },
+  });
+
+  const cancel_scheduled_action = defineTool({
+    name: "cancel_scheduled_action",
+    label: "Cancel a scheduled AI action",
+    description:
+      "Delete/cancel a one-shot scheduled AI job by numeric id. REQUIRED when work finishes early " +
+      "or a later check supersedes an earlier scheduled follow-up — stale jobs must not fire. " +
+      "Get ids from list_scheduled_actions or the id returned by schedule_action.",
+    parameters: Type.Object({
+      id: Type.Number({ description: "Scheduled action id (e.g. 31)" }),
+    }),
+    execute: async (_id, p) => {
+      try {
+        const out = await trmm.deleteScheduledAction(p.id);
+        return text(JSON.stringify(out || { ok: true, id: p.id, cancelled: true }));
+      } catch (e) { return text("cancel_scheduled_action failed: " + (e?.message || e)); }
+    },
+  });
+
   const send_email = defineTool({
     name: "send_email",
     label: "Send email",
@@ -1363,18 +1905,56 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       "for INTERNAL / STAFF / VENDOR email - e.g. sending a purchase recommendation to procurement, a " +
       "heads-up to a colleague, or a parts order. For CUSTOMER communication ABOUT the ticket use " +
       "reply_to_ticket / resolve_ticket instead (keeps it on the ticket thread). Supports HTML with " +
-      "inline styles plus a plain-text fallback.",
+      "inline styles plus a plain-text fallback. BRAND + COLOR SAFETY (www.blueuc.com): primary #00C4FF, text #212529, light #F6F5F4, dark #1B1319. " +
+      "Logo https://www.blueuc.com/web/image/1330-24f164ad/blue_cloud_logo_A.png on light header with cyan bottom border. " +
+      "Dark text on light backgrounds only — NEVER white text on navy/gradient headers. Table th: bg #00C4FF color #212529. " +
+      "Footer with logo + BlueCloud IAAS, LLC + 855-258-3456 + support@blueuc.com. " +
+      "From identity is SERVER-CHOSEN: tech's real name + " +
+      "email when allowlisted, otherwise pi-*@ with the company brand display name (e.g. BlueCloud " +
+      "Support). Do not invent a sender name.",
     parameters: Type.Object({
       to: Type.String({ description: "Recipient email address(es), comma-separated" }),
       subject: Type.String({ description: "Subject line" }),
       body: Type.String({ description: "Plain-text body (also the fallback for HTML clients)" }),
       html: Type.Optional(Type.String({ description: "Optional HTML body (inline styles only)" })),
-      from_name: Type.Optional(Type.String({ description: "Optional sender display name" })),
+      attach_capture_name: Type.Optional(
+        Type.String({
+          description:
+            "Name of a capture (from capture_as) to attach to this email. The bridge holds " +
+            "the bytes, so file size costs you no context. This is the ONLY way to email a " +
+            "large file - never paste file contents into `body`.",
+        }),
+      ),
+      attachment_filename: Type.Optional(
+        Type.String({ description: "Filename the recipient sees, e.g. export.csv (required with attach_capture_name)" }),
+      ),
+      decode_base64: Type.Optional(
+        Type.Boolean({ description: "Decode the capture from base64 first (for binary files such as xlsx/pdf)" }),
+      ),
     }),
     execute: async (_id, p, signal) => {
+      let att = null;
+      if (p.attach_capture_name) {
+        const cap = capStore.get(p.attach_capture_name);
+        if (!cap)
+          return text(`No capture named "${p.attach_capture_name}". Available: ${capStore.names().join(", ") || "(none)"}.`);
+        if (!p.attachment_filename) return text("attachment_filename is required when attaching a capture.");
+        att = {
+          attachment_base64: p.decode_base64 ? cap.data.replace(/\s+/g, "") : Buffer.from(cap.data, "utf8").toString("base64"),
+          attachment_filename: p.attachment_filename, bytes: cap.bytes, lines: cap.lines,
+        };
+        if (gate) {
+          const g = await gate("device", `Email ${p.to} with ATTACHMENT ${att.attachment_filename} (${att.bytes} bytes, ${att.lines} lines): "${p.subject}"`);
+          if (!g.ok) return text("REFUSED: " + (g.reason || "the technician did not approve sending that file."));
+        }
+      }
       try {
         const out = await trmm.sendEmail(
-          { to: p.to, subject: p.subject, body: p.body, html: p.html, from_name: p.from_name },
+          // from_name is server policy (tech real name vs brand) — never model-supplied
+          { to: p.to, subject: p.subject, body: p.body, html: p.html,
+            actor_email: actorEmail || undefined, actor_name: actorName || undefined,
+            attachment_base64: att ? att.attachment_base64 : undefined,
+            attachment_filename: att ? att.attachment_filename : undefined },
           { signal },
         );
         return text(typeof out === "string" ? out : JSON.stringify(out));
@@ -1393,6 +1973,56 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   // A procedure that carries a `disposition` can make the engine rule on tickets without a
   // model call, so nothing the model writes may be live until a human approves it in the
   // console. The model proposes; a person promotes.
+  const attach_capture = defineTool({
+    name: "attach_capture",
+    label: "Attach a captured file to this ticket",
+    description:
+      "Attach a file captured with run_device_command(capture_as=...) to a ticket. THIS is how " +
+      "you send a large file: the bridge holds the bytes, so size costs you no context, and the " +
+      "file cannot be truncated or altered by you. to_customer=true sends it as the branded " +
+      "customer reply (an email really goes out); false attaches it as a staff-only internal " +
+      "note. Use decode_base64=true when the captured output was base64 (binary files).",
+    parameters: Type.Object({
+      capture: Type.String({ description: "Name given to capture_as" }),
+      ticket: Type.String({ description: "Ticket reference, e.g. TICKET/55726" }),
+      filename: Type.String({ description: "Filename the recipient sees, e.g. export.csv" }),
+      message: Type.String({ description: "Internal note text, or the customer-facing reply body" }),
+      to_customer: Type.Optional(Type.Boolean({ description: "true = email the customer (default false = internal note)" })),
+      decode_base64: Type.Optional(Type.Boolean({ description: "Decode the capture from base64 first" })),
+    }),
+    execute: async (_id, p) => {
+      if (!hd) return text("Helpdesk integration is not configured" + (hdError ? ": " + hdError : "") + ".");
+      const cap = capStore.get(p.capture);
+      if (!cap)
+        return text(`No capture named "${p.capture}". Available: ${capStore.names().join(", ") || "(none)"}.`);
+      const op = p.to_customer ? "reply_to_ticket" : "attach_file";
+      if (!hd.operations[op]) return text(`This helpdesk has no "${op}" operation.`);
+      const capRes = gateOp({ surface, op, opClasses: hd.opClasses, mutating: hd.mutating });
+      if (!capRes.allowed && capRes.enforced) return text(`Not permitted on this surface: ${capRes.reason}`);
+      if (gate) {
+        const g = await gate(
+          "device",
+          `Attach ${p.filename} (${cap.bytes} bytes, ${cap.lines} lines) to ${p.ticket}` +
+            (p.to_customer ? " AND EMAIL IT TO THE CUSTOMER" : " as a staff-only internal note"),
+        );
+        if (!g.ok) return text("REFUSED: " + (g.reason || "the technician did not approve that."));
+      }
+      const file = { filename: p.filename };
+      if (p.decode_base64) file.content_base64 = cap.data.replace(/\s+/g, "");
+      else file.content = cap.data;
+      try {
+        const res = await hd.operations[op]({ ticket: p.ticket, message: p.message, files: [file] });
+        if (res && res.error) return text("attach failed: " + res.error);
+        return text(
+          `Attached ${p.filename} to ${p.ticket} (${cap.bytes} bytes, ${cap.lines} lines, sha256 ` +
+            `${cap.sha256.slice(0, 16)}...). ` +
+            (p.to_customer ? "Customer reply SENT with the file attached." : "Posted as a staff-only internal note.") +
+            ` Result: ${JSON.stringify(res)}`,
+        );
+      } catch (e) { return text("attach failed: " + (e?.message || e)); }
+    },
+  });
+
   const save_procedure = defineTool({
     name: "save_procedure",
     label: "Capture a procedure (draft)",
@@ -1478,5 +2108,90 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     },
   });
 
-  return { tools: [helpdesk_call, find_devices, run_device_command, save_device_note, get_device_notes, schedule_action, send_email, save_procedure, ...webTools()], hd, hdError };
+  const operatorTools = operatorPlugin?.buildOperatorTools({
+    Type, defineTool, text, operatorPolicy, operatorActor, surface: "ai-decision",
+  }) || [];
+
+
+
+  // ---- Sales / ERP quotations (optional, decision-chat only when enabled) ----
+  let sales = null;
+  let salesError = null;
+  if (salesEnabled && salesCode) {
+    try {
+      sales = loadSales(salesCode, salesApi || helpdeskApi || null, {
+        ticket_ref: ticketRef || "",
+        actor_email: actorEmail || "",
+        actor_name: actorName || "",
+        actor_username: creditActor || "",
+      });
+    } catch (e) {
+      salesError = String(e?.message || e);
+      sales = null;
+    }
+  }
+  let sales_call = null;
+  if (sales) {
+    const sOpList = sales.names.map((n) => `  - ${n}${sales.meta[n] ? ": " + sales.meta[n] : ""}`).join("\n");
+    sales_call = defineTool({
+      name: "sales_call",
+      label: "Sales / ERP operation",
+      description:
+        "Sales/ERP operations for quotations (create draft quote in the ERP, read it, link to this ticket). " +
+        "ONLY when the technician explicitly asks to create/push a quote INTO the ERP/Odoo — never because " +
+        "they asked you to email a quote to the customer. Draft only; never confirm a Sales Order. " +
+        "create_quotation MUST match S00064 quality: structured sections/notes + billable lines + " +
+        "note_html = EXACT full HTML body from the customer quote send_email (paste it, do not rewrite; usually 12k-25k chars). " +
+        "Required: option_label, nte, customer_blurb, project_blurb, workloads>=2, phases>=3, assumptions>=3, " +
+        "out_of_scope>=3, next_steps>=2, lines[]. Thin quotes (S00063) or weak Terms (S00065) are REFUSED. " +
+        "Available operations:\n" + (sOpList || "  (none)"),
+      parameters: Type.Object({
+        operation: Type.String({ description: "Operation name from the list above" }),
+        args: Type.Optional(Type.Object({}, { additionalProperties: true, description: "Operation arguments" })),
+        // Common create_quotation fields also accepted top-level for convenience
+        lines: Type.Optional(Type.Array(Type.Object({
+          name: Type.String(),
+          qty: Type.Optional(Type.Number()),
+          price_unit: Type.Optional(Type.Number()),
+          product_name: Type.Optional(Type.String()),
+        }, { additionalProperties: true }))),
+        partner_id: Type.Optional(Type.Number()),
+        note_html: Type.Optional(Type.String()),
+        order_id: Type.Optional(Type.Number()),
+        name: Type.Optional(Type.String()),
+        ticket_ref: Type.Optional(Type.String()),
+      }),
+      execute: async (_id, p) => {
+        if (!sales || !sales.operations[p.operation]) return text(`sales operation ${p.operation} not available`);
+        const cap = gateOp({ surface: surface || "decision_chat", op: p.operation, opClasses: sales.opClasses, mutating: sales.mutating, ref: ticketRef });
+        if (!cap.allowed && cap.enforced)
+          return text(`'${p.operation}' is NOT allowed here: ${cap.reason}`);
+        // Mutating sales ops ALWAYS require human approval (Auto-approve cannot skip).
+        if (sales.mutating.has(p.operation)) {
+          const summary = `Sales ERP: ${p.operation} on ${ticketRef || "(no ticket)"}\n` +
+            JSON.stringify({ lines: p.lines, partner_id: p.partner_id, order_id: p.order_id, args: p.args }, null, 0).slice(0, 600);
+          const g = gate
+            ? await gate("sales", summary)
+            : { ok: false, reason: "no approval channel — sales writes only in the decision chat." };
+          if (!g.ok) return text(g.reason || "Sales operation not approved.");
+        }
+        const args = { ...(p.args || {}) };
+        for (const k of ["lines", "partner_id", "note_html", "order_id", "name", "ticket_ref"])
+          if (p[k] !== undefined && args[k] === undefined) args[k] = p[k];
+        if (ticketRef && args.ticket_ref === undefined) args.ticket_ref = ticketRef;
+        if (!args.salesperson_email && actorEmail) args.salesperson_email = actorEmail;
+        try {
+          const out = await sales.operations[p.operation](args);
+          return text(typeof out === "string" ? out : JSON.stringify(out).slice(0, 20000));
+        } catch (e) {
+          return text(`${p.operation} failed: ${e?.message || e}`);
+        }
+      },
+    });
+  }
+
+  const baseTools = [helpdesk_call, find_devices, run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
+  if (sales_call) baseTools.push(sales_call);
+  return { tools: baseTools, hd, hdError, sales, salesError };
 }
+

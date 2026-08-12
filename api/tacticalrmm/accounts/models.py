@@ -141,6 +141,25 @@ class Role(BaseAuditModel):
     # Manage/delete AI tasks & bulk AI commands created by OTHER users, and on
     # agents outside this role's normal scope. Superusers always have this.
     can_manage_all_ai_tasks = models.BooleanField(default=False)
+    # See the live token/cost meter in Pi Chat and the AI Decision window (what the
+    # current conversation is spending). Off by default: technicians do not need to
+    # see provider spend, and the meter also reveals model/context sizing. Superusers
+    # always have it. Purely a VISIBILITY permission - it grants no AI capability.
+    can_view_ai_cost = models.BooleanField(default=False)
+    # Seize the driving seat in a Pi Chat or AI Decision window that someone else is
+    # already driving. Everyone with can_use_ai may WATCH a live session read-only;
+    # this is the permission to take control of one.
+    #
+    # Taking over from a NON-superuser happens immediately -- they are told, and drop
+    # to read-only rather than being thrown out, because watching what happened next
+    # in a session you were driving is usually the point.
+    #
+    # Taking over from a SUPERUSER requires that person's consent, unless the
+    # requester is also a superuser (superusers bypass each other). No answer means
+    # DENIED: a consent prompt that grants itself on a timeout is not consent.
+    #
+    # Superusers always have this, like can_view_ai_cost.
+    can_take_over_ai_session = models.BooleanField(default=False)
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )

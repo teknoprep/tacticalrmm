@@ -1,0 +1,19 @@
+[Unit]
+Description=Pi.dev <-> Tactical RMM bridge (per-device AI assistant)
+After=network.target redis-server.service nats.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=tactical
+Group=tactical
+WorkingDirectory=/opt/pi-trmm-bridge
+EnvironmentFile=/etc/pi-trmm-bridge.env
+ExecStart=/home/tactical/.local/share/pi-node/node-v22.22.3-linux-x64/bin/node /opt/pi-trmm-bridge/src/server.js
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/pi-trmm-bridge.log
+StandardError=append:/var/log/pi-trmm-bridge.log
+
+[Install]
+WantedBy=multi-user.target
