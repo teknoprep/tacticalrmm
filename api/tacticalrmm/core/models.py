@@ -1,4 +1,5 @@
 import smtplib
+import ssl
 import traceback
 from contextlib import suppress
 from email.headerregistry import Address
@@ -618,10 +619,30 @@ class CoreSettings(BaseAuditModel):
                         filename=f"{attachment_filename}.{ext}",
                     )
 
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20) as server:
+            # From upstream 1.5.2: port 465 uses implicit TLS (SMTPS), so the socket
+            # is wrapped in SSL the moment it opens and must be created with
+            # smtplib.SMTP_SSL. Ports 587/25 open plaintext and are upgraded in-band
+            # with STARTTLS. Our own additions to this method -- attachments of any
+            # MIME type, override_from/override_from_name, and the HTML alternative
+            # part -- are untouched above; only the connection is upstream's.
+            use_ssl = self.smtp_port == 465
+            if use_ssl:
+                server: smtplib.SMTP = smtplib.SMTP_SSL(
+                    self.smtp_host,
+                    self.smtp_port,
+                    timeout=20,
+                    context=ssl.create_default_context(),
+                )
+            else:
+                server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20)
+
+            with server:
                 if self.smtp_requires_auth:
                     server.ehlo()
-                    server.starttls()
+                    # STARTTLS only applies to a plaintext connection; on an
+                    # implicit-TLS (465) socket the channel is already encrypted.
+                    if not use_ssl:
+                        server.starttls()
                     server.login(
                         self.smtp_host_user,
                         self.smtp_host_password,
@@ -632,7 +653,8 @@ class CoreSettings(BaseAuditModel):
                     # gmail smtp relay specific handling.
                     if self.smtp_host == "smtp-relay.gmail.com":
                         server.ehlo()
-                        server.starttls()
+                        if not use_ssl:
+                            server.starttls()
                         server.send_message(msg)
                         server.quit()
                     else:
