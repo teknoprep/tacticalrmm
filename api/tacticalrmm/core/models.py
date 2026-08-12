@@ -210,6 +210,17 @@ class CoreSettings(BaseAuditModel):
     # so it can be selected the same day, instead of waiting for a package upgrade.
     ai_model_autoregister = models.BooleanField(default=True)
 
+    # PI AI OPERATOR / DESKTOP ACCESS. This is policy only: the standalone Operator
+    # owns browser execution and its runtime. The RMM stores which existing agent(s)
+    # may receive Operator tools and which configured AI model should be selected when
+    # an Operator-capable Pi Chat / AI Decision session starts.
+    ai_operator_enabled = models.BooleanField(default=False)
+    ai_operator_default_model = models.ForeignKey(
+        "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="operator_default_for",
+    )
+    ai_operator_allowed_agent_ids = models.JSONField(default=list, blank=True)
+
     # SCHEDULED RUNTIME UPDATE - upgrading the AI runtime restarts the bridge, which drops
     # live chats and in-flight background runs. So it happens (a) only inside a window an
     # operator chose, and (b) only once nothing is running. If the new version is not
@@ -296,6 +307,15 @@ class CoreSettings(BaseAuditModel):
     ai_staff_email_domains = models.JSONField(default=list, blank=True)
     # Escape hatch for a colleague whose login is not on the company domain.
     ai_staff_extra_usernames = models.JSONField(default=list, blank=True)
+
+    # AI SMTP send_email: send AS tech when their email domain is allowlisted.
+    ai_mail_tech_from_domains = models.JSONField(default=list, blank=True)
+
+    # Pi.dev AI Sales Integration (ERP quotations). Off by default. Reuses the helpdesk
+    # API base/key (same Odoo). JS + prompt mirror the helpdesk pattern.
+    ai_sales_enabled = models.BooleanField(default=False)
+    ai_sales_prompt = models.TextField(blank=True, default="")
+    ai_sales_code = models.TextField(blank=True, default="")
 
     # Work that leaves no timestamps still leaves CONTENT. Three considered replies posted in
     # the same minute span zero seconds but represent real composition, so the ledger also
@@ -471,6 +491,11 @@ class CoreSettings(BaseAuditModel):
         attachment_filename: Optional[str] = None,
         attachment_type: Optional[str] = None,
         attachment_extension: Optional[str] = None,
+        # Explicit MIME type for an attachment of ANY kind. The attachment_type switch
+        # below only understands pdf/html/plaintext, so a CSV, xlsx or zip had no correct
+        # path through here at all. When this is given it wins, `attachment_filename` is
+        # used verbatim (no extension is appended), and bytes are attached as bytes.
+        attachment_mimetype: Optional[str] = None,
         alert_template: "Optional[AlertTemplate]" = None,
         override_recipients: Optional[List[str]] = [],
         override_from: Optional[str] = None,
@@ -529,7 +554,17 @@ class CoreSettings(BaseAuditModel):
             if html_body:
                 msg.add_alternative(html_body, subtype="html")
 
-            if attachment:
+            if attachment and attachment_mimetype and "/" in attachment_mimetype:
+                maintype, _, subtype = attachment_mimetype.partition("/")
+                fname = attachment_filename or "attachment"
+                if isinstance(attachment, str) and maintype == "text":
+                    msg.add_attachment(attachment, subtype=subtype or "plain", filename=fname)
+                else:
+                    data = (attachment if isinstance(attachment, (bytes, bytearray))
+                            else str(attachment).encode())
+                    msg.add_attachment(data, maintype=maintype or "application",
+                                       subtype=subtype or "octet-stream", filename=fname)
+            elif attachment:
                 match attachment_type:
                     case "pdf":
                         subtype = "pdf"
@@ -857,6 +892,27 @@ class AIProvider(BaseAuditModel):
     def serialize(obj):
         from .serializers import AIProviderSerializer
 
+        # The audit log serializes the object BEFORE the row is inserted (see
+        # BaseAuditModel.save), so on create `obj.pk` is still None. The serializer carries
+        # a nested reverse relation (`models`), and Django refuses to read a reverse
+        # relation on an unsaved instance - it raises
+        #   ValueError: 'AIProvider' instance needs to have a primary key value before
+        #               this relationship can be used
+        # which surfaced as a bare HTTP 500 when adding ANY new provider through Global
+        # Settings. It only bit over real HTTP because the audit path is skipped when there
+        # is no request user, which is why the same call succeeded from a shell.
+        #
+        # A brand-new provider has no child models by definition, so describe it directly
+        # and keep the audit entry. `api_key` is deliberately absent here, exactly as the
+        # serializer marks it write_only - an audit record must never carry the secret.
+        if obj.pk is None:
+            return {
+                "name": obj.name,
+                "base_url": obj.base_url,
+                "enabled": obj.enabled,
+                "api_key_set": bool(obj.api_key),
+                "models": [],
+            }
         return AIProviderSerializer(obj).data
 
 
@@ -910,9 +966,23 @@ class AITask(BaseAuditModel):
     ]
 
     name = models.CharField(max_length=255)
+    # PRIMARY machine: the one this task is created/listed on (AI Tasks tab, dedup,
+    # history keying). Unchanged from before multi-machine support existed.
     agent = models.ForeignKey(
         "agents.Agent", related_name="ai_tasks", on_delete=models.CASCADE
     )
+    # Optional operator-written note on what the PRIMARY machine's role/job is in this
+    # task. Blank is fine (ordinary single-machine tasks never need it).
+    primary_role = models.CharField(max_length=400, blank=True, default="")
+    # Multi-machine mode (optional). ADDITIONAL machines beyond the primary, each an
+    # {agent_id, role} object - mirrors the interactive multi-machine chat's shape
+    # (agents/views.py PiMultiSession) so the SAME buildTools({machines}) mechanism in
+    # the bridge targets them: every device tool gains a required `machine` parameter
+    # and the model must name one of the roster's labels to act on it. Empty list =
+    # ordinary single-machine task (the pre-existing behavior, unchanged).
+    # See docs/SCHEDULING.md in the pi-ai-helpdesk repo for how to author a
+    # multi-machine task's prompt (role-labels, sequencing, failure handling).
+    machines = models.JSONField(default=list, blank=True)  # [{agent_id, role}]
     prompt = models.TextField()
     model = models.ForeignKey(
         "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL
@@ -959,7 +1029,21 @@ class AITask(BaseAuditModel):
     last_output = models.TextField(null=True, blank=True)
 
     def __str__(self) -> str:
-        return f"{self.name} ({self.agent.hostname})"
+        extra = f" +{len(self.machines)}" if self.machines else ""
+        return f"{self.name} ({self.agent.hostname}{extra})"
+
+    @property
+    def is_multi(self) -> bool:
+        return bool(self.machines)
+
+    def secondary_agent_ids(self):
+        """agent_ids of the additional (non-primary) machines, in order, deduped."""
+        seen = []
+        for m in self.machines or []:
+            aid = str((m or {}).get("agent_id") or "").strip()
+            if aid and aid != self.agent.agent_id and aid not in seen:
+                seen.append(aid)
+        return seen
 
     @staticmethod
     def serialize(obj):
@@ -983,7 +1067,11 @@ class AITaskRun(models.Model):
     # groups all per-machine runs of a single bulk dispatch, so a finalizer can
     # compile ONE combined report after the whole batch finishes.
     batch_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
-    triggered_by = models.CharField(max_length=20, default="schedule")  # schedule|manual|bulk
+    triggered_by = models.CharField(max_length=32, default="schedule")  # schedule|manual|bulk|scheduled_action
+    # Freeform label for one-shot AI-scheduled actions (no parent AITask/Bulk).
+    # Shown in AI History as source_name so completed purple jobs remain visible forever.
+    action_label = models.CharField(max_length=255, blank=True, default="")
+    ticket_ref = models.CharField(max_length=100, blank=True, default="")
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, default="running")  # running/ok/warning/alert/error
@@ -999,6 +1087,8 @@ class AITaskRun(models.Model):
             return "bulk"
         if self.task_id:
             return "task"
+        if self.triggered_by == "scheduled_action" or self.action_label:
+            return "scheduled"
         return "chat"
 
     @property
@@ -1007,6 +1097,8 @@ class AITaskRun(models.Model):
             return self.bulk.name
         if self.task_id:
             return self.task.name
+        if self.action_label:
+            return self.action_label
         return ""
 
     def get_agent(self):
@@ -1335,6 +1427,7 @@ class AIReportSchedule(models.Model):
     KIND = (
         ("activity", "Activity report - what happened"),
         ("open_tickets", "Open-ticket review - what could be done"),
+        ("tech_productivity", "Technician Productivity Analysis - how each tech is doing"),
     )
     CADENCE = (
         ("daily", "Every day"),
@@ -1646,8 +1739,9 @@ class AIDecisionRequest(models.Model):
 class AIScheduledAction(models.Model):
     """A future AI action to run at a specific time (e.g. patch in a maintenance
     window). A cheap celery-beat dispatcher fires it ONCE when due - the LLM never
-    polls the clock. On success the row is deleted; on failure it's kept for review.
-    NOT created automatically by triage (human-directed for now)."""
+    polls the clock. On completion an AITaskRun history row is written (kept forever
+    under AI History); the live queue row is then removed on success, or kept with
+    status=error on failure for review. NOT created automatically by triage."""
 
     agent = models.ForeignKey(
         "agents.Agent", null=True, blank=True, on_delete=models.SET_NULL,

@@ -37,6 +37,12 @@ class AgentSerializer(serializers.ModelSerializer):
     cpu_model = serializers.ReadOnlyField()
     local_ips = serializers.ReadOnlyField()
     make_model = serializers.ReadOnlyField()
+    # Hardware/asset identity. Like make_model this is a model @property derived from
+    # the agent's STORED wmi_detail, so it is readable for OFFLINE agents. It was
+    # present on AgentTableSerializer but missing here, which meant the agent DETAIL
+    # endpoint (and therefore the AI's get_device_details) could report a machine's
+    # make and model but never its serial number.
+    serial_number = serializers.ReadOnlyField()
     physical_disks = serializers.ReadOnlyField()
     graphics = serializers.ReadOnlyField()
     checks = serializers.ReadOnlyField()

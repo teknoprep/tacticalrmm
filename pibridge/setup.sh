@@ -34,6 +34,10 @@ info "Deploying Pi bridge to ${BRIDGE_DIR}"
 sudo mkdir -p "${BRIDGE_DIR}"
 sudo cp -r "${BRIDGE_SRC}/src" "${BRIDGE_DIR}/"
 sudo cp "${BRIDGE_SRC}/package.json" "${BRIDGE_DIR}/"
+# Ship the tests too: package.json's `npm test` is the fastest post-deploy sanity
+# check on a live box (tool-result caps, cost meter, transcript rebuild, device
+# hardware inventory), and it needs test/ present to run at all.
+sudo cp -r "${BRIDGE_SRC}/test" "${BRIDGE_DIR}/"
 sudo chown -R "${TRMM_USER}:${TRMM_USER}" "${BRIDGE_DIR}"
 
 # --- 2. install npm deps (pi SDK, ws, ioredis) -----------------------------

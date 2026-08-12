@@ -1792,6 +1792,12 @@ class PiMultiSession(APIView):
             "hostname": hostnames,
             "device_facts": machines[0]["device_facts"],
             "username": user.username,
+            # Tech identity so the bridge can send email as this user (send_email From).
+            "user_email": getattr(user, "email", "") or "",
+            "user_display": (
+                user.get_full_name() if hasattr(user, "get_full_name") else ""
+            )
+            or user.username,
             "provider": chosen.provider.name,
             "model_id": chosen.model_id,
             "thinking_level": chosen.thinking_level,
@@ -1801,6 +1807,10 @@ class PiMultiSession(APIView):
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(
                 is_super or (user.role and user.role.can_use_ai_autoapprove)
+            ),
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(
+                is_super or (user.role and user.role.can_view_ai_cost)
             ),
             # mutate_allowed = may this session EVER write (role/super).
             # allow_mutating = initial state; a read_only request (e.g. AI Resolve)
@@ -1960,6 +1970,12 @@ class AgentPiSession(APIView):
             "agent_id": agent.agent_id,
             "hostname": agent.hostname,
             "username": user.username,
+            # Tech identity so the bridge can send email as this user (send_email From).
+            "user_email": getattr(user, "email", "") or "",
+            "user_display": (
+                user.get_full_name() if hasattr(user, "get_full_name") else ""
+            )
+            or user.username,
             "provider": chosen["provider"] if isinstance(chosen, dict) else chosen.provider.name,
             "model_id": chosen.model_id,
             "thinking_level": chosen.thinking_level,
@@ -1969,6 +1985,8 @@ class AgentPiSession(APIView):
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(is_super or (user.role and user.role.can_use_ai_autoapprove)),
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             "mutate_allowed": bool(is_super or (user.role and user.role.can_use_ai_mutate)),
             "allow_mutating": bool(
                 (is_super or (user.role and user.role.can_use_ai_mutate))

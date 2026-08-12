@@ -207,6 +207,11 @@ class AITaskSerializer(serializers.ModelSerializer):
     hostname = serializers.CharField(source="agent.hostname", read_only=True)
     agent_id = serializers.CharField(source="agent.agent_id", read_only=True)
     model_display = serializers.SerializerMethodField()
+    # Read-only, hostname-resolved view of `machines` (raw field stays [{agent_id,
+    # role}] for editing) so the UI can render "<hostname> - <role>" without a
+    # second round-trip. Missing/renamed agents degrade to hostname="" rather than
+    # erroring - a task must keep working even if a secondary machine was deleted.
+    machines_detail = serializers.SerializerMethodField()
 
     class Meta:
         model = AITask
@@ -214,6 +219,31 @@ class AITaskSerializer(serializers.ModelSerializer):
 
     def get_model_display(self, obj) -> str:
         return obj.model.display_name if obj.model else "(default)"
+
+    def get_machines_detail(self, obj) -> list:
+        from agents.models import Agent
+
+        ids = [str((m or {}).get("agent_id") or "") for m in (obj.machines or [])]
+        by_id = {
+            a.agent_id: a
+            for a in Agent.objects.select_related("site__client").filter(
+                agent_id__in=ids
+            )
+        }
+        out = []
+        for m in obj.machines or []:
+            aid = str((m or {}).get("agent_id") or "")
+            a = by_id.get(aid)
+            out.append(
+                {
+                    "agent_id": aid,
+                    "role": (m or {}).get("role") or "",
+                    "hostname": a.hostname if a else "",
+                    "client": a.site.client.name if a else "",
+                    "site": a.site.name if a else "",
+                }
+            )
+        return out
 
 
 class AITaskRunSerializer(serializers.ModelSerializer):

@@ -790,12 +790,8 @@ def _resolve_ai_model(model):
     )
 
 
-def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id, reply_register="none"):
-    """Execute one headless AI run on an agent via the bridge. Returns
-    (status, summary, output)."""
-    import requests as _requests
-
-    device_facts = {
+def _ai_device_facts(agent):
+    return {
         "agent_id": agent.agent_id,
         "hostname": agent.hostname,
         "client": agent.client.name,
@@ -811,6 +807,31 @@ def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id, reply_
         "device_url": (f"{settings.CORS_ORIGIN_WHITELIST[0]}/agents/{agent.agent_id}" if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""),
         "ai_notes": agent.ai_notes or "",
     }
+
+
+def _run_prompt_on_agent(
+    *, agent, model, prompt, allow_mutating, run_id, reply_register="none",
+    primary_role="", secondary_machines=None,
+):
+    """Execute one headless AI run via the bridge. Returns (status, summary, output,
+    ticket_error).
+
+    `secondary_machines`, when non-empty, turns this into a MULTI-MACHINE task run:
+    a list of {"agent": Agent, "role": str} for every ADDITIONAL machine beyond the
+    primary `agent`. Mirrors agents/views.py PiMultiSession's blob shape exactly (same
+    bridge-side buildTools({machines}) consumes both) so a scheduled task and the
+    interactive multi-machine chat behave identically: every device tool gains a
+    required `machine` parameter, labeled by hostname (deduped #2/#3.. on collision),
+    and the model can only ever reach the machines named in this roster. See
+    docs/SCHEDULING.md (pi-ai-helpdesk repo) for how to author the prompt for one of
+    these.
+    """
+    import requests as _requests
+
+    device_facts = _ai_device_facts(agent)
+    secondary_machines = secondary_machines or []
+    is_multi = bool(secondary_machines)
+
     payload = {
         "agent_id": agent.agent_id,
         "device_facts": device_facts,
@@ -831,6 +852,25 @@ def _run_prompt_on_agent(*, agent, model, prompt, allow_mutating, run_id, reply_
         },
         "helpdesk_code": get_core_settings().ai_helpdesk_code or "",
     }
+    if is_multi:
+        payload["multi"] = True
+        payload["primary_role"] = primary_role or ""
+        payload["machines"] = [
+            {
+                "agent_id": agent.agent_id,
+                "hostname": agent.hostname,
+                "role": primary_role or "",
+                "device_facts": device_facts,
+            }
+        ] + [
+            {
+                "agent_id": sm["agent"].agent_id,
+                "hostname": sm["agent"].hostname,
+                "role": sm.get("role") or "",
+                "device_facts": _ai_device_facts(sm["agent"]),
+            }
+            for sm in secondary_machines
+        ]
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)
     try:
@@ -1047,10 +1087,44 @@ def run_ai_task(task_id, triggered_by="schedule"):
         run.status = "error"; run.summary = msg; run.finished_at = djangotime.now(); run.save()
         return "no model"
 
+    # Multi-machine (optional): resolve the additional-machine roster to live Agent
+    # rows. Fail loud rather than quietly running short-handed - a task written to
+    # reason across a PAIR of machines (e.g. "cert host" + "RD Gateway") produces a
+    # misleading result if one side silently vanishes from the roster.
+    secondary_machines = None
+    if task.machines:
+        from agents.models import Agent as _Agent
+
+        ids = [str((m or {}).get("agent_id") or "") for m in task.machines]
+        by_id = {
+            a.agent_id: a
+            for a in _Agent.objects.select_related("site__client").filter(
+                agent_id__in=ids
+            )
+        }
+        missing = [aid for aid in ids if aid not in by_id]
+        if missing:
+            msg = (
+                f"Task '{task.name}' has {len(missing)} secondary machine(s) that no "
+                f"longer exist ({', '.join(missing)}). Edit the task's machine roster."
+            )
+            AITask.objects.filter(pk=task.pk).update(
+                last_run=djangotime.now(), last_status="error", last_summary=msg
+            )
+            run.status = "error"; run.summary = msg; run.finished_at = djangotime.now(); run.save()
+            _ai_alert_gated(task.agent, task.name, "error", msg, task.alert_threshold, False)
+            return "missing secondary machine"
+        secondary_machines = [
+            {"agent": by_id[str((m or {}).get("agent_id") or "")], "role": (m or {}).get("role") or ""}
+            for m in task.machines
+        ]
+
     status, summary, output, ticket_error = _run_prompt_on_agent(
         agent=task.agent, model=model, prompt=task.prompt,
         allow_mutating=task.allow_mutating, run_id=run_id,
         reply_register=getattr(task, "reply_register", "none"),
+        primary_role=getattr(task, "primary_role", ""),
+        secondary_machines=secondary_machines,
     )
 
     task.last_run = djangotime.now()
@@ -1888,19 +1962,42 @@ def triage_ai_ticket(state_pk, force=False):
                     except Exception as e:
                         DebugLog.error(message=f"tracker-stage check failed for {row.tracker_ref}: {e}")
                 if dec["action"] == "suppress":
-                    note = (
-                        f"Known condition - suppressed automatically.\n\n"
-                        f"This is the same condition already tracked on {row.tracker_ref}: "
-                        f"\"{hit['title']}\" on {row.host or 'this system'}. "
-                        f"Occurrence {row.occurrences} of this condition; {row.suppressed} "
-                        f"notification(s) suppressed so far. Nothing new has happened and the "
-                        f"customer has already been advised, so this duplicate is cancelled "
-                        f"instead of being worked again.\n\n"
-                        f"The condition itself is NOT closed - it stays open on {row.tracker_ref} "
-                        f"until it stops recurring or a human resolves it. Matched by the approved "
-                        f"procedure \"{hit['title']}\" (condition key: {hit['condition_key']}); "
-                        f"no AI judgement was involved in this decision."
-                    )
+                    if dec.get("muted"):
+                        # A human cancelled the tracker for this condition. Saying "tracked on
+                        # <ref>" would point at a ticket they deliberately closed, so say what
+                        # actually happened instead.
+                        note = (
+                            f"Known condition - MUTED by a human, suppressed automatically.\n\n"
+                            f"\"{hit['title']}\" on {row.host or 'this system'}. A technician "
+                            f"closed the tracker for this condition ({dec.get('muted_by') or row.tracker_ref}), "
+                            f"which is a decision not to hold a ticket open for it, so this "
+                            f"notification is cancelled rather than worked again."
+                            + (" The host identity in this notification is a variant of the muted "
+                               "one, so it is treated as the same condition."
+                               if dec.get("inherited") else "") +
+                            f"\n\nOccurrence {row.occurrences} of this condition; "
+                            f"{row.suppressed} notification(s) suppressed so far. The condition "
+                            f"is still on the books and still counted - it is reported in the "
+                            f"open-ticket review - it just no longer creates work. Un-mute it to "
+                            f"start holding tickets open again.\n\n"
+                            f"Matched by the approved procedure \"{hit['title']}\" (condition key: "
+                            f"{hit['condition_key']}); no AI judgement was involved, and nothing "
+                            f"that we have to fix ourselves is ever cancelled this way."
+                        )
+                    else:
+                        note = (
+                            f"Known condition - suppressed automatically.\n\n"
+                            f"This is the same condition already tracked on {row.tracker_ref}: "
+                            f"\"{hit['title']}\" on {row.host or 'this system'}. "
+                            f"Occurrence {row.occurrences} of this condition; {row.suppressed} "
+                            f"notification(s) suppressed so far. Nothing new has happened and the "
+                            f"customer has already been advised, so this duplicate is cancelled "
+                            f"instead of being worked again.\n\n"
+                            f"The condition itself is NOT closed - it stays open on {row.tracker_ref} "
+                            f"until it stops recurring or a human resolves it. Matched by the approved "
+                            f"procedure \"{hit['title']}\" (condition key: {hit['condition_key']}); "
+                            f"no AI judgement was involved in this decision."
+                        )
                     try:
                         _hd_op("cancel_ticket", {"ticket": st.ticket_ref, "reason": note})
                     except Exception as e:
@@ -2540,7 +2637,10 @@ def dispatch_ai_report_schedules():
         rcpt = sch.recipients or ""
         opts = sch.options if isinstance(sch.options, dict) else {}
         try:
-            if sch.kind == "open_tickets":
+            if sch.kind == "tech_productivity":
+                res = send_tech_productivity_report(
+                    hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+            elif sch.kind == "open_tickets":
                 res = send_open_ticket_review(
                     force=True, recipients_override=[x.strip() for x in rcpt.replace(";", ",").split(",") if x.strip()],
                     hours=sch.effective_window_hours, stamp_core=False, options=opts)
@@ -2714,26 +2814,56 @@ def attempt_ai_ticket_resolve(ticket_ref):
 
 @app.task
 def run_ai_scheduled_action(pk):
-    """Execute one due scheduled action on its device, update the ticket, then
-    delete the job (or mark error)."""
-    from core.models import AIScheduledAction
+    """Execute one due scheduled action on its device, write an AITaskRun history
+    row (kept forever under AI History), then drop the live queue row on success
+    (or keep it with status=error on failure for review)."""
+    import uuid as _uuid
+
+    from django.utils import timezone as djangotime
+
+    from core.models import AIScheduledAction, AITaskRun
 
     act = AIScheduledAction.objects.filter(pk=pk).first()
     if not act or act.status != "scheduled":
         return "skip"
     act.status = "running"
     act.save(update_fields=["status", "updated"])
+
+    # History row first — even if the run fails, AI History keeps the attempt forever.
+    label = (act.action or "Scheduled action").strip().replace("\n", " ")
+    if len(label) > 240:
+        label = label[:237] + "..."
+    run_id = f"sched-{act.pk}-{_uuid.uuid4().hex[:12]}"
+    run = AITaskRun.objects.create(
+        agent=act.agent,
+        run_id=run_id,
+        triggered_by="scheduled_action",
+        action_label=label,
+        ticket_ref=(act.ticket_ref or "")[:100],
+        status="running",
+    )
+
     model = _resolve_ai_model(None)
     if not model:
+        msg = "no enabled AI model/default configured"
         act.status = "error"
-        act.result = "no enabled AI model/default configured"
+        act.result = msg
         act.save(update_fields=["status", "result", "updated"])
-        return act.result
+        run.status = "error"
+        run.summary = msg
+        run.finished_at = djangotime.now()
+        run.save(update_fields=["status", "summary", "finished_at"])
+        return msg
     if not act.agent:
+        msg = "scheduled action has no target device"
         act.status = "error"
-        act.result = "scheduled action has no target device"
+        act.result = msg
         act.save(update_fields=["status", "result", "updated"])
-        return act.result
+        run.status = "error"
+        run.summary = msg
+        run.finished_at = djangotime.now()
+        run.save(update_fields=["status", "summary", "finished_at"])
+        return msg
 
     prompt = act.action
     if act.ticket_ref:
@@ -2746,17 +2876,25 @@ def run_ai_scheduled_action(pk):
         )
     status, summary, output, ticket_error = _run_prompt_on_agent(
         agent=act.agent, model=model, prompt=prompt,
-        allow_mutating=act.allow_mutating, run_id=f"sched-{act.pk}",
+        allow_mutating=act.allow_mutating, run_id=run_id,
     )
+
+    run.status = status or "error"
+    run.summary = (summary or "")[:5000]
+    run.output = (output or "")[:50000]
+    run.finished_at = djangotime.now()
+    run.save(update_fields=["status", "summary", "output", "finished_at"])
+
     if status == "error":
         act.status = "error"
         act.result = (summary or "run error")[:5000]
         act.save(update_fields=["status", "result", "updated"])
         return f"error: {summary}"
-    # success -> delete the job (user preference: remove on completion)
+
+    # success -> history kept on AITaskRun; drop the live queue row
     ref = act.ticket_ref
     act.delete()
-    return f"done + deleted (ticket {ref or 'n/a'}): {(summary or '')[:120]}"
+    return f"done + archived to AI History (ticket {ref or 'n/a'}): {(summary or '')[:120]}"
 
 
 # ---------------------------------------------------------------------------
@@ -4491,3 +4629,138 @@ def send_daily_ticket_report(force=False, hours=None, recipients_override=None,
         f"{len(data.get('actors') or [])} people/systems active, "
         f"{_dr_fmt_mins(value['human_total'])} tech time, {_dr_fmt_mins(value['saved'])} saved by AI"
     )
+
+
+@app.task
+def send_tech_productivity_report(hours=None, recipients_override=None, options=None):
+    """Technician Productivity Analysis - the coaching report.
+
+    Deliberately built ON TOP of the same collected data as the activity report rather than
+    beside it: two reports that count the desk's tickets two different ways would disagree in
+    public, and then neither would be believed. So the ticket facts, the actor rollup and the
+    quality signals come from exactly the same `daily_activity` collection and the same work
+    ledger; this task adds what the activity report has no way to know - phone work from the
+    PBX, ticket complexity on a 1-5 scale, per-person 1-5 scoring, and the full list of every
+    ticket each person completed.
+    """
+    from datetime import timedelta
+
+    import requests as _requests
+    from django.utils import timezone as djangotime
+
+    from core import tech_productivity as tp
+
+    core = get_core_settings()
+    if not core.ai_module_enabled:
+        return "ai module disabled"
+    if not (core.ai_helpdesk_code or "").strip():
+        return "no helpdesk integration configured"
+
+    opts = options or {}
+    hours = max(1, int(hours or 24 * 7))
+    # Owner's standing requirement: the ledger is updated before ANY summary email is sent.
+    ledger_note = _refresh_ledger_before_report(hours)
+    bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+
+    try:
+        r = _requests.post(
+            f"{bridge}/pi/helpdesk-op",
+            json={
+                "operation": "daily_activity",
+                "args": {"hours": hours,
+                         "all_teams": bool(opts.get("all_teams", True)),
+                         "team_ids": opts.get("team_ids") or None,
+                         "baseline_days": core.ai_report_baseline_days or 14,
+                         "driven_by": _ai_driven_by(hours)},
+                "helpdesk_api": {"base_url": core.ai_helpdesk_api_base_url or "",
+                                 "api_key": core.ai_helpdesk_api_key or ""},
+                "helpdesk_code": core.ai_helpdesk_code or "",
+            },
+            timeout=(10, 900),
+        )
+        payload_in = r.json()
+    except Exception as e:
+        return f"data collection failed: {str(e)[:200]}"
+    if payload_in.get("error"):
+        return f"data collection error: {str(payload_in['error'])[:200]}"
+    data = payload_in.get("result") or payload_in
+    if not isinstance(data, dict) or "totals" not in data:
+        return f"unexpected data shape from daily_activity: {str(data)[:160]}"
+
+    import json as _json
+    try:
+        fallback = _json.loads(core.ai_report_fallback_minutes or "{}")
+    except Exception:
+        fallback = {}
+    cfg = {
+        "gap": core.ai_report_session_gap_minutes or 30,
+        "per_msg": core.ai_report_minutes_per_message or 4,
+        "min_session": core.ai_report_min_session_minutes or 5,
+        "max_session": core.ai_report_max_session_minutes or 90,
+        "baseline_days": core.ai_report_baseline_days or 14,
+        "fallback": fallback,
+    }
+    tickets = data.get("tickets") or []
+    ledger = _dr_ledger_minutes(hours)
+    actors = _dr_estimate(tickets, cfg, ledger=ledger)
+    actors = _dr_actors_from_ledger(actors, ledger, tickets, hours)
+    quality = _dr_quality(tickets, actors)
+
+    # The phone system is a separate universe from the helpdesk; if it is unreachable the report
+    # still goes out, saying so, rather than silently reporting everyone as making no calls.
+    phone = tp.collect_phone(hours)
+    if not phone.get("ok"):
+        DebugLog.warning(message=f"tech productivity: phone data unavailable: {phone.get('error')}")
+
+    built = tp.build(data, tickets, actors, quality, hours, phone,
+                     pbx_overrides=opts.get("pbx") or {})
+    if not built["rows"]:
+        return "no technician had ticket activity in this window"
+
+    html = tp.render(built, hours, core=core, options=opts, ledger_note=ledger_note)
+
+    recipients = [x.strip() for x in
+                  (recipients_override or core.ai_daily_report_recipients or "").replace(";", ",").split(",")
+                  if x.strip()]
+    if not recipients:
+        recipients = list(core.email_alert_recipients or [])
+    if not recipients:
+        return "no recipients configured"
+
+    desk = built["desk"]
+    top = max(built["rows"], key=lambda r: r["overall_absolute"] or 0)
+    label = (f"{hours}h" if hours < 48 else f"{round(hours / 24)}d")
+    subject = (f"Technician Productivity Analysis - last {label} — "
+               f"{desk['techs']} techs, {desk['tickets_closed']} closed, "
+               f"avg complexity {desk['avg_complexity']}/5, "
+               f"{_dr_fmt_mins(desk['minutes'])} tech time"
+               + (f", {_dr_fmt_mins(desk['talk_minutes'])} on the phone" if built["phone_ok"] else "")
+               + (f" ({desk['dormant_day_count']} unaccounted day(s))" if desk.get("dormant_day_count") else ""))
+    text_lines = [f"Technician Productivity Analysis - last {label}.", ""]
+    for r in sorted(built["rows"], key=lambda x: -(x["overall_absolute"] or 0)):
+        ph = r.get("phone") or {}
+        text_lines.append(
+            f"{r['name']}: {r['tickets_closed']} closed of {r['tickets_touched']} touched, "
+            f"avg complexity {r['avg_complexity']}/5, {_dr_fmt_mins(r['minutes'])} on tickets, "
+            f"{_dr_fmt_mins(r['ai_collab_minutes'])} with the AI, "
+            f"{_dr_fmt_mins(ph.get('talk_minutes')) if ph else 'no phone data'} talk time, "
+            f"overall {r['overall_absolute']}/5 absolute, {r['overall_relative']}/5 vs desk.")
+    text_lines += ["", "This report is best viewed as HTML - every ticket links straight through."]
+
+    # THE FULL REPORT ALWAYS ARRIVES, EVEN IF THE CLIENT CLIPS IT. Every completed ticket for
+    # every technician is required to be in this email, which for a busy month is several hundred
+    # rows and comfortably past the ~102KB at which Gmail truncates a message body and hides the
+    # rest behind "view entire message". The same HTML is therefore attached as a file: the inline
+    # version is for reading, the attachment guarantees nothing was silently lost.
+    stamp = djangotime.localtime(djangotime.now()).strftime("%Y-%m-%d")
+    msg, ok = core.send_mail(subject=subject, body="\n".join(text_lines), html_body=html,
+                            override_recipients=recipients,
+                            attachment=html, attachment_type="html",
+                            attachment_filename=f"technician-productivity-{stamp}",
+                            attachment_extension="html")
+    if not ok:
+        return f"email failed: {str(msg)[:200]}"
+    return (f"sent to {', '.join(recipients)} — {desk['techs']} techs, "
+            f"{desk['tickets_closed']} closed, {_dr_fmt_mins(desk['minutes'])} tech time, "
+            f"{desk['calls']} calls / {_dr_fmt_mins(desk['talk_minutes'])} talk time, "
+            f"top scorer {top['name']} ({top['overall_absolute']}/5)")

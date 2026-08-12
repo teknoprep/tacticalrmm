@@ -15,8 +15,14 @@
 // DEFAULT DENY: an operation the deployment declares as mutating, but does not
 // classify, is DENIED. A new operation can never silently inherit authority.
 
-// The seven classes. Anything outside this set is treated as unclassified (denied).
-export const CLASSES = ["read", "create", "note", "knowledge", "customer", "close", "routing"];
+// The eight classes. Anything outside this set is treated as unclassified (denied).
+//
+// `secret` is the customer's stored credentials (the IT Notebook tab on a company). It is
+// deliberately NOT a kind of "read": a read is cheap and reversible, whereas handing over a
+// live username and password is neither, and it must never happen because an unattended job
+// decided it needed one. It is granted to exactly one surface - the ai-decision window,
+// where a named technician is present - and even there the gate asks them every single time.
+export const CLASSES = ["read", "create", "note", "knowledge", "global_knowledge", "customer", "close", "routing", "secret", "sales"];
 
 // Ships-working-out-of-the-box classifier for conventional operation names. This is a
 // DEFAULT CLASSIFIER ONLY, never the authority: explicit exports.opClasses always wins.
@@ -31,10 +37,15 @@ export const NAME_DEFAULTS = {
   create_ticket: "create", submit_report: "create",
   // note
   add_note: "note",
-  // knowledge  (MANDATE 4.13: knowledge capture is memory, not a change)
+  // knowledge  (MANDATE 4.13: company-scoped knowledge capture is memory, not a change)
   upsert_ai_kb_article: "knowledge",
+  // global_knowledge (shared/global KB authoring is only exposed interactively and
+  // also requires a direct technician instruction; see tools.js)
+  create_global_kb_article: "global_knowledge",
   // customer  (irreversible outbound contact)
   reply_to_ticket: "customer",
+  // secret  (customer credentials - decision window only, always prompts)
+  get_partner_credentials: "secret", get_credentials: "secret", read_secure_notes: "secret",
   // close
   cancel_ticket: "close", close_ticket: "close", ai_close_ticket: "close",
   resolve_ticket: "close",
@@ -42,6 +53,9 @@ export const NAME_DEFAULTS = {
   assign_ticket: "routing", assign_to_working_user: "routing", claim_ticket: "routing",
   release_ticket: "routing", add_follower: "routing", set_ticket_company: "routing",
   set_needs_input_tag: "routing", clear_needs_input_tag: "routing",
+  // sales (decision chat only)
+  create_quotation: "sales", link_ticket_quotation: "sales",
+  get_quotation: "read", list_products: "read",
 };
 
 // Surface -> allowed classes. The surface is WHERE the model is running, which
@@ -58,9 +72,11 @@ export const SURFACE_CLASSES = {
   // End-of-batch report finalizer. Files ONE combined ticket.
   report:        ["create", "read"],
   // Interactive device chat: a human is watching and approves each mutating call.
-  device_chat:   ["create", "note", "knowledge", "read", "customer", "routing"],
-  // Decision chat: a human is driving the ticket and approves each mutating call.
-  decision_chat: ["create", "note", "knowledge", "read", "customer", "routing", "close"],
+  device_chat:   ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing"],
+  // Decision chat: a human is driving the ticket and approves each mutating call. The ONLY
+  // surface that may reach the credential store, and only with a per-request approval that
+  // Auto-approve cannot skip (see the `secret` branch of gate() in server.js).
+  decision_chat: ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "close", "secret", "sales"],
   // Ticket Console auto-resolve: read-only investigation, posts a note. Never closes,
   // never emails. Replaces the old blockOps name list (ISSUES.md I6).
   auto_resolve:  ["read", "note", "knowledge"],

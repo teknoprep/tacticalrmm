@@ -141,6 +141,11 @@ class Role(BaseAuditModel):
     # Manage/delete AI tasks & bulk AI commands created by OTHER users, and on
     # agents outside this role's normal scope. Superusers always have this.
     can_manage_all_ai_tasks = models.BooleanField(default=False)
+    # See the live token/cost meter in Pi Chat and the AI Decision window (what the
+    # current conversation is spending). Off by default: technicians do not need to
+    # see provider spend, and the meter also reveals model/context sizing. Superusers
+    # always have it. Purely a VISIBILITY permission - it grants no AI capability.
+    can_view_ai_cost = models.BooleanField(default=False)
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )
