@@ -182,3 +182,48 @@ is byte-identical to production, all files parse, and every relative import reso
 
 **Rule going forward:** `/opt/pi-trmm-bridge` is the deploy target, **not** the place to edit.
 Change `bridge/src`, run `npm test`, then copy forward — otherwise the next drift is silent.
+
+---
+
+## 2026-08-12 (later) — One git home per artefact, and the drift that hid in the gaps
+
+Asked to "make sure everything is pushed to GitHub so we are in sync". What that turned up
+was not a push backlog but **four different ways for code to exist without git**:
+
+| where it lived | what was wrong |
+|---|---|
+| `/opt/pi-trmm-bridge` | de-facto source of truth; five modules `server.js` imports existed **only** here |
+| `~/pi-trmm-integration/` | **no git at all** — the bridge, the docs, `tools/ticket_report.py` |
+| `~/tacticalrmm` | second checkout, 78 commits behind live, 27 uncommitted files incl. a **renumbered duplicate migration** (`0098` here = `0099` live) |
+| `~/pi-ai-operator` | 21 commits, **no remote** — the whole history existed on one disk |
+| `~/tacticalrmm-web` | 13 commits never pushed (branding + AI UI) |
+| `~/pi-ai-helpdesk` | 8 commits + 4 modified docs never pushed |
+
+**Decision: the branch that runs is the branch that is tracked.** `/rmm` on
+`feature/remote-proxy-v1.5.2` is what serves production, so `pibridge/` now lives *there*,
+byte-identical to `/opt/pi-trmm-bridge`, with `install.sh`/`update.sh` calling
+`pibridge/setup.sh`. Rejected: pushing the bridge to `feature/pi-ai-assistant`, where it
+already existed — that branch is 78 commits behind, so the newest bridge would have sat
+next to five-week-old backend code.
+
+**Decision: visibility decides the home, per file.** `teknoprep/tacticalrmm` is a **public**
+fork (verified via the API, not assumed), so it takes only code and sanitised engineering
+docs. Six documents moved to the **private** `teknoprep/pi-ai-helpdesk` under `internal/`:
+the capability and outcome reports, the customer-reply standard plus the verbatim customer
+reply it was drawn from (named customer server, Sage 100 / MAS_FBI), and two deliberately
+unsanitised issue records. `tools/ticket_report.example.json` went with them — it names
+staff and a departing employee. One real device serial was scrubbed out of this file before
+it was published.
+
+**Decision: a superseded tree gets a snapshot, not a merge.** `~/tacticalrmm`'s 27
+uncommitted files are an older duplicate of work already committed in `/rmm`; committing
+them onto the fork branch would have forked the migration graph. They are preserved on
+`snapshot/secondary-tree-2026-08-12` — off-box, honest about being stale.
+
+`~/pi-ai-operator` got a **private** remote (desktop control code); 21 commits and both
+branches pushed. Everything on the host is now committed, pushed, and tracking an upstream.
+
+**Left as a risk, not fixed here:** the GitHub PAT sits in plaintext in
+`/tmp/pr-backend/.git/config` and `/tmp/pr-web/.git/config` (scope `repo, workflow,
+read:org`) — the `UPGRADE-RUNBOOK.md` gap list already flagged it. It was the only push
+credential on the box. **Rotate it and move these clones to SSH.**
