@@ -1424,38 +1424,123 @@ class AISendEmail(APIView):
         if not subject or not body:
             return notify_error("Both subject and body are required.")
 
-        # ---- From address -------------------------------------------------
-        # Rules:
-        #  - full address given (has '@')  -> used verbatim ("whatever we want")
-        #  - local part only given         -> <localpart>@<smtp domain>
-        #  - nothing given                 -> pi-<job_ref|random>@<smtp domain>
-        # The domain always defaults to the SMTP from-address domain so mail
-        # stays aligned with the configured/authorized sending domain.
+        # ---- From address + display name ----------------------------------
+        # Rules (server decides; the model cannot freely spoof From identity):
+        #  1. actor_email (tech driving the chat) whose domain is in
+        #     ai_mail_tech_from_domains  -> send AS that tech so replies hit them
+        #     Display name: ALWAYS the tech's real name (never a model invention,
+        #     never the generic SMTP brand name).
+        #  2. explicit from_address with @ only if its domain is the SMTP domain
+        #     OR an allowlisted tech-from domain
+        #  3. bare local-part            -> <local>@<smtp domain>
+        #  4. nothing                    -> pi-<job_ref|random>@<smtp domain>
+        # For 2/3/4 (system / random / non-tech From): display name is the
+        # configured SMTP brand ("BlueCloud Support" / smtp_from_name). The model
+        # may not invent a From display name on any path.
         import re
         import secrets
 
-        smtp_domain = (core.smtp_from_email or "").split("@")[-1].strip()
+        smtp_domain = (core.smtp_from_email or "").split("@")[-1].strip().lower()
+        # Brand name for non-personal (system/random pi-*) From on AI mail only.
+        # Deliberately NOT smtp_from_name ("BlueCloud RMM") — that's for RMM alerts.
+        brand_from_name = "BlueCloud Support"
         raw_from = str(request.data.get("from_address") or "").strip()
-        from_name = request.data.get("from_name")
-        if from_name is not None:
-            from_name = str(from_name)[:120]
+        # Model-supplied from_name is intentionally ignored (it was inventing
+        # "BlueCloud Technical Documentation" etc.). Identity is server policy.
+        actor_email = str(request.data.get("actor_email") or "").strip()
+        actor_name = str(request.data.get("actor_name") or "").strip()[:120]
+        tech_domains = [
+            str(d).strip().lower()
+            for d in (getattr(core, "ai_mail_tech_from_domains", None) or [])
+            if str(d).strip()
+        ]
 
-        if raw_from and "@" in raw_from:
-            from_address = raw_from
-        else:
-            if raw_from:
-                local = raw_from
-            else:
-                job_ref = str(request.data.get("job_ref") or "").strip()
-                base = job_ref or secrets.token_hex(4)
-                local = f"pi-{base}"
-            # sanitize local part to valid email-local characters
-            local = re.sub(r"[^A-Za-z0-9._+-]", "", local)[:64] or f"pi-{secrets.token_hex(4)}"
-            if not smtp_domain:
-                return notify_error(
-                    "SMTP from-address has no domain configured; cannot build a From address."
+        def _domain_of(addr: str) -> str:
+            return addr.rsplit("@", 1)[-1].strip().lower() if "@" in addr else ""
+
+        def _allowed_send_domain(domain: str) -> bool:
+            if not domain:
+                return False
+            if smtp_domain and domain == smtp_domain:
+                return True
+            return domain in tech_domains
+
+        def _resolve_tech_display_name(email: str, hint: str) -> str:
+            """Prefer the session-provided name; else look up the RMM user."""
+            if hint:
+                return hint
+            try:
+                from accounts.models import User
+
+                u = (
+                    User.objects.filter(email__iexact=email)
+                    .exclude(email="")
+                    .order_by("id")
+                    .first()
                 )
-            from_address = f"{local}@{smtp_domain}"
+                if u:
+                    full = (u.get_full_name() or "").strip()
+                    if full:
+                        return full[:120]
+                    if u.username:
+                        return str(u.username)[:120]
+            except Exception:
+                pass
+            # last resort: local-part of the email, title-cased
+            local = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+            return (local.title() if local else brand_from_name)[:120]
+
+        from_address = None
+        from_name = None
+        used_tech_from = False
+        # 1) Tech From when allowlisted — display name is ALWAYS the tech
+        if actor_email and "@" in actor_email:
+            try:
+                validate_email(actor_email)
+            except ValidationError:
+                actor_email = ""
+            if actor_email and _domain_of(actor_email) in tech_domains:
+                from_address = actor_email
+                from_name = _resolve_tech_display_name(actor_email, actor_name)
+                used_tech_from = True
+
+        # 2/3/4) fallbacks — system/random From uses the brand display name
+        if not from_address:
+            if raw_from and "@" in raw_from:
+                if not _allowed_send_domain(_domain_of(raw_from)):
+                    return notify_error(
+                        f"from_address domain not allowed: {raw_from}. "
+                        f"Allowed domains: {', '.join([smtp_domain] + tech_domains) if smtp_domain else ', '.join(tech_domains) or '(none)'}"
+                    )
+                from_address = raw_from
+                # If they explicitly pointed at the tech's own address, still use tech name
+                if (
+                    actor_email
+                    and from_address.lower() == actor_email.lower()
+                    and _domain_of(from_address) in tech_domains
+                ):
+                    from_name = _resolve_tech_display_name(actor_email, actor_name)
+                    used_tech_from = True
+                else:
+                    from_name = brand_from_name
+            else:
+                if raw_from:
+                    local = raw_from
+                else:
+                    job_ref = str(request.data.get("job_ref") or "").strip()
+                    base = job_ref or secrets.token_hex(4)
+                    local = f"pi-{base}"
+                # sanitize local part to valid email-local characters
+                local = re.sub(r"[^A-Za-z0-9._+-]", "", local)[:64] or f"pi-{secrets.token_hex(4)}"
+                if not smtp_domain:
+                    return notify_error(
+                        "SMTP from-address has no domain configured; cannot build a From address."
+                    )
+                from_address = f"{local}@{smtp_domain}"
+                from_name = brand_from_name
+
+        if not from_name:
+            from_name = brand_from_name
 
         try:
             validate_email(from_address)
@@ -1480,15 +1565,28 @@ class AISendEmail(APIView):
             return notify_error(f"Email send failed: {msg}")
 
         DebugLog.info(
-            message=f"AI assistant sent email to {', '.join(recipients)} from {from_address}: "
-            f"{subject} (requested by {request.user.username})"
+            message=f"AI assistant sent email to {', '.join(recipients)} from "
+            f"{from_name} <{from_address}>: "
+            f"{subject} (requested by {request.user.username}"
+            + (f"; actor={actor_email}" if actor_email else "")
+            + (f"; tech_from={used_tech_from}")
+            + ")"
             + (f" [attachment: {att_name}, {len(attachment)} bytes]" if attachment else "")
         )
         return Response(
             {
                 "ok": True,
-                "detail": f"Email sent to {', '.join(recipients)} from {from_address}"
-                + (f" with attachment {att_name} ({len(attachment)} bytes)" if attachment else ""),
+                "detail": (
+                    f"Email sent to {', '.join(recipients)} from "
+                    f"{from_name} <{from_address}>"
+                    + (
+                        f" with attachment {att_name} ({len(attachment)} bytes)"
+                        if attachment
+                        else ""
+                    )
+                ),
+                "from_address": from_address,
+                "from_name": from_name,
             }
         )
 
@@ -1759,7 +1857,8 @@ class AIReportScheduleDetail(APIView):
 
         from core.models import AIReportSchedule
         from core.tasks import (send_daily_ticket_report, send_open_ticket_review,
-                                send_tech_productivity_report)
+                                send_tech_productivity_report,
+                                send_ai_spend_report)
 
         sch = get_object_or_404(AIReportSchedule, pk=pk)
         rcpt = sch.recipients or ""
@@ -1770,6 +1869,9 @@ class AIReportScheduleDetail(APIView):
         if sch.kind == "tech_productivity":
             res = send_tech_productivity_report(hours=sch.effective_window_hours,
                                                recipients_override=rcpt, options=opts)
+        elif sch.kind == "ai_spend":
+            res = send_ai_spend_report(hours=sch.effective_window_hours,
+                                      recipients_override=rcpt, options=opts)
         elif sch.kind == "open_tickets":
             res = send_open_ticket_review(force=True, recipients_override=to,
                                          hours=sch.effective_window_hours,
@@ -1781,6 +1883,206 @@ class AIReportScheduleDetail(APIView):
         sch.last_result = f"manual: {res}"[:1000]
         sch.save(update_fields=["last_run", "last_result"])
         return Response(str(res))
+
+
+class AISpendEntryView(APIView):
+    """Record one billed AI turn in the spend ledger (see core.models.AISpendEntry).
+
+    Posted fire-and-forget by the bridge as each turn settles, so the ledger is current
+    without a backfill. Idempotent on (session_id, turn_index): a retry cannot double-bill.
+
+    Every dollar field is stored exactly as the pi runtime reported it. This endpoint does
+    NOT price anything itself - see the accounting rule on the model.
+    """
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def post(self, request):
+        from decimal import Decimal, InvalidOperation
+
+        from django.utils.dateparse import parse_datetime
+
+        from accounts.models import User
+        from agents.models import Agent
+        from core.models import AISpendEntry
+
+        d = request.data
+        session_id = str(d.get("session_id") or "").strip()[:64]
+        if not session_id:
+            return notify_error("session_id is required")
+        try:
+            turn_index = int(d.get("turn_index") or 0)
+        except (TypeError, ValueError):
+            turn_index = 0
+
+        at = parse_datetime(str(d.get("at") or "")) or djangotime.now()
+
+        def dec(v):
+            try:
+                return Decimal(str(v if v is not None else 0))
+            except (InvalidOperation, ValueError):
+                return Decimal(0)
+
+        def pint(v):
+            try:
+                n = int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+            return n if n > 0 else 0
+
+        actor = str(d.get("actor_username") or "").strip()
+        user = User.objects.filter(username=actor).first() if actor else None
+
+        agent = None
+        agent_id = str(d.get("agent_id") or "").strip()
+        if agent_id:
+            # NOTE: Agent.client is a PROPERTY (it resolves through site.client), not a
+            # field - passing it to .only() raises and produced a 500 that the bridge's
+            # fire-and-forget write swallowed, so device-chat spend silently went
+            # unrecorded. Follow the real relation instead.
+            agent = Agent.objects.select_related("site__client").filter(
+                agent_id=agent_id
+            ).first()
+
+        tokens = d.get("tokens") or {}
+        cost = d.get("cost") or {}
+
+        row, created = AISpendEntry.objects.get_or_create(
+            session_id=session_id,
+            turn_index=turn_index,
+            defaults={
+                "surface": str(d.get("surface") or "device_chat")[:20],
+                "provider": str(d.get("provider") or "")[:50],
+                "model_id": str(d.get("model_id") or "")[:255],
+                "actor_user": user,
+                "actor_username": actor[:150],
+                "agent": agent,
+                "agent_hostname": (str(d.get("agent_hostname") or "")
+                                   or (agent.hostname if agent else ""))[:255],
+                "client": (str(d.get("client") or "")
+                           or (agent.site.client.name if agent else ""))[:255],
+                "site": (str(d.get("site") or "")
+                         or (agent.site.name if agent else ""))[:255],
+                "ticket_ref": str(d.get("ticket_ref") or "")[:100],
+                "input_tokens": pint(tokens.get("input")),
+                "output_tokens": pint(tokens.get("output")),
+                "cache_read_tokens": pint(tokens.get("cacheRead")),
+                "cache_write_tokens": pint(tokens.get("cacheWrite")),
+                "reasoning_tokens": pint(tokens.get("reasoning")),
+                "total_tokens": pint(tokens.get("total")),
+                "cost_input": dec(cost.get("input")),
+                "cost_output": dec(cost.get("output")),
+                "cost_cache_read": dec(cost.get("cacheRead")),
+                "cost_cache_write": dec(cost.get("cacheWrite")),
+                "cost_total": dec(cost.get("total")),
+                "priced": bool(d.get("priced", True)),
+                "context_tokens": pint(d.get("context_tokens")),
+                "was_model_switch": bool(d.get("was_model_switch")),
+                "at": at,
+            },
+        )
+        return Response({"ok": True, "id": row.id, "deduped": not created})
+
+
+class AISpendReport(APIView):
+    """Aggregated spend for a time range, grouped however the report asks.
+
+    GET /core/ai/spend-report/?start=<iso>&end=<iso>&group_by=day|client|user|model|surface|ticket
+    Optional filters: client, user, model, surface.
+
+    Returns totals plus the grouped rows, so the UI renders a table without doing maths.
+    """
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    GROUPS = {
+        "day": "day",
+        "client": "client",
+        "user": "actor_username",
+        "model": "model_id",
+        "surface": "surface",
+        "ticket": "ticket_ref",
+    }
+
+    def get(self, request):
+        from django.db.models import Count, DecimalField, Sum, Value
+        from django.db.models.functions import Coalesce, TruncDate
+        from datetime import timedelta as dt_timedelta
+
+        from django.utils.dateparse import parse_datetime
+
+        from core.models import AISpendEntry
+
+        q = request.query_params
+        end = parse_datetime(str(q.get("end") or "")) or djangotime.now()
+        start = parse_datetime(str(q.get("start") or "")) or (end - dt_timedelta(days=30))
+
+        rows = AISpendEntry.objects.filter(at__gte=start, at__lte=end)
+        for param, field in (("client", "client"), ("user", "actor_username"),
+                             ("model", "model_id"), ("surface", "surface")):
+            val = str(q.get(param) or "").strip()
+            if val:
+                rows = rows.filter(**{field: val})
+
+        money = DecimalField(max_digits=18, decimal_places=10)
+        sums = {
+            "cost_total": Coalesce(Sum("cost_total"), Value(0), output_field=money),
+            "cost_input": Coalesce(Sum("cost_input"), Value(0), output_field=money),
+            "cost_output": Coalesce(Sum("cost_output"), Value(0), output_field=money),
+            "cost_cache_read": Coalesce(Sum("cost_cache_read"), Value(0), output_field=money),
+            "cost_cache_write": Coalesce(Sum("cost_cache_write"), Value(0), output_field=money),
+            "input_tokens": Coalesce(Sum("input_tokens"), Value(0)),
+            "output_tokens": Coalesce(Sum("output_tokens"), Value(0)),
+            "cache_read_tokens": Coalesce(Sum("cache_read_tokens"), Value(0)),
+            "cache_write_tokens": Coalesce(Sum("cache_write_tokens"), Value(0)),
+            "turns": Count("id"),
+        }
+
+        group_by = str(q.get("group_by") or "day")
+        field = self.GROUPS.get(group_by, "day")
+        grouped = rows.annotate(day=TruncDate("at")) if field == "day" else rows
+        buckets = list(
+            grouped.values(field).annotate(**sums).order_by(
+                "day" if field == "day" else "-cost_total"
+            )
+        )
+
+        def f(v):
+            return float(v or 0)
+
+        totals = rows.aggregate(**sums)
+        return Response({
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "group_by": group_by,
+            "totals": {
+                **{k: f(v) for k, v in totals.items() if k.startswith("cost_")},
+                "turns": totals["turns"],
+                "input_tokens": totals["input_tokens"],
+                "output_tokens": totals["output_tokens"],
+                "cache_read_tokens": totals["cache_read_tokens"],
+                "cache_write_tokens": totals["cache_write_tokens"],
+                "cost_per_turn": (f(totals["cost_total"]) / totals["turns"]) if totals["turns"] else 0,
+                "unpriced_turns": rows.filter(priced=False).count(),
+            },
+            "rows": [
+                {
+                    "key": str(b[field]) if b[field] not in (None, "") else "(none)",
+                    "turns": b["turns"],
+                    "cost_total": f(b["cost_total"]),
+                    "cost_input": f(b["cost_input"]),
+                    "cost_output": f(b["cost_output"]),
+                    "cost_cache_read": f(b["cost_cache_read"]),
+                    "cost_cache_write": f(b["cost_cache_write"]),
+                    "input_tokens": b["input_tokens"],
+                    "output_tokens": b["output_tokens"],
+                    "cache_read_tokens": b["cache_read_tokens"],
+                    "cache_write_tokens": b["cache_write_tokens"],
+                    "cost_per_turn": (f(b["cost_total"]) / b["turns"]) if b["turns"] else 0,
+                }
+                for b in buckets
+            ],
+        })
 
 
 class AIWorkEntryView(APIView):
@@ -2044,10 +2346,10 @@ class AIDecisionSession(APIView):
             return notify_error("No AI models are available. Ask an admin to configure providers/models.")
         from agents.views import _pi_operator_policy
         operator_policy = _pi_operator_policy(core, user)
-        operator_default = next(
-            (m for m in allowed if m.pk == operator_policy.get("default_model_id")), None
-        )
-        chosen = operator_default or next((m for m in allowed if m.is_default), allowed[0])
+        # AI Decision is ticket work first — use the global default model. The Desktop
+        # Access model is available in the picker for when the tech wants it; do not
+        # force it on every ticket chat.
+        chosen = next((m for m in allowed if m.is_default), allowed[0])
         req_id = request.data.get("model_id")
         if req_id:
             match = next((m for m in allowed if m.model_id == req_id), None)
@@ -2073,6 +2375,8 @@ class AIDecisionSession(APIView):
             "mutate_allowed": mut,
             "allow_mutating": False,  # Write mode OFF by default - tech must enable it (needs can_use_ai_mutate)
             "autoapprove_allowed": aa,
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             "allow_email": True,      # Allow customer email ON by default
             "require_approval": True,
             "question": d.question,
@@ -2116,6 +2420,14 @@ class AIDecisionSession(APIView):
                 "api_key": core.ai_helpdesk_api_key or "",
             },
             "helpdesk_code": core.ai_helpdesk_code or "",
+            "sales_enabled": bool(getattr(core, "ai_sales_enabled", False)),
+            "sales_prompt": getattr(core, "ai_sales_prompt", "") or "",
+            "sales_code": (getattr(core, "ai_sales_code", "") or "") if getattr(core, "ai_sales_enabled", False) else "",
+            # Same Odoo credentials as helpdesk
+            "sales_api": {
+                "base_url": core.ai_helpdesk_api_base_url or "",
+                "api_key": core.ai_helpdesk_api_key or "",
+            },
             "persist_history": True,
             "operator": operator_policy,
         }
@@ -2147,13 +2459,39 @@ class AIScheduleAction(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        from agents.models import Agent
         from core.models import AIScheduledAction
 
-        rows = AIScheduledAction.objects.select_related("agent").order_by("run_at")[:200]
+        # Scope the same way as /ai/tasks/: agent, site, or client. Without a filter
+        # we still return everything the user is permitted to see (capped).
+        qs = AIScheduledAction.objects.select_related(
+            "agent", "agent__site", "agent__site__client"
+        ).order_by("run_at")
+        agent_id = request.query_params.get("agent_id")
+        site = request.query_params.get("site")
+        client = request.query_params.get("client")
+        ticket_ref = request.query_params.get("ticket_ref")
+        status = request.query_params.get("status")
+        permitted = Agent.objects.filter_by_role(request.user)  # type: ignore
+        qs = qs.filter(agent__in=permitted) | qs.filter(agent__isnull=True)
+        if agent_id:
+            qs = qs.filter(agent__agent_id=agent_id)
+        elif site:
+            qs = qs.filter(agent__site_id=site)
+        elif client:
+            qs = qs.filter(agent__site__client_id=client)
+        if ticket_ref:
+            qs = qs.filter(ticket_ref=ticket_ref)
+        if status:
+            qs = qs.filter(status=status)
+        rows = qs.distinct()[:200]
         return Response([{
             "id": r.id, "ticket_ref": r.ticket_ref,
             "agent": r.agent.hostname if r.agent else None,
             "agent_id": r.agent.agent_id if r.agent else None,
+            "hostname": r.agent.hostname if r.agent else None,
+            "client": (r.agent.site.client.name if r.agent and r.agent.site_id else None),
+            "site": (r.agent.site.name if r.agent and r.agent.site_id else None),
             "action": r.action, "run_at": r.run_at.isoformat(),
             "status": r.status, "allow_mutating": r.allow_mutating,
             "created_by": r.created_by, "result": r.result,

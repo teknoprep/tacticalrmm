@@ -86,7 +86,26 @@ class CoreSettingsSerializer(HostedCoreMixin, serializers.ModelSerializer):
                 )
         attrs["ai_operator_allowed_agent_ids"] = operator_ids
 
+        operator_enabled = bool(get_value("ai_operator_enabled"))
         operator_model = get_value("ai_operator_default_model")
+        if operator_enabled and not operator_model:
+            # Desktop Control must always have an explicit model when enabled.
+            from core.models import AIModel
+
+            operator_model = (
+                AIModel.objects.filter(enabled=True, provider__enabled=True, is_default=True)
+                .select_related("provider")
+                .first()
+                or AIModel.objects.filter(enabled=True, provider__enabled=True)
+                .select_related("provider")
+                .order_by("id")
+                .first()
+            )
+            if not operator_model:
+                raise serializers.ValidationError(
+                    {"ai_operator_default_model": "Enable at least one AI model before turning on Desktop Access."}
+                )
+            attrs["ai_operator_default_model"] = operator_model
         if operator_model and (not operator_model.enabled or not operator_model.provider.enabled):
             raise serializers.ValidationError(
                 {"ai_operator_default_model": "Desktop default model and provider must both be enabled."}

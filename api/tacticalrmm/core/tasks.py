@@ -2640,6 +2640,9 @@ def dispatch_ai_report_schedules():
             if sch.kind == "tech_productivity":
                 res = send_tech_productivity_report(
                     hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+            elif sch.kind == "ai_spend":
+                res = send_ai_spend_report(
+                    hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
             elif sch.kind == "open_tickets":
                 res = send_open_ticket_review(
                     force=True, recipients_override=[x.strip() for x in rcpt.replace(";", ",").split(",") if x.strip()],
@@ -2814,26 +2817,56 @@ def attempt_ai_ticket_resolve(ticket_ref):
 
 @app.task
 def run_ai_scheduled_action(pk):
-    """Execute one due scheduled action on its device, update the ticket, then
-    delete the job (or mark error)."""
-    from core.models import AIScheduledAction
+    """Execute one due scheduled action on its device, write an AITaskRun history
+    row (kept forever under AI History), then drop the live queue row on success
+    (or keep it with status=error on failure for review)."""
+    import uuid as _uuid
+
+    from django.utils import timezone as djangotime
+
+    from core.models import AIScheduledAction, AITaskRun
 
     act = AIScheduledAction.objects.filter(pk=pk).first()
     if not act or act.status != "scheduled":
         return "skip"
     act.status = "running"
     act.save(update_fields=["status", "updated"])
+
+    # History row first — even if the run fails, AI History keeps the attempt forever.
+    label = (act.action or "Scheduled action").strip().replace("\n", " ")
+    if len(label) > 240:
+        label = label[:237] + "..."
+    run_id = f"sched-{act.pk}-{_uuid.uuid4().hex[:12]}"
+    run = AITaskRun.objects.create(
+        agent=act.agent,
+        run_id=run_id,
+        triggered_by="scheduled_action",
+        action_label=label,
+        ticket_ref=(act.ticket_ref or "")[:100],
+        status="running",
+    )
+
     model = _resolve_ai_model(None)
     if not model:
+        msg = "no enabled AI model/default configured"
         act.status = "error"
-        act.result = "no enabled AI model/default configured"
+        act.result = msg
         act.save(update_fields=["status", "result", "updated"])
-        return act.result
+        run.status = "error"
+        run.summary = msg
+        run.finished_at = djangotime.now()
+        run.save(update_fields=["status", "summary", "finished_at"])
+        return msg
     if not act.agent:
+        msg = "scheduled action has no target device"
         act.status = "error"
-        act.result = "scheduled action has no target device"
+        act.result = msg
         act.save(update_fields=["status", "result", "updated"])
-        return act.result
+        run.status = "error"
+        run.summary = msg
+        run.finished_at = djangotime.now()
+        run.save(update_fields=["status", "summary", "finished_at"])
+        return msg
 
     prompt = act.action
     if act.ticket_ref:
@@ -2846,17 +2879,25 @@ def run_ai_scheduled_action(pk):
         )
     status, summary, output, ticket_error = _run_prompt_on_agent(
         agent=act.agent, model=model, prompt=prompt,
-        allow_mutating=act.allow_mutating, run_id=f"sched-{act.pk}",
+        allow_mutating=act.allow_mutating, run_id=run_id,
     )
+
+    run.status = status or "error"
+    run.summary = (summary or "")[:5000]
+    run.output = (output or "")[:50000]
+    run.finished_at = djangotime.now()
+    run.save(update_fields=["status", "summary", "output", "finished_at"])
+
     if status == "error":
         act.status = "error"
         act.result = (summary or "run error")[:5000]
         act.save(update_fields=["status", "result", "updated"])
         return f"error: {summary}"
-    # success -> delete the job (user preference: remove on completion)
+
+    # success -> history kept on AITaskRun; drop the live queue row
     ref = act.ticket_ref
     act.delete()
-    return f"done + deleted (ticket {ref or 'n/a'}): {(summary or '')[:120]}"
+    return f"done + archived to AI History (ticket {ref or 'n/a'}): {(summary or '')[:120]}"
 
 
 # ---------------------------------------------------------------------------
@@ -4726,3 +4767,304 @@ def send_tech_productivity_report(hours=None, recipients_override=None, options=
             f"{desk['tickets_closed']} closed, {_dr_fmt_mins(desk['minutes'])} tech time, "
             f"{desk['calls']} calls / {_dr_fmt_mins(desk['talk_minutes'])} talk time, "
             f"top scorer {top['name']} ({top['overall_absolute']}/5)")
+
+
+# ---------------------------------------------------------------------------
+# AI Spend report - a scheduled report kind, driven entirely by the spend ledger.
+#
+# Deliberately reads AISpendEntry and nothing else: the ledger already holds the figure
+# the AI runtime reported for every billed turn, so this report never re-prices anything.
+# That is what keeps a past report stable when a provider changes its prices, and what
+# stops this report disagreeing with the live meter in Pi Chat.
+# ---------------------------------------------------------------------------
+
+_SPEND_GROUPS = {
+    "day": "day",
+    "client": "client",
+    "user": "actor_username",
+    "model": "model_id",
+    "surface": "surface",
+    "ticket": "ticket_ref",
+}
+_SPEND_GROUP_LABELS = {
+    "day": "Day", "client": "Client", "user": "Technician",
+    "model": "Model", "surface": "Surface", "ticket": "Ticket",
+}
+
+
+def _spend_money(v) -> str:
+    return f"${float(v or 0):,.2f}"
+
+
+def _spend_tokens(v) -> str:
+    n = float(v or 0)
+    if n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.1f}k"
+    return f"{int(n)}"
+
+
+def collect_ai_spend(hours: int, options=None) -> dict:
+    """Aggregate the spend ledger for a window. Pure data - no email, no rendering."""
+    from datetime import timedelta
+
+    from django.db.models import Count, DecimalField, Sum, Value
+    from django.db.models.functions import Coalesce, TruncDate
+    from django.utils import timezone as djangotime
+
+    from core.models import AISpendEntry
+
+    opts = options or {}
+    end = djangotime.now()
+    start = end - timedelta(hours=max(1, int(hours or 24)))
+
+    rows = AISpendEntry.objects.filter(at__gte=start, at__lte=end)
+    for key, field in (("client", "client"), ("user", "actor_username"),
+                       ("model", "model_id"), ("surface", "surface")):
+        val = str(opts.get(key) or "").strip()
+        if val:
+            rows = rows.filter(**{field: val})
+
+    money = DecimalField(max_digits=18, decimal_places=10)
+    sums = {
+        "cost_total": Coalesce(Sum("cost_total"), Value(0), output_field=money),
+        "cost_input": Coalesce(Sum("cost_input"), Value(0), output_field=money),
+        "cost_output": Coalesce(Sum("cost_output"), Value(0), output_field=money),
+        "cost_cache_read": Coalesce(Sum("cost_cache_read"), Value(0), output_field=money),
+        "cost_cache_write": Coalesce(Sum("cost_cache_write"), Value(0), output_field=money),
+        "input_tokens": Coalesce(Sum("input_tokens"), Value(0)),
+        "output_tokens": Coalesce(Sum("output_tokens"), Value(0)),
+        "cache_read_tokens": Coalesce(Sum("cache_read_tokens"), Value(0)),
+        "cache_write_tokens": Coalesce(Sum("cache_write_tokens"), Value(0)),
+        "turns": Count("id"),
+    }
+
+    def f(v):
+        return float(v or 0)
+
+    def bucket(group_key):
+        field = _SPEND_GROUPS.get(group_key)
+        if not field:
+            return []
+        qs = rows.annotate(day=TruncDate("at")) if field == "day" else rows
+        out = []
+        for b in qs.values(field).annotate(**sums).order_by(
+                "day" if field == "day" else "-cost_total"):
+            out.append({
+                "key": str(b[field]) if b[field] not in (None, "") else "(none)",
+                "turns": b["turns"],
+                "cost_total": f(b["cost_total"]),
+                "cost_output": f(b["cost_output"]),
+                "cost_cache": f(b["cost_cache_read"]) + f(b["cost_cache_write"]),
+                "input_tokens": b["input_tokens"],
+                "output_tokens": b["output_tokens"],
+                "cost_per_turn": (f(b["cost_total"]) / b["turns"]) if b["turns"] else 0,
+            })
+        return out
+
+    totals = rows.aggregate(**sums)
+    # Which groupings to include: the schedule's own choice, defaulting to the four that
+    # answer "how much, on what, by whom, and where did it go".
+    wanted = opts.get("group_by") or ["day", "client", "model", "user"]
+    if isinstance(wanted, str):
+        wanted = [wanted]
+    wanted = [g for g in wanted if g in _SPEND_GROUPS]
+
+    switches = rows.filter(was_model_switch=True)
+    switch_cost = switches.aggregate(
+        c=Coalesce(Sum("cost_cache_write"), Value(0), output_field=money))["c"]
+
+    return {
+        "start": start, "end": end, "hours": hours,
+        "totals": {
+            "cost_total": f(totals["cost_total"]),
+            "cost_input": f(totals["cost_input"]),
+            "cost_output": f(totals["cost_output"]),
+            "cost_cache_read": f(totals["cost_cache_read"]),
+            "cost_cache_write": f(totals["cost_cache_write"]),
+            "input_tokens": totals["input_tokens"],
+            "output_tokens": totals["output_tokens"],
+            "cache_read_tokens": totals["cache_read_tokens"],
+            "cache_write_tokens": totals["cache_write_tokens"],
+            "turns": totals["turns"],
+            "cost_per_turn": (f(totals["cost_total"]) / totals["turns"]) if totals["turns"] else 0,
+            "unpriced_turns": rows.filter(priced=False).count(),
+            "model_switch_turns": switches.count(),
+            "model_switch_cost": f(switch_cost),
+        },
+        "groups": [{"key": g, "label": _SPEND_GROUP_LABELS[g], "rows": bucket(g)} for g in wanted],
+    }
+
+
+def render_ai_spend_html(data: dict, core=None, options=None) -> str:
+    """Branded, email-safe HTML. Dark text on light backgrounds only (clients strip
+    backgrounds, and white-on-dark becomes unreadable in the ticket chatter)."""
+    opts = options or {}
+    t = data["totals"]
+    top = max(int(opts.get("top_rows") or 15), 1)
+    cache = t["cost_cache_read"] + t["cost_cache_write"]
+    cache_pct = round((cache / t["cost_total"]) * 100) if t["cost_total"] else 0
+    hrs = int(data["hours"])
+    label = f"{hrs}h" if hrs < 48 else f"{round(hrs / 24)}d"
+    # Hoisted so no f-string below contains a subscript (py3.11 cannot nest same quotes).
+    win_start = data["start"].strftime("%Y-%m-%d %H:%M")
+    win_end = data["end"].strftime("%Y-%m-%d %H:%M")
+    n_turns = t["turns"]
+    m_total = _spend_money(t["cost_total"])
+    m_perturn = _spend_money(t["cost_per_turn"])
+    m_output = _spend_money(t["cost_output"])
+    m_cache = _spend_money(cache)
+    n_switch = t["model_switch_turns"]
+    m_switch = _spend_money(t["model_switch_cost"])
+    n_unpriced = t["unpriced_turns"]
+
+    def th(txt, align="left"):
+        return (f'<th style="background-color:#1a3c6e;color:#ffffff;padding:7px 9px;'
+                f'border:1px solid #ccc;text-align:{align};font-size:13px">{txt}</th>')
+
+    def td(txt, align="left", bold=False):
+        w = "font-weight:bold;" if bold else ""
+        return (f'<td style="padding:6px 9px;border:1px solid #ccc;text-align:{align};'
+                f'color:#24292f;font-size:13px;{w}">{txt}</td>')
+
+    parts = [
+        '<div style="font-family:Arial,Helvetica,sans-serif;color:#24292f">',
+        f'<h2 style="color:#1a3c6e;margin:0 0 4px">AI Spend &mdash; last {label}</h2>',
+        f'<p style="color:#555;font-size:13px;margin:0 0 14px">'
+        f'{win_start} to {win_end}. '
+        f'Every figure is the cost the AI runtime itself reported for each call, taken from '
+        f'the spend ledger &mdash; nothing is re-priced, so this report will not change '
+        f'retroactively if a provider changes prices.</p>',
+
+        '<table style="border-collapse:collapse;margin-bottom:16px">',
+        f'<tr>{th("Total")}{th("Turns")}{th("Per turn")}{th("Answers (output)")}{th("Cache traffic")}</tr>',
+        f'<tr>{td(m_total, "left", True)}{td(format(n_turns, ","))}'
+        f'{td(m_perturn)}{td(m_output)}'
+        f'{td(m_cache + " (" + str(cache_pct) + "%)")}</tr>',
+        '</table>',
+    ]
+
+    if cache_pct >= 50 and t["cost_total"]:
+        parts.append(
+            f'<p style="background:#fff4e5;border-left:4px solid #e8a33d;padding:9px 12px;'
+            f'font-size:13px;color:#24292f;margin:0 0 14px">'
+            f'<b>{cache_pct}% of this spend was cache traffic</b> ({m_cache}) '
+            f'&mdash; re-sending conversation context &mdash; versus '
+            f'{m_output} for the answers themselves. Long conversations '
+            f'and switching model mid-chat are the usual causes.</p>')
+
+    if t["model_switch_turns"]:
+        parts.append(
+            f'<p style="font-size:13px;margin:0 0 14px">'
+            f'{n_switch} turn(s) ran straight after a model switch, costing '
+            f'{m_switch} in cache writes to re-send the '
+            f'conversation into another model.</p>')
+
+    if t["unpriced_turns"]:
+        parts.append(
+            f'<p style="font-size:13px;color:#8a6d3b;margin:0 0 14px">'
+            f'{n_unpriced} turn(s) ran on a model with no published pricing, so their '
+            f'cost is not included above.</p>')
+
+    for g in data["groups"]:
+        g_label = g["label"]
+        g_rows = g["rows"]
+        rows = g_rows[:top]
+        if not rows:
+            continue
+        parts.append(f'<h3 style="color:#1a3c6e;margin:18px 0 6px">By {g_label}</h3>')
+        parts.append('<table style="border-collapse:collapse;width:100%">')
+        parts.append(f'<tr>{th(g_label)}{th("Turns","right")}{th("Total","right")}'
+                     f'{th("Per turn","right")}{th("Answers","right")}{th("Cache","right")}'
+                     f'{th("Tokens in/out","right")}</tr>')
+        for r in rows:
+            r_key = r["key"]
+            r_turns = format(r["turns"], ",")
+            r_total = _spend_money(r["cost_total"])
+            r_pt = _spend_money(r["cost_per_turn"])
+            r_out = _spend_money(r["cost_output"])
+            r_cache = _spend_money(r["cost_cache"])
+            r_tok = _spend_tokens(r["input_tokens"]) + " / " + _spend_tokens(r["output_tokens"])
+            parts.append(
+                f'<tr>{td(r_key)}{td(r_turns, "right")}'
+                f'{td(r_total, "right", True)}'
+                f'{td(r_pt, "right")}'
+                f'{td(r_out, "right")}'
+                f'{td(r_cache, "right")}'
+                f'{td(r_tok, "right")}</tr>')
+        parts.append('</table>')
+        n_all = len(g_rows)
+        if n_all > top:
+            parts.append(f'<p style="font-size:12px;color:#777;margin:4px 0 0">'
+                         f'Showing top {top} of {n_all}.</p>')
+
+    parts.append('</div>')
+    return "".join(parts)
+
+
+def send_ai_spend_report(hours=None, recipients_override=None, options=None):
+    """Email the AI spend report for a window. Registered as the `ai_spend` report kind."""
+    core = get_core_settings()
+    if not core.ai_module_enabled:
+        return "ai module disabled"
+
+    opts = options or {}
+    hours = max(1, int(hours or 24))
+    data = collect_ai_spend(hours, opts)
+    t = data["totals"]
+
+    if not t["turns"] and not opts.get("send_when_empty"):
+        return "no AI spend recorded in this window"
+
+    recipients = [x.strip() for x in
+                  (recipients_override or core.ai_daily_report_recipients or "").replace(";", ",").split(",")
+                  if x.strip()]
+    if not recipients:
+        recipients = list(core.email_alert_recipients or [])
+    if not recipients:
+        return "no recipients configured"
+
+    html = render_ai_spend_html(data, core=core, options=opts)
+    label = f"{hours}h" if hours < 48 else f"{round(hours / 24)}d"
+    cache = t["cost_cache_read"] + t["cost_cache_write"]
+    subject = (f"AI Spend - last {label} — {_spend_money(t['cost_total'])} over "
+               + format(t["turns"], ",") + " turns ("
+               + _spend_money(t["cost_per_turn"]) + "/turn)")
+
+    m_total = _spend_money(t["cost_total"])
+    m_perturn = _spend_money(t["cost_per_turn"])
+    m_output = _spend_money(t["cost_output"])
+    m_cache = _spend_money(cache)
+    n_turns_s = format(t["turns"], ",")
+    w_start = data["start"].strftime("%Y-%m-%d %H:%M")
+    w_end = data["end"].strftime("%Y-%m-%d %H:%M")
+    text = [
+        f"AI Spend - last {label}",
+        f"{w_start} to {w_end}",
+        "",
+        f"Total:            {m_total}",
+        f"Turns:            {n_turns_s}",
+        f"Per turn:         {m_perturn}",
+        f"Answers (output): {m_output}",
+        f"Cache traffic:    {m_cache}",
+        "",
+    ]
+    for g in data["groups"]:
+        if not g["rows"]:
+            continue
+        text.append("By " + g["label"] + ":")
+        for r in g["rows"][:int(opts.get("top_rows") or 15)]:
+            k = str(r["key"])[:28]
+            rt = _spend_money(r["cost_total"])
+            rp = _spend_money(r["cost_per_turn"])
+            rn = r["turns"]
+            text.append(f"  {k:<28} {rt:>10}  {rn:>5} turns  {rp}/turn")
+        text.append("")
+
+    msg, ok = core.send_mail(subject=subject, body="\n".join(text), html_body=html,
+                             override_recipients=recipients)
+    if not ok:
+        return f"email failed: {str(msg)[:200]}"
+    return (f"sent to {len(recipients)} recipient(s): {_spend_money(t['cost_total'])} "
+            f"over {t['turns']} turns")

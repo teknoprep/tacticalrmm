@@ -1885,6 +1885,8 @@ class PiMultiSession(APIView):
             "hostname": hostnames,
             "device_facts": machines[0]["device_facts"],
             "username": user.username,
+            "user_email": getattr(user, "email", "") or "",
+            "user_display": (user.get_full_name() if hasattr(user, "get_full_name") else "") or user.username,
             "provider": chosen.provider.name,
             "model_id": chosen.model_id,
             "thinking_level": chosen.thinking_level,
@@ -1894,6 +1896,10 @@ class PiMultiSession(APIView):
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(
                 is_super or (user.role and user.role.can_use_ai_autoapprove)
+            ),
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(
+                is_super or (user.role and user.role.can_view_ai_cost)
             ),
             # Remembered preference - see accounts.User.ai_autoapprove_default.
             "auto_approve": bool(
@@ -2010,15 +2016,10 @@ class AgentPiSession(APIView):
             )
 
         operator_policy = _pi_operator_policy(core, user)
-        operator_agent_ids = {m["agent_id"] for m in operator_policy["machines"]}
-        operator_default = next(
-            (m for m in allowed if m.pk == operator_policy.get("default_model_id")), None
-        )
-        default_model = (
-            operator_default
-            if agent.agent_id in operator_agent_ids and operator_default
-            else next((m for m in allowed if m.is_default), allowed[0])
-        )
+        # Pi Chat always opens on the GLOBAL default model (e.g. Sonnet 5).
+        # The Desktop Access model (e.g. Grok) is available in the picker for when the
+        # tech wants it — it is never forced just because Operator tools are enabled.
+        default_model = next((m for m in allowed if m.is_default), allowed[0])
 
         # requested model (optional) must be in allowed set
         req_id = request.data.get("model_id")
@@ -2065,6 +2066,8 @@ class AgentPiSession(APIView):
             "agent_id": agent.agent_id,
             "hostname": agent.hostname,
             "username": user.username,
+            "user_email": getattr(user, "email", "") or "",
+            "user_display": (user.get_full_name() if hasattr(user, "get_full_name") else "") or user.username,
             "provider": chosen["provider"] if isinstance(chosen, dict) else chosen.provider.name,
             "model_id": chosen.model_id,
             "thinking_level": chosen.thinking_level,
@@ -2074,6 +2077,8 @@ class AgentPiSession(APIView):
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(is_super or (user.role and user.role.can_use_ai_autoapprove)),
+            # Show the live token/cost meter? Visibility only - grants no capability.
+            "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             # Remembered preference (see accounts.User.ai_autoapprove_default): the device
             # chat had the same reset-on-refresh behaviour as the ticket chat.
             "auto_approve": bool((is_super or (user.role and user.role.can_use_ai_autoapprove))

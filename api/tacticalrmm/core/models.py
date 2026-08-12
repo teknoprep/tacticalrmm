@@ -308,6 +308,40 @@ class CoreSettings(BaseAuditModel):
     # Escape hatch for a colleague whose login is not on the company domain.
     ai_staff_extra_usernames = models.JSONField(default=list, blank=True)
 
+    # AI SMTP "send_email" From policy: when the directing technician's account email is on
+    # one of these domains, send AS that address so replies hit the tech (not a random
+    # pi-*@ mailbox). Empty list = always randomize/job-ref. Default includes the company
+    # domain. Unattended jobs (no actor_email) still use pi-<job_ref|random>@.
+    ai_mail_tech_from_domains = models.JSONField(default=list, blank=True)
+
+    # Pi.dev AI Sales Integration (ERP quotations). Off by default. Reuses the helpdesk
+    # API base/key (same Odoo). JS + prompt mirror the helpdesk pattern.
+    ai_sales_enabled = models.BooleanField(default=False)
+    ai_sales_prompt = models.TextField(blank=True, default="")
+    ai_sales_code = models.TextField(blank=True, default="")
+
+    # ---- ERP AI integration (inbound) -------------------------------------
+    # Master switch for ERP systems that embed our AI next to a record they are
+    # displaying -- currently the Odoo `ai_pi_bridge` addon, but named
+    # generically because the contract (mint a session, resolve models, execute
+    # nothing) is not Odoo-specific.
+    #
+    # OFF by default and checked on every /core/ai/odoo/ request, so this switch
+    # alone closes the integration without touching nginx or the ERP.
+    #
+    # Nothing else is required to turn it on: the ERP holds its own URLs and
+    # prompts. The two fields below are optional hardening/plumbing that only
+    # matter once it is enabled.
+    ai_erp_integration_enabled = models.BooleanField(default=False)
+    # Origins permitted to embed the chat UI and exchange postMessage with it.
+    # Comma-separated, e.g. "https://erp.blueuc.com". Served to the UI at
+    # runtime so the ERP hostname is never hardcoded in the page -- ERP URLs
+    # change, and a hardcoded origin means editing and redeploying static files.
+    ai_erp_allowed_origins = models.TextField(blank=True, default="")
+    # Public base the chat UI should open its WebSocket against. Blank = derive
+    # from the request, which is correct unless the API is fronted separately.
+    ai_erp_ws_base = models.CharField(max_length=255, blank=True, default="")
+
     # Work that leaves no timestamps still leaves CONTENT. Three considered replies posted in
     # the same minute span zero seconds but represent real composition, so the ledger also
     # values a burst by what was written and read, and keeps whichever estimate is larger.
@@ -1058,7 +1092,11 @@ class AITaskRun(models.Model):
     # groups all per-machine runs of a single bulk dispatch, so a finalizer can
     # compile ONE combined report after the whole batch finishes.
     batch_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
-    triggered_by = models.CharField(max_length=20, default="schedule")  # schedule|manual|bulk
+    triggered_by = models.CharField(max_length=32, default="schedule")  # schedule|manual|bulk|scheduled_action
+    # Freeform label for one-shot AI-scheduled actions (no parent AITask/Bulk).
+    # Shown in AI History as source_name so completed purple jobs remain visible forever.
+    action_label = models.CharField(max_length=255, blank=True, default="")
+    ticket_ref = models.CharField(max_length=100, blank=True, default="")
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, default="running")  # running/ok/warning/alert/error
@@ -1074,6 +1112,8 @@ class AITaskRun(models.Model):
             return "bulk"
         if self.task_id:
             return "task"
+        if self.triggered_by == "scheduled_action" or self.action_label:
+            return "scheduled"
         return "chat"
 
     @property
@@ -1082,6 +1122,8 @@ class AITaskRun(models.Model):
             return self.bulk.name
         if self.task_id:
             return self.task.name
+        if self.action_label:
+            return self.action_label
         return ""
 
     def get_agent(self):
@@ -1411,6 +1453,7 @@ class AIReportSchedule(models.Model):
         ("activity", "Activity report - what happened"),
         ("open_tickets", "Open-ticket review - what could be done"),
         ("tech_productivity", "Technician Productivity Analysis - how each tech is doing"),
+        ("ai_spend", "AI Spend - what the AI cost, from the spend ledger"),
     )
     CADENCE = (
         ("daily", "Every day"),
@@ -1527,6 +1570,10 @@ class TicketWorkEntry(models.Model):
         ("verifier", "Alert verifier"),
         ("condition_engine", "Known-condition engine"),
         ("rmm_activity", "Working in RMM (remote sessions, device work)"),
+        # The Odoo AI panel. Always a technician DRIVING the AI, never unattended,
+        # so its entries are actor_kind="tech_via_ai" and the minutes land in
+        # human_minutes: the tech really was working, the AI was the tool.
+        ("odoo_ai", "Odoo AI panel (CRM / quotations)"),
     )
     CONFIDENCE = (
         ("measured", "Measured from timestamps"),
@@ -1722,8 +1769,9 @@ class AIDecisionRequest(models.Model):
 class AIScheduledAction(models.Model):
     """A future AI action to run at a specific time (e.g. patch in a maintenance
     window). A cheap celery-beat dispatcher fires it ONCE when due - the LLM never
-    polls the clock. On success the row is deleted; on failure it's kept for review.
-    NOT created automatically by triage (human-directed for now)."""
+    polls the clock. On completion an AITaskRun history row is written (kept forever
+    under AI History); the live queue row is then removed on success, or kept with
+    status=error on failure for review. NOT created automatically by triage."""
 
     agent = models.ForeignKey(
         "agents.Agent", null=True, blank=True, on_delete=models.SET_NULL,
@@ -1744,3 +1792,109 @@ class AIScheduledAction(models.Model):
 
     def __str__(self) -> str:
         return f"scheduled {self.action[:30]} @ {self.run_at} [{self.status}]"
+
+
+class AISpendEntry(models.Model):
+    """Append-only LEDGER of AI provider spend - one row per billed turn.
+
+    Why this exists: before it, the only record of spend was `usage.cost` inside the
+    bridge's session `.jsonl` files. Measured 2026-08-04 that was 1,413 files holding
+    $433.37 across 8,302 billed messages, and it was unusable as a ledger because it was
+    (a) not queryable or attributable to a client / ticket / technician, (b) DESTROYED when
+    a tech deleted a chat from AI History (`history.deleteSession` unlinks the file), and
+    (c) entirely ABSENT for unattended runs, which use in-memory sessions that never touch
+    disk - so scheduled fleet work was billing real money with no trace at all.
+
+    ACCOUNTING RULE - every dollar column is the figure the pi runtime REPORTED for that
+    call (`message.usage.cost`), stored verbatim. We never recompute from a rate table:
+
+      * Providers apply rules a flat `tokens x rate` multiply gets wrong - tiered pricing
+        (gpt-5.6-sol doubles above 272k input tokens) and cache variants (Anthropic's
+        `cacheWrite1h`). An earlier version of the live meter did recompute and silently
+        understated tiered calls; this table must not repeat that.
+      * Recording what was ACTUALLY charged keeps historical reports stable. If a provider
+        changes its prices next month, last month's report must not move.
+
+    Corrections are new rows, never edits, so any past report can be re-derived exactly
+    (same rule as TicketWorkEntry).
+    """
+
+    SURFACE = (
+        ("device_chat", "Device chat / pichat"),
+        ("decision_chat", "Ticket (AI-decision) chat"),
+        ("unattended", "Unattended run (scheduled task / bulk / action)"),
+        ("verifier", "Alert verifier"),
+        # The Odoo AI panel. Rows were already being written with this value and the
+        # report grouped them correctly, because it groups by DATA rather than by
+        # declared choices -- but with no choice declared the label rendered as the
+        # raw string "odoo" instead of something a human reads.
+        ("odoo", "Odoo AI panel (CRM / quotations)"),
+        ("other", "Other"),
+    )
+
+    # --- what produced the spend -------------------------------------------------
+    session_id = models.CharField(max_length=64, db_index=True)
+    # Monotonic turn counter within the session. Together with session_id this makes the
+    # bridge's fire-and-forget POST idempotent, so a retry cannot double-bill a report.
+    turn_index = models.PositiveIntegerField(default=0)
+    surface = models.CharField(max_length=20, choices=SURFACE, default="device_chat")
+    provider = models.CharField(max_length=50)
+    model_id = models.CharField(max_length=255, db_index=True)
+
+    # --- who / what it was for ---------------------------------------------------
+    actor_user = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="ai_spend_entries",
+    )
+    actor_username = models.CharField(max_length=150, blank=True, default="", db_index=True)
+    agent = models.ForeignKey(
+        "agents.Agent", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="ai_spend_entries",
+    )
+    # Denormalised labels: an agent can be renamed, moved or deleted, but a past invoice
+    # must keep saying which client it belonged to.
+    agent_hostname = models.CharField(max_length=255, blank=True, default="")
+    client = models.CharField(max_length=255, blank=True, default="", db_index=True)
+    site = models.CharField(max_length=255, blank=True, default="")
+    ticket_ref = models.CharField(max_length=100, blank=True, default="", db_index=True)
+
+    # --- tokens, as reported -----------------------------------------------------
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
+    cache_read_tokens = models.PositiveBigIntegerField(default=0)
+    cache_write_tokens = models.PositiveBigIntegerField(default=0)
+    reasoning_tokens = models.PositiveIntegerField(default=0)
+    total_tokens = models.PositiveBigIntegerField(default=0)
+
+    # --- dollars, exactly as pi reported them ------------------------------------
+    # Decimal (not float) so SUM() over many small values stays exact; the smallest
+    # observed figure is ~3.8e-05, hence 10 decimal places.
+    cost_input = models.DecimalField(max_digits=16, decimal_places=10, default=0)
+    cost_output = models.DecimalField(max_digits=16, decimal_places=10, default=0)
+    cost_cache_read = models.DecimalField(max_digits=16, decimal_places=10, default=0)
+    cost_cache_write = models.DecimalField(max_digits=16, decimal_places=10, default=0)
+    cost_total = models.DecimalField(max_digits=16, decimal_places=10, default=0)
+    # False when the runtime reported no cost object (model without pricing metadata).
+    # Reports must show these turns as "unpriced" rather than as $0.00.
+    priced = models.BooleanField(default=True)
+
+    # --- context / diagnostics ---------------------------------------------------
+    context_tokens = models.PositiveBigIntegerField(default=0)
+    # True when this turn ran on a different model than the previous one, i.e. the
+    # conversation was re-cached into a new provider. That is what made one session spend
+    # $2.25 on cache writes alone, so it is worth being able to report on.
+    was_model_switch = models.BooleanField(default=False)
+
+    at = models.DateTimeField(db_index=True)
+
+    class Meta:
+        unique_together = ("session_id", "turn_index")
+        indexes = [
+            models.Index(fields=["at", "client"]),
+            models.Index(fields=["at", "actor_username"]),
+            models.Index(fields=["at", "model_id"]),
+            models.Index(fields=["at", "surface"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.at:%Y-%m-%d %H:%M} {self.model_id} ${self.cost_total} [{self.surface}]"
