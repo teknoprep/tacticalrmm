@@ -579,8 +579,16 @@ async function startChat(ws, blob) {
   const chatTitle = multi
     ? `Multi: ${toolMachines.map((m) => m.label).join(" + ")}`
     : `Chat about ${facts.hostname}`;
+  // SESSION LABEL. The technician's own name for this conversation, typed in the chat
+  // window and shown in AI History. Auto-generated names ("Chat about PBX3", or the first
+  // 200 characters of whatever was last said) are fine for finding a session you opened
+  // ten minutes ago and useless for finding the one from Tuesday. Kept in the same index
+  // as the rest of the session metadata, so it survives a refresh, a reconnect and a
+  // Continue - a label that evaporated on reload would be worse than none.
+  let sessionLabel = String(history.readIndex(agentId)[sessionId]?.label || "");
   if (blob.persist_history) {
     history.recordSession(agentId, sessionId, {
+      label: sessionLabel,
       file: session.sessionFile,
       name: chatTitle,
       started: history.readIndex(agentId)[sessionId]?.started || new Date().toISOString(),
@@ -716,6 +724,7 @@ async function startChat(ws, blob) {
       context_window: Number(model?.contextWindow || 0),
       operator_enabled: !!(blob.operator && blob.operator.enabled),
       operator_machines: (blob.operator && blob.operator.machines) || [],
+      label: sessionLabel,
       history: uiTranscript(sessionManager, session),
     }),
   );
@@ -792,6 +801,16 @@ async function startChat(ws, blob) {
           }
           ws.send(JSON.stringify({ type: "readonly_state", value: readonly }));
           break;
+        case "set_label": {
+          // Trimmed and capped, because this is a label rather than a note and it has to
+          // fit a table column. Blank clears it and AI History falls back to the
+          // generated name, so there is no way to get stuck with a label you cannot remove.
+          sessionLabel = String(msg.value ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+          if (blob.persist_history) history.recordSession(agentId, sessionId, { label: sessionLabel });
+          log("label set", agentId, sessionId, sessionLabel || "(cleared)");
+          ws.send(JSON.stringify({ type: "label_state", value: sessionLabel }));
+          break;
+        }
         case "set_model": {
           const allowed = (blob.allowed_models || []).find(
             (m) => m.model_id === msg.model_id,
@@ -1119,9 +1138,12 @@ async function startDecisionChat(ws, blob) {
     sessionManager, agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
   });
   const sessionId = session.sessionId;
+  // Same technician-set label as the device chat (see the note there).
+  let sessionLabel = String(history.readIndex(histKey)[sessionId]?.label || "");
   history.recordSession(histKey, sessionId, {
     file: session.sessionFile,
     name: `Ticket ${ticketRef}`,
+    label: sessionLabel,
     started: history.readIndex(histKey)[sessionId]?.started || new Date().toISOString(),
     last_activity: new Date().toISOString(),
     model: `${blob.provider}/${blob.model_id}`, user: blob.username,
@@ -1218,6 +1240,7 @@ async function startDecisionChat(ws, blob) {
     read_only: readonly, mutate_allowed: mutateAllowed,
     allow_email: allowEmail,
     autocredential_allowed: autocredentialAllowed, auto_credential: autoCredential,
+    label: sessionLabel,
     // Whether this operator's role may see the running cost meter.
     cost_visible: !!blob.cost_visible,
     context_window: Number(model?.contextWindow || 0),
@@ -1290,6 +1313,13 @@ async function startDecisionChat(ws, blob) {
           allowEmail = !!msg.value;
           ws.send(JSON.stringify({ type: "allow_email_state", value: allowEmail }));
           break;
+        case "set_label": {
+          sessionLabel = String(msg.value ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+          history.recordSession(histKey, sessionId, { label: sessionLabel });
+          log("label set", histKey, sessionId, sessionLabel || "(cleared)");
+          ws.send(JSON.stringify({ type: "label_state", value: sessionLabel }));
+          break;
+        }
         case "set_autocredential":
           // Gated by the role, exactly like Auto-approve: remembering a choice, or
           // receiving one over the socket, can never grant the permission itself.
