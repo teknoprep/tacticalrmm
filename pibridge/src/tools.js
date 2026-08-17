@@ -1329,6 +1329,11 @@ export function buildTools({
 
   const operatorTools = operatorPlugin?.buildOperatorTools({
     Type, defineTool, text, operatorPolicy, operatorActor, surface: "pi-chat",
+    // A brokered PowerShell run is a device change like any other: hand the Operator
+    // tools this session's real controls rather than letting them invent their own.
+    approve: async (summary) => ({ ok: await gate(summary) }),
+    isReadonly,
+    mutatingMatch,
   }) || [];
 
   let tools = [
@@ -1757,12 +1762,16 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         const A = p.args || {};
         const who = p.company_name || p.partner_id || A.company_name || A.partner_id || "this company";
         const wantsPriv = !!(p.include_privileged || A.include_privileged);
+        // The privileged flag travels as DATA, not as a phrase in the summary: it decides
+        // whether Auto-credential may cover this read, and a gate must never have to parse
+        // English to work that out.
         const g = gate
           ? await gate("secret", `Read STORED CREDENTIALS (IT Notebook) for ${who}, requested on ${ticketRef}. ` +
               `The AI will be able to see the usernames and passwords it returns.` +
               (wantsPriv
                 ? ` IT IS ALSO ASKING FOR THE PRIVILEGED ROWS, which are normally withheld.`
-                : ` Privileged rows will be withheld.`))
+                : ` Privileged rows will be withheld.`),
+              { privileged: wantsPriv })
           : { ok: false, reason: "no approval channel available - credentials can only be read in the ai-decision window." };
         if (!g.ok)
           return text(
@@ -2245,6 +2254,10 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
 
   const operatorTools = operatorPlugin?.buildOperatorTools({
     Type, defineTool, text, operatorPolicy, operatorActor, surface: "ai-decision",
+    // gate("device") already enforces read-only and the approval prompt here, so the
+    // read-only check is folded into it and isReadonly is left null on purpose.
+    approve: (summary) => (gate ? gate("device", summary) : { ok: false, reason: "no approval channel available." }),
+    mutatingMatch,
   }) || [];
 
 

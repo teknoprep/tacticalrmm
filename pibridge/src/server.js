@@ -897,6 +897,13 @@ async function startDecisionChat(ws, blob) {
   // Same remembered-choice rule as the device chat (see above).
   let autoApprove = !!blob.auto_approve && !!blob.autoapprove_allowed;
   let allowEmail = blob.allow_email !== false; // default: ON
+  // AUTO-CREDENTIAL. Its own role permission (can_use_ai_autocredential), its own
+  // toggle, and its own remembered default - never inferred from Auto-approve. What it
+  // buys: an ordinary IT Notebook row can be read without stopping the work to ask.
+  // What it deliberately does NOT buy: the privileged rows, which keep asking a human
+  // every single time (see gate("secret") below).
+  const autocredentialAllowed = !!blob.autocredential_allowed;
+  let autoCredential = !!blob.auto_credential && autocredentialAllowed;
 
   const keys = { [blob.provider]: blob.api_key };
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
@@ -968,7 +975,7 @@ async function startDecisionChat(ws, blob) {
   // model would be closing on its own authority. Same reasoning for an irreversible
   // outbound customer email. This mirrors the identity/access gate, which already applies
   // "EVEN in Write mode / Auto-approve".
-  async function gate(kind, summary) {
+  async function gate(kind, summary, opts = {}) {
     if (kind === "device") {
       if (readonly) return { ok: false, reason: "the chat is in READ-ONLY mode - switch on Write mode to make device changes." };
       if (autoApprove) return { ok: true };
@@ -995,6 +1002,24 @@ async function startDecisionChat(ws, blob) {
     // ticket, which is a reasonable reading for a reply or a close and an unreasonable one for
     // handing a live password to a model. If they want it, they can answer the prompt.
     if (kind === "secret") {
+      // AUTO-CREDENTIAL is the one sanctioned exception, and it is narrow on purpose.
+      //
+      // The rule above still holds for everything it does not cover: a sentence the tech
+      // typed earlier never counts as permission to hand over a password. What changed is
+      // that a technician whose ROLE carries can_use_ai_autocredential can now say so ONCE,
+      // deliberately, with a switch at the top of the window - a standing instruction they
+      // can see and revoke, not an inference drawn from their prose.
+      //
+      // Two things it never covers:
+      //   1. PRIVILEGED rows. Those are withheld by default for a reason; asking for them
+      //      is an escalation and escalations get a human. No toggle skips this.
+      //   2. The audit line. Silent to the technician is not the same as unrecorded - an
+      //      automatic read is logged exactly like a prompted one, and says which switch
+      //      allowed it.
+      if (autoCredential && autocredentialAllowed && !opts.privileged) {
+        log("credential read auto-permitted (Auto-credential)", histKey, sessionId, String(summary).slice(0, 160));
+        return { ok: true };
+      }
       const ok = await requestApproval(summary);
       if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
       log("credential read permitted by tech", histKey, sessionId, String(summary).slice(0, 160));
@@ -1192,6 +1217,7 @@ async function startDecisionChat(ws, blob) {
     require_approval: true, autoapprove_allowed: autoapproveAllowed, auto_approve: autoApprove,
     read_only: readonly, mutate_allowed: mutateAllowed,
     allow_email: allowEmail,
+    autocredential_allowed: autocredentialAllowed, auto_credential: autoCredential,
     // Whether this operator's role may see the running cost meter.
     cost_visible: !!blob.cost_visible,
     context_window: Number(model?.contextWindow || 0),
@@ -1263,6 +1289,16 @@ async function startDecisionChat(ws, blob) {
         case "set_allow_email":
           allowEmail = !!msg.value;
           ws.send(JSON.stringify({ type: "allow_email_state", value: allowEmail }));
+          break;
+        case "set_autocredential":
+          // Gated by the role, exactly like Auto-approve: remembering a choice, or
+          // receiving one over the socket, can never grant the permission itself.
+          autoCredential = !!msg.value && autocredentialAllowed;
+          log(
+            autoCredential ? "auto-credential ON" : "auto-credential OFF",
+            histKey, sessionId, `by ${blob.username || "?"}`,
+          );
+          ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential }));
           break;
         case "approve":
         case "deny": {

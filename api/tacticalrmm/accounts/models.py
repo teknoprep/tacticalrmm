@@ -26,6 +26,10 @@ class User(AbstractUser, BaseAuditModel):
     # stops working". The permission to use it is still the role's (can_use_ai_autoapprove);
     # this is only the remembered preference.
     ai_autoapprove_default = models.BooleanField(default=False)
+    # AI chat: remember the operator's Auto-credential choice the same way. The
+    # permission to use it at all is the role's (can_use_ai_autocredential); this is
+    # only the remembered preference so it survives a refresh or a second window.
+    ai_autocredential_default = models.BooleanField(default=False)
     show_community_scripts = models.BooleanField(default=True)
     agent_dblclick_action: "AgentDblClick" = models.CharField(
         max_length=50, choices=AgentDblClick.choices, default=AgentDblClick.EDIT_AGENT
@@ -160,6 +164,20 @@ class Role(BaseAuditModel):
     #
     # Superusers always have this, like can_view_ai_cost.
     can_take_over_ai_session = models.BooleanField(default=False)
+    # Let Pi USE a stored IT Notebook credential without stopping to ask for each
+    # retrieval. Off by default and deliberately separate from can_use_ai_autoapprove:
+    # approving a device change and handing over a live password are different grants.
+    #
+    # Scope, enforced in the bridge (server.js gate("secret")):
+    #   - covers ordinary IT Notebook rows only. A request for the PRIVILEGED rows
+    #     (include_privileged=true) still asks a human EVERY time, whatever this says.
+    #   - every auto-permitted read is still written to the audit log naming the
+    #     company, the label and the ticket. Silent is not the same as unrecorded.
+    #   - the brokered path (operator_desktop_fill_secret, run_script_with_credential)
+    #     never shows the value to the model and does not need this permission; this
+    #     permission is what makes the plain read unattended.
+    # Superusers always have it, like can_view_ai_cost.
+    can_use_ai_autocredential = models.BooleanField(default=False)
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )

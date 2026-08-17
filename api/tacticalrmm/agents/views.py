@@ -1902,6 +1902,11 @@ class PiMultiSession(APIView):
             "autoapprove_allowed": bool(
                 is_super or (user.role and user.role.can_use_ai_autoapprove)
             ),
+            # Read stored IT Notebook credentials without prompting for each retrieval.
+            # Separate grant from Auto-approve; PRIVILEGED rows always still prompt.
+            "autocredential_allowed": bool(
+                is_super or (user.role and user.role.can_use_ai_autocredential)
+            ),
             # Show the live token/cost meter? Visibility only - grants no capability.
             "cost_visible": bool(
                 is_super or (user.role and user.role.can_view_ai_cost)
@@ -1910,6 +1915,10 @@ class PiMultiSession(APIView):
             "auto_approve": bool(
                 (is_super or (user.role and user.role.can_use_ai_autoapprove))
                 and getattr(user, "ai_autoapprove_default", False)
+            ),
+            "auto_credential": bool(
+                (is_super or (user.role and user.role.can_use_ai_autocredential))
+                and getattr(user, "ai_autocredential_default", False)
             ),
             # mutate_allowed = may this session EVER write (role/super).
             # allow_mutating = initial state; a read_only request (e.g. AI Resolve)
@@ -1967,6 +1976,7 @@ class PiMultiSession(APIView):
                 "allowed_models": [_pi_model_dict(m) for m in allowed],
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
+                "autocredential_allowed": blob["autocredential_allowed"],
             }
         )
 
@@ -2082,12 +2092,15 @@ class AgentPiSession(APIView):
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(is_super or (user.role and user.role.can_use_ai_autoapprove)),
+            "autocredential_allowed": bool(is_super or (user.role and user.role.can_use_ai_autocredential)),
             # Show the live token/cost meter? Visibility only - grants no capability.
             "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             # Remembered preference (see accounts.User.ai_autoapprove_default): the device
             # chat had the same reset-on-refresh behaviour as the ticket chat.
             "auto_approve": bool((is_super or (user.role and user.role.can_use_ai_autoapprove))
                                  and getattr(user, "ai_autoapprove_default", False)),
+            "auto_credential": bool((is_super or (user.role and user.role.can_use_ai_autocredential))
+                                    and getattr(user, "ai_autocredential_default", False)),
             "mutate_allowed": bool(is_super or (user.role and user.role.can_use_ai_mutate)),
             "allow_mutating": bool(
                 (is_super or (user.role and user.role.can_use_ai_mutate))
@@ -2128,6 +2141,7 @@ class AgentPiSession(APIView):
                 "allowed_models": [model_dict(m) for m in allowed],
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
+                "autocredential_allowed": blob["autocredential_allowed"],
                 "operator_enabled": operator_policy["enabled"],
                 "operator_machines": [
                     {"agent_id": m["agent_id"], "hostname": m["hostname"]}

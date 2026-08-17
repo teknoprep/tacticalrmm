@@ -2333,6 +2333,9 @@ class AIDecisionSession(APIView):
         # auto-approve uses can_use_ai_autoapprove. Superusers get both.
         mut = bool(is_super or (user.role and user.role.can_use_ai_mutate))
         aa = bool(is_super or (user.role and user.role.can_use_ai_autoapprove))
+        # Auto-credential is its OWN grant, not a side effect of Auto-approve: approving a
+        # device change and handing over a live password are different decisions.
+        ac = bool(is_super or (user.role and user.role.can_use_ai_autocredential))
         enabled = AIModel.objects.filter(enabled=True, provider__enabled=True).select_related("provider")
         if is_super:
             allowed = list(enabled)
@@ -2375,6 +2378,10 @@ class AIDecisionSession(APIView):
             "mutate_allowed": mut,
             "allow_mutating": False,  # Write mode OFF by default - tech must enable it (needs can_use_ai_mutate)
             "autoapprove_allowed": aa,
+            # May this window read stored IT Notebook credentials without asking each time?
+            # PRIVILEGED rows are excluded from this and still prompt every time (enforced
+            # in the bridge, not here).
+            "autocredential_allowed": ac,
             # Show the live token/cost meter? Visibility only - grants no capability.
             "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             "allow_email": True,      # Allow customer email ON by default
@@ -2396,6 +2403,7 @@ class AIDecisionSession(APIView):
             # Start the chat in the state the operator last chose, not always OFF. Gated by
             # the role permission above, so remembering it can never grant it.
             "auto_approve": bool(aa and getattr(user, "ai_autoapprove_default", False)),
+            "auto_credential": bool(ac and getattr(user, "ai_autocredential_default", False)),
             # The customer-reply standard lives in the HELPDESK POLICY. The ticket chat is
             # the surface that actually answers customers, so it must receive it - it did
             # not, and produced replies below the standard while the policy sat unread.
@@ -2444,6 +2452,8 @@ class AIDecisionSession(APIView):
             "require_approval": True,
             "autoapprove_allowed": aa,
             "auto_approve": bool(aa and getattr(request.user, "ai_autoapprove_default", False)),
+            "autocredential_allowed": ac,
+            "auto_credential": bool(ac and getattr(request.user, "ai_autocredential_default", False)),
             "operator_enabled": operator_policy["enabled"],
             "operator_machines": [
                 {"agent_id": m["agent_id"], "hostname": m["hostname"]}

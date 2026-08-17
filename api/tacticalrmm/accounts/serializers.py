@@ -17,6 +17,7 @@ class UserUISerializer(ModelSerializer):
         fields = [
             "dark_mode",
             "ai_autoapprove_default",
+            "ai_autocredential_default",
             "show_community_scripts",
             "agent_dblclick_action",
             "url_action",
