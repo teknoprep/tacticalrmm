@@ -17,6 +17,7 @@ import { loadVerifiers, matchVerifier, inspectVerifiers } from "./verifier-runti
 import { trmm } from "./trmm.js";
 import * as history from "./history.js";
 import { makeCostMeter, silentStopMessage } from "./cost-meter.js";
+import { makeLlmRecovery } from "./llm-recovery.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
@@ -641,6 +642,11 @@ async function startChat(ws, blob) {
       site: facts?.site || "",
     },
   });
+  // Silent recovery from provider faults the harness does not recognise (see
+  // llm-recovery.js). A technician watching this window should not lose a turn to a
+  // transient blip the provider phrased in words pi-ai has no pattern for.
+  const recovery = makeLlmRecovery({ log, key: agentId, sessionId });
+
   const unsubscribe = session.subscribe((event) => {
     lastActivity = Date.now();
     // per-session observability so a "stuck" chat can be diagnosed from the log
@@ -654,6 +660,8 @@ async function startChat(ws, blob) {
       log("retry", agentId, sessionId, `attempt ${event.attempt}/${event.maxAttempts}: ${String(event.errorMessage || "").slice(0, 120)}`);
     } else if (event.type === "auto_retry_end") {
       log("retry_end", agentId, sessionId, event.success ? `recovered on attempt ${event.attempt}` : `gave up: ${String(event.finalError || "").slice(0, 120)}`);
+      // The harness's retry budget is authoritative: if IT gave up, do not keep going.
+      if (!event.success) recovery.noteHarnessGaveUp();
     } else if (event.type === "agent_start") {
       log("agent_start", agentId, sessionId);
     } else if (event.type === "agent_end") {
@@ -666,12 +674,20 @@ async function startChat(ws, blob) {
       // ends silently: nothing in the log, nothing in the browser. See I17.
       const why = String(event.message.errorMessage || "unknown provider error");
       log("llm_error", agentId, sessionId, why.slice(0, 400));
-      try {
-        ws.send(JSON.stringify({
-          type: "error",
-          message: `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
-        }));
-      } catch {}
+      // A content-free, token-free rejection is a request the provider dropped before it
+      // started. Retry it silently - exactly as the harness would have, had the error text
+      // matched its pattern list - and only bother the technician if that also fails.
+      if (recovery.consider(event.message)) {
+        log("llm_error_recoverable", agentId, sessionId, "no content, no tokens - will re-run silently");
+      } else {
+        try {
+          ws.send(JSON.stringify({
+            type: "error",
+            message: recovery.exhaustedNote(why)
+              || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
+          }));
+        } catch {}
+      }
     }
     // Fold usage into the meter and surface any non-answering stop (e.g. "length").
     if (event.type === "message_end" && event.message?.role === "assistant") {
@@ -777,10 +793,17 @@ async function startChat(ws, blob) {
       switch (msg.type) {
         case "prompt":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
+          recovery.beginTurn();
           if (session.isStreaming) {
             await session.prompt(msg.message, { streamingBehavior: "steer" });
           } else {
             await session.prompt(msg.message);
+          }
+          // prompt() resolves once the whole turn has settled (including the harness's own
+          // retries), so this is the point at which we know a blank rejection ended it.
+          // Loop rather than retry once: the recovery object owns the budget.
+          while (recovery.pending) {
+            if (!(await recovery.run(session))) break;
           }
           break;
         case "steer":
@@ -1177,6 +1200,8 @@ async function startDecisionChat(ws, blob) {
     },
   });
   const CHATTER_OPS = new Set(["reply_to_ticket", "add_note", "resolve_ticket"]);
+  // Same silent recovery as the device chat (see llm-recovery.js).
+  const recovery = makeLlmRecovery({ log, key: histKey, sessionId });
   const unsubscribe = session.subscribe((event) => {
     lastActivity = Date.now();
     if (event.type === "tool_execution_start") {
@@ -1187,15 +1212,23 @@ async function startDecisionChat(ws, blob) {
     } else if (event.type === "tool_execution_end") {
       toolsInFlight = Math.max(0, toolsInFlight - 1);
       log("tool<", histKey, sessionId, event.toolName, event.isError ? "ERROR" : "ok");
+    } else if (event.type === "auto_retry_end" && !event.success) {
+      log("retry_end", histKey, sessionId, `gave up: ${String(event.finalError || "").slice(0, 120)}`);
+      recovery.noteHarnessGaveUp();
     } else if (event.type === "message_end" && event.message?.stopReason === "error") {
       const why = String(event.message.errorMessage || "unknown provider error");
       log("llm_error", histKey, sessionId, why.slice(0, 400));
-      try {
-        ws.send(JSON.stringify({
-          type: "error",
-          message: `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
-        }));
-      } catch {}
+      if (recovery.consider(event.message)) {
+        log("llm_error_recoverable", histKey, sessionId, "no content, no tokens - will re-run silently");
+      } else {
+        try {
+          ws.send(JSON.stringify({
+            type: "error",
+            message: recovery.exhaustedNote(why)
+              || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
+          }));
+        } catch {}
+      }
     } else if (event.type === "agent_end") {
       log("agent_end", histKey, sessionId);
       const last = session.messages.filter((m) => m.role === "assistant").slice(-1)[0];
@@ -1280,8 +1313,13 @@ async function startDecisionChat(ws, blob) {
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           work.humanTurn();
           assignWorkingUser(); // fire-and-forget: claim the ticket for the working tech on first message
+          recovery.beginTurn();
           if (session.isStreaming) await session.prompt(msg.message, { streamingBehavior: "steer" });
           else await session.prompt(msg.message);
+          // See the device chat: re-run a blank provider rejection before telling the tech.
+          while (recovery.pending) {
+            if (!(await recovery.run(session))) break;
+          }
           break;
         case "steer":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });

@@ -7,10 +7,10 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/cost-meter.test.mjs && node test/tool-caps.test.mjs && node test/transcript.test.mjs && node test/device-hardware.test.mjs"
+    "test": "node test/cost-meter.test.mjs && node test/tool-caps.test.mjs && node test/transcript.test.mjs && node test/device-hardware.test.mjs && node --test test/llm-recovery.test.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
     "ioredis": "^5.4.1",
     "typebox": "^1.1.38",
     "ws": "^8.18.0"
