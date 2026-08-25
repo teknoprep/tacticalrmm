@@ -94,15 +94,22 @@ export const SURFACE_CLASSES = {
   // End-of-batch report finalizer. Files ONE combined ticket.
   report:        ["create", "read"],
   // Interactive device chat: a human is watching and approves each mutating call.
-  device_chat:   ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing"],
-  // Decision chat: a human is driving the ticket and approves each mutating call. The ONLY
-  // surface that may reach the credential store, and only with a per-request approval that
-  // Auto-approve cannot skip (see the `secret` branch of gate() in server.js).
-  // `secret_write` is here and nowhere else, for the same reason `secret` is: it is the
-  // only surface with a named technician present to instruct or approve it at the time.
-  // Deliberately NOT granted to device_chat - that surface cannot read the credential
-  // store either, and its gate takes a bare summary rather than a capability kind, so a
-  // grant there would silently land in the device-approval path instead of this one.
+  //
+  // `secret` was added 2026-08-25. It had been withheld because this surface's gate took a
+  // bare summary rather than a capability kind, so a grant would have landed credential
+  // reads in the device-approval path - where Auto-approve skips prompts. That is now
+  // fixed: startChat builds the same makeCredentialGate() the ticket chat uses and passes
+  // it as `secretGate`, and buildTools refuses a `secret` operation outright when that
+  // channel is absent. The reason to grant it is that a technician fixing a machine needs
+  // the customer's login for the same reasons a technician working a ticket does.
+  //
+  // `secret_write` stays out. Recording a credential is a decision about what the customer's
+  // record should say, and it belongs with the ticket that justifies it.
+  device_chat:   ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "secret"],
+  // Decision chat: a human is driving the ticket and approves each mutating call. Reaches
+  // the credential store under makeCredentialGate(), which Auto-approve cannot skip.
+  // `secret_write` is here and nowhere else: recording a credential is a decision about the
+  // customer's record, and the ticket is what justifies and dates it.
   decision_chat: ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "close", "secret", "secret_write", "sales"],
   // Ticket Console auto-resolve: read-only investigation, posts a note. Never closes,
   // never emails. Replaces the old blockOps name list (ISSUES.md I6).
@@ -197,15 +204,30 @@ export function checkOp({ surface, op, opClasses, mutating, grants }) {
 
 // Enforcement wrapper. Logs every denial either way so the warn-mode window produces
 // the evidence needed before switching to enforce.
+// Classes that are NEVER warn-only, whatever PI_CAPS_MODE says.
+//
+// `warn` exists so that tightening a capability cannot silently break a running
+// automation: the refusal is logged and the call still goes through, and an operator flips
+// to `enforce` once a day of real traffic has been reviewed. That is a sound default for
+// classes whose worst case is an unwanted ticket note.
+//
+// It is not sound for the credential store. On a surface that is not supposed to reach it,
+// `warn` would return the customer's live passwords to the model and write a log line
+// about it - and because a credential READ is not a mutating operation, no approval gate
+// stands behind the class check to catch it. There is no observation window worth that, so
+// these two classes are enforced from the moment they are checked.
+const ALWAYS_ENFORCED = new Set(["secret", "secret_write"]);
+
 export function gateOp(ctx) {
   const v = checkOp(ctx);
   if (v.allowed) return v;
+  const enforced = CAPS_MODE === "enforce" || ALWAYS_ENFORCED.has(v.cls);
   stamp(
-    `caps_${CAPS_MODE === "enforce" ? "deny" : "warn"}>`,
+    `caps_${enforced ? "deny" : "warn"}>`,
     `surface=${ctx.surface}`, `op=${ctx.op}`, `class=${v.cls || "unclassified"}`,
     `ref=${ctx.ref || "-"}`, `| ${v.reason}`,
   );
-  return { ...v, enforced: CAPS_MODE === "enforce" };
+  return { ...v, enforced };
 }
 
 // Operations this surface may actually call - used to filter the list advertised to

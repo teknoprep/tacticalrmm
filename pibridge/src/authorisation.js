@@ -48,18 +48,60 @@ const NOTEBOOK_NEGATED =
  * @returns { at, text } of the authorising sentence, or null
  */
 export function notebookWriteAuthorisation(techTurns) {
+  return scanNewestFirst(techTurns, NOTEBOOK_TARGET, NOTEBOOK_NEGATED,
+    (line) => ACTION_THEN_TARGET.test(line) || TARGET_THEN_ACTION.test(line));
+}
+
+// READING the PRIVILEGED rows - class `secret`, `opts.privileged`.
+//
+// Reported 2026-08-25: "even with auto-credential on it still asks for approval". It did,
+// and the gate was right to: every prompt was a privileged-row request, which no toggle
+// covers. What made it feel broken is that the model escalated to privileged rows on its
+// OWN initiative, seconds after a normal read, on practically every lookup - so the
+// technician saw a prompt every time and concluded the switch did nothing.
+//
+// The escalation itself is the thing to control, and the deployment already has a rule for
+// this shape of decision: `close` and `email` accept the technician's own instruction as
+// the authorisation, because a prompt asking them to confirm what they just typed protects
+// nobody. Reading a row the technician asked for is not a graver act than closing the
+// customer's ticket, so it follows the same rule.
+//
+// What it does NOT do is let the model decide. Absent an instruction, a privileged read
+// still prompts every single time, exactly as before.
+const PRIV_ROW = String.raw`(?:privileged|admin(?:istrator)?|domain admin|root|elevated|global admin|superuser|sa)`;
+const CRED_WORD = String.raw`(?:credential|cred|password|passwd|pwd|login|logon|account|user(?:name)?|row|entry|secret)`;
+// Both orders: "get the admin password" and "the password for the admin account".
+const PRIV_THEN_CRED = new RegExp(String.raw`\b${PRIV_ROW}\b[^.!?]{0,40}\b${CRED_WORD}s?\b`, "i");
+const CRED_THEN_PRIV = new RegExp(String.raw`\b${CRED_WORD}s?\b[^.!?]{0,40}\b${PRIV_ROW}\b`, "i");
+const PRIV_ANY = new RegExp(String.raw`\b${PRIV_ROW}\b`, "i");
+// "don't use the admin account", "not the domain admin one" - a refusal ends the search.
+const PRIV_NEGATED = new RegExp(
+  String.raw`\b(do ?n'?t|dont|do not|never|no need|not the|avoid|without|hold off|not yet|wait)\b[^.!?]{0,60}\b${PRIV_ROW}\b`,
+  "i",
+);
+
+/**
+ * Did the technician ask, in their own words, for the PRIVILEGED credential rows?
+ *
+ * @param techTurns  the technician's own turns, oldest first: [{ at, text }]
+ * @returns { at, text } of the authorising sentence, or null
+ */
+export function privilegedCredentialAuthorisation(techTurns) {
+  return scanNewestFirst(techTurns, PRIV_ANY, PRIV_NEGATED,
+    (line) => PRIV_THEN_CRED.test(line) || CRED_THEN_PRIV.test(line));
+}
+
+// Newest turn first, so a technician who changes their mind is obeyed rather than
+// out-voted by something they said earlier; and a refusal ENDS the search rather than
+// skipping the line, so "don't use the admin account" cannot be overridden by an older
+// "get the admin password".
+function scanNewestFirst(techTurns, mentions, negated, matches) {
   if (!Array.isArray(techTurns)) return null;
-  // Newest first: the most recent instruction is the operative one, so a technician who
-  // changes their mind is obeyed rather than out-voted by something they said earlier.
   for (let i = techTurns.length - 1; i >= 0; i--) {
     const line = String(techTurns[i]?.text || "");
-    if (!NOTEBOOK_TARGET.test(line)) continue;
-    // A refusal ENDS the search rather than skipping the line: "don't save it to the
-    // notebook, just show me" must not be overridden by an older "save it".
-    if (NOTEBOOK_NEGATED.test(line)) return null;
-    if (ACTION_THEN_TARGET.test(line) || TARGET_THEN_ACTION.test(line)) {
-      return { at: techTurns[i].at, text: line.slice(0, 300) };
-    }
+    if (!mentions.test(line)) continue;
+    if (negated.test(line)) return null;
+    if (matches(line)) return { at: techTurns[i].at, text: line.slice(0, 300) };
   }
   return null;
 }

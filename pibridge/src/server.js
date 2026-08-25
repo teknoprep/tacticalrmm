@@ -19,7 +19,7 @@ import * as history from "./history.js";
 import { makeCostMeter, silentStopMessage } from "./cost-meter.js";
 import { makeLlmRecovery } from "./llm-recovery.js";
 import { makeTurnWatchdog } from "./turn-watchdog.js";
-import { notebookWriteAuthorisation } from "./authorisation.js";
+import { notebookWriteAuthorisation, privilegedCredentialAuthorisation } from "./authorisation.js";
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
 import { makeRemoteBinding } from "./remote-room.js";
@@ -454,6 +454,65 @@ function uiTranscript(sessionManager, session) {
   return out.length ? out : session?.messages || [];
 }
 
+// ---- The credential-read policy, in ONE place --------------------------------
+//
+// Both chat surfaces reach the customer's stored logins, and they must treat them
+// identically. Before this existed the policy lived inline in the decision chat only, and
+// the device chat had no credential path at all; the moment it got one, the two would have
+// drifted - which is the whole failure mode this gate exists to prevent.
+//
+// The rules, in order:
+//   1. Ordinary row + Auto-credential ON + role permits  -> permitted, logged.
+//   2. PRIVILEGED row + the technician asked for it in their own words -> permitted,
+//      logged with the authorising sentence. Same standard `close` and `email` use: a
+//      prompt asking someone to confirm what they just typed protects nobody.
+//   3. Anything else -> ask, every time.
+//
+// Auto-APPROVE never appears here. It governs device changes; it has never covered
+// credentials and must not start by accident.
+function makeCredentialGate({ isOn, allowed, techSaid, prompt, log, key, sessionId }) {
+  // `sessionId` may be a getter: the session does not exist yet where this is built.
+  const sid = () => (typeof sessionId === "function" ? sessionId() : sessionId);
+  return async function credentialGate(summary, opts = {}) {
+    if (isOn() && allowed && !opts.privileged) {
+      log("credential read auto-permitted (Auto-credential)", key, sid(), String(summary).slice(0, 160));
+      return { ok: true };
+    }
+    if (opts.privileged && isOn() && allowed) {
+      const auth = privilegedCredentialAuthorisation(techSaid);
+      if (auth) {
+        log("privileged credential read authorised by tech", key, sid(), `"${auth.text.slice(0, 120)}"`);
+        return { ok: true, authorised_by: auth };
+      }
+    }
+    // SAY WHY THE SWITCH DID NOT APPLY (reported 2026-08-19, and again 2026-08-25).
+    //
+    // The first report was a session where every prompt was a privileged-row request, which
+    // no toggle covers - the gate was right and the prompt never said so, so the reasonable
+    // conclusion was that the feature was broken. The second was the same symptom with a
+    // different cause: the model was escalating to privileged rows on its own initiative
+    // after every ordinary read, because the tool result told it to. Rule 2 above and the
+    // rewritten helpdesk.js text handle that; this message handles the rest.
+    //
+    // A safeguard that looks like a malfunction gets worked around, so explaining it is
+    // part of enforcing it.
+    const privBlocked = opts.privileged && isOn() && allowed;
+    const ask = privBlocked
+      ? `${summary}\n\nAuto-credential is ON, but you have not asked for the privileged rows ` +
+        `in this chat, and the AI has requested them on its own initiative. Approving here ` +
+        `releases them once. If you do want them, say so in the chat and it will not ask again.`
+      : summary;
+    if (privBlocked) {
+      log("credential prompt (privileged, self-directed - not covered by Auto-credential)",
+          key, sid(), String(summary).slice(0, 160));
+    }
+    const ok = await prompt(ask);
+    if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
+    log("credential read permitted by tech", key, sid(), String(summary).slice(0, 160));
+    return { ok: true };
+  };
+}
+
 // ---- WebSocket session lifecycle -------------------------------------------
 async function startChat(ws, blob) {
   const facts = blob.device_facts;
@@ -514,9 +573,34 @@ async function startChat(ws, blob) {
   let readonly = !blob.allow_mutating;
   if (!mutateAllowed) readonly = true; // can never write
   const techSaid = [];
+
+  // AUTO-CREDENTIAL on the device chat. Same role permission, same policy object and the
+  // same audit line as the ticket chat - see makeCredentialGate(). A technician fixing a
+  // machine needs the customer's login for exactly the reasons a technician working a
+  // ticket does, and having the switch on one surface and not the other was not a policy
+  // decision, it was where the feature happened to be built first.
+  const autocredentialAllowed = !!blob.autocredential_allowed;
+  let autoCredential = !!blob.auto_credential && autocredentialAllowed;
+  const credentialGate = makeCredentialGate({
+    isOn: () => autoCredential,
+    allowed: autocredentialAllowed,
+    techSaid,
+    // NOT requestApproval: that one returns true when Auto-approve is on, and Auto-approve
+    // has never covered credentials. This surface's approval helper is the reason the
+    // `secret` class was kept away from it, so the gate brings its own prompt.
+    prompt: (ask) => new Promise((resolve) => {
+      const id = randomUUID();
+      pendingApprovals.set(id, resolve);
+      ws.send(JSON.stringify({ type: "approval_request", id, summary: ask }));
+      remote?.onApprovalRequest(id, ask);
+    }),
+    log, key: agentId, sessionId: () => sessionId,
+  });
+
   const { tools, mutating, machines: toolMachines } = buildTools({
     machines,
     gate: requestApproval,
+    secretGate: credentialGate,
     surface: "device_chat",   // human watching; approves each mutating call
     mutateAllowed,
     isReadonly: () => readonly,
@@ -804,6 +888,9 @@ async function startChat(ws, blob) {
       mutate_allowed: mutateAllowed,
       // Whether this operator's role may see the running cost meter.
       cost_visible: !!blob.cost_visible,
+      // Auto-credential: same permission and same switch as the ticket chat.
+      autocredential_allowed: autocredentialAllowed,
+      auto_credential: autoCredential,
       // Does this window offer the Remote (phone) button? Role + global switch + relay.
       remote_allowed: !!blob.remote_allowed && !!blob.remote_relay_url,
       context_window: Number(model?.contextWindow || 0),
@@ -967,6 +1054,14 @@ async function startChat(ws, blob) {
         case "set_autoapprove":
           autoApprove = !!msg.value && blob.autoapprove_allowed;
           ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove }));
+          break;
+        case "set_autocredential":
+          // Gated by the role, exactly like the ticket chat: remembering a choice, or
+          // receiving one over the socket, can never grant the permission itself.
+          autoCredential = !!msg.value && autocredentialAllowed;
+          log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
+              agentId, sessionId, `by ${blob.username || "?"}`);
+          ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential }));
           break;
         case "set_readonly":
           // operator toggles read-only <-> write; only honored if the role can write
@@ -1175,6 +1270,16 @@ async function startDecisionChat(ws, blob) {
   // model would be closing on its own authority. Same reasoning for an irreversible
   // outbound customer email. This mirrors the identity/access gate, which already applies
   // "EVEN in Write mode / Auto-approve".
+  // The shared credential policy. `prompt` is requestApproval directly: on this surface it
+  // never consults Auto-approve, so a credential prompt is always a real prompt.
+  const credentialGate = makeCredentialGate({
+    isOn: () => autoCredential,
+    allowed: autocredentialAllowed,
+    techSaid,
+    prompt: (ask) => requestApproval(ask),
+    log, key: histKey, sessionId: () => sessionId,
+  });
+
   async function gate(kind, summary, opts = {}) {
     if (kind === "device") {
       if (readonly) return { ok: false, reason: "the chat is in READ-ONLY mode - switch on Write mode to make device changes." };
@@ -1195,58 +1300,8 @@ async function startDecisionChat(ws, blob) {
       // a human sees the actual words first. Auto-approve cannot skip this.
       return { ok: await requestApproval(summary) };
     }
-    // CREDENTIALS. The technician must permit each retrieval, in this window, at the time.
-    // No Write mode involvement (this reads nothing on a device), no Auto-approve skip, and
-    // deliberately NO "they already said so earlier in the conversation" shortcut of the kind
-    // `close` and `email` have: those infer authority from a sentence the tech typed about a
-    // ticket, which is a reasonable reading for a reply or a close and an unreasonable one for
-    // handing a live password to a model. If they want it, they can answer the prompt.
-    if (kind === "secret") {
-      // AUTO-CREDENTIAL is the one sanctioned exception, and it is narrow on purpose.
-      //
-      // The rule above still holds for everything it does not cover: a sentence the tech
-      // typed earlier never counts as permission to hand over a password. What changed is
-      // that a technician whose ROLE carries can_use_ai_autocredential can now say so ONCE,
-      // deliberately, with a switch at the top of the window - a standing instruction they
-      // can see and revoke, not an inference drawn from their prose.
-      //
-      // Two things it never covers:
-      //   1. PRIVILEGED rows. Those are withheld by default for a reason; asking for them
-      //      is an escalation and escalations get a human. No toggle skips this.
-      //   2. The audit line. Silent to the technician is not the same as unrecorded - an
-      //      automatic read is logged exactly like a prompted one, and says which switch
-      //      allowed it.
-      if (autoCredential && autocredentialAllowed && !opts.privileged) {
-        log("credential read auto-permitted (Auto-credential)", histKey, sessionId, String(summary).slice(0, 160));
-        return { ok: true };
-      }
-      // SAY WHY THE SWITCH DID NOT APPLY (reported 2026-08-19: "Auto-credential is on and
-      // it's still asking me to approve credential access").
-      //
-      // It was working correctly - every prompt in that session was a PRIVILEGED-row
-      // request, which no toggle skips. But the prompt only said the rows were "normally
-      // withheld", never that the switch they had just turned on deliberately does not
-      // cover them, so the reasonable conclusion was that the feature was broken. The log
-      // shows what that costs: three approvals, then the technician toggling
-      // Auto-credential off and back on to try to fix something that was not wrong.
-      //
-      // A safeguard that looks like a malfunction gets worked around, so explaining it is
-      // part of enforcing it.
-      const privBlocked = opts.privileged && autoCredential && autocredentialAllowed;
-      const ask = privBlocked
-        ? `${summary}\n\nAuto-credential is ON, but it deliberately does NOT cover privileged ` +
-          `rows - those ask you every time. Nothing is broken; approving here is the only way ` +
-          `to release a privileged row.`
-        : summary;
-      if (privBlocked) {
-        log("credential prompt (privileged - Auto-credential does not cover it)",
-            histKey, sessionId, String(summary).slice(0, 160));
-      }
-      const ok = await requestApproval(ask);
-      if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
-      log("credential read permitted by tech", histKey, sessionId, String(summary).slice(0, 160));
-      return { ok: true };
-    }
+    // CREDENTIALS. One policy for both chat surfaces - see makeCredentialGate() above.
+    if (kind === "secret") return credentialGate(summary, opts);
     // RECORDING a credential / IT Notebook row. Two routes in, no toggle past.
     //
     // The technician asked for this feature because the AI kept doing the work and then

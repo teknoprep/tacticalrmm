@@ -568,6 +568,12 @@ export function buildTools({
   // whose author declared a reply register). Intersected with capabilities.GRANTABLE, so
   // this can only ever add `customer` - never closing or routing authority.
   grants = [],
+  // The credential-read policy (server.js makeCredentialGate). Kept SEPARATE from `gate`
+  // on purpose: `gate` here is the device-approval helper, which returns true when
+  // Auto-approve is on, and Auto-approve has never covered the customer's stored logins.
+  // Absent, a `secret` operation is refused outright rather than falling back to `gate` -
+  // a missing credential policy must not silently downgrade to the device one.
+  secretGate = null,
   // Product code verifies the technician's OWN chat text before global/shared KB
   // authoring. The model cannot grant this to itself by claiming it was asked.
   globalKnowledgeAuthorisation = () => null,
@@ -1191,6 +1197,36 @@ export function buildTools({
       if (p.args) {
         try { args = JSON.parse(p.args); }
         catch (e) { return text(`args must be valid JSON: ${e.message}`); }
+      }
+      // CREDENTIALS. Class `secret` - the customer's live usernames and passwords. This is
+      // NOT routed through `gate`: a credential read is not a mutating operation, so the
+      // mutating check below would let it straight through, and `gate` would honour
+      // Auto-approve even if it did catch it. It gets its own policy or it does not run.
+      if (cap.cls === "secret") {
+        if (!secretGate)
+          return text(
+            "Not permitted: this surface has no credential-approval channel, so stored " +
+              "logins cannot be read here. Do not retry, and do not ask the customer for " +
+              "their password.",
+          );
+        const who = args.company_name || args.partner_id || "this company";
+        const wantsPriv = !!args.include_privileged;
+        // The privileged flag travels as DATA, not as a phrase in the summary: it decides
+        // whether Auto-credential may cover this read, and a gate must never have to parse
+        // English to work that out.
+        const g = await secretGate(
+          `Read STORED CREDENTIALS (IT Notebook) for ${who}. ` +
+            `The AI will be able to see the usernames and passwords it returns.` +
+            (wantsPriv
+              ? ` IT IS ALSO ASKING FOR THE PRIVILEGED ROWS, which are normally withheld.`
+              : ` Privileged rows will be withheld.`),
+          { privileged: wantsPriv },
+        );
+        if (!g.ok)
+          return text(
+            (g.reason || "Reading the stored credentials was not permitted.") +
+              " Do not retry it and do not ask the customer for their password.",
+          );
       }
       let globalKnowledgeAuth = null;
       if (op === "create_global_kb_article") {
