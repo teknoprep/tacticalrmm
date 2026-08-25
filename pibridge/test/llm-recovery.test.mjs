@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isBlankProviderFailure, makeLlmRecovery } from "../src/llm-recovery.js";
+import { isBlankProviderFailure, isWatchdogStallAbort, makeLlmRecovery } from "../src/llm-recovery.js";
 
 const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
@@ -199,4 +199,144 @@ test("a number that is not a status is not read as one", () => {
 
 test("the original xAI fault is still recoverable after the status change", () => {
   assert.equal(isBlankProviderFailure(xaiBlank), true);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: 2026-08-18, TrueNAS speed-test chat. Asked for a long technical
+// email, grok-4.5 went silent for 208s building a ~20k-char send_email argument,
+// the stall watchdog aborted the turn, and because an abort is "somebody pressed
+// stop" to every retry layer, the chat simply stopped. Twice. No email.
+// ---------------------------------------------------------------------------
+
+/** The exact message shape observed on 2026-08-18, session 01a014e5. */
+const watchdogAbort = {
+  role: "assistant",
+  stopReason: "aborted",
+  errorMessage: "OpenAI Responses stream ended before a terminal response event",
+  content: [
+    { type: "thinking", thinking: "The user wants me to send a technical email report..." },
+    { type: "text", text: "Sending a technical performance report to chris@blueuc.com..." },
+  ],
+  usage: { ...zero, totalTokens: 0 },
+};
+
+const stallSession = () => {
+  const messages = [{ role: "user", content: "email me the report" }, { ...watchdogAbort }];
+  return {
+    continued: () => messages.length,
+    agent: {
+      state: {
+        get messages() { return messages.slice(); },
+        set messages(v) { messages.length = 0; messages.push(...v); },
+      },
+      continue: async () => {},
+    },
+  };
+};
+
+test("the blank-failure path cannot see a watchdog abort - this is why it was lost", () => {
+  // stopReason is "aborted", not "error", and it printed a preamble: two independent
+  // reasons the old classifier said no. Kept as a statement of the actual bug.
+  assert.equal(isBlankProviderFailure(watchdogAbort), false);
+});
+
+test("a watchdog abort has the right shape, preamble and all", () => {
+  assert.equal(isWatchdogStallAbort(watchdogAbort), true);
+  assert.equal(isWatchdogStallAbort({ ...watchdogAbort, stopReason: "cancelled" }), true);
+  // Not an abort at all.
+  assert.equal(isWatchdogStallAbort({ ...watchdogAbort, stopReason: "stop" }), false);
+  assert.equal(isWatchdogStallAbort({ ...watchdogAbort, role: "user" }), false);
+  assert.equal(isWatchdogStallAbort(null), false);
+});
+
+test("an aborted turn that emitted a tool call is never re-run", () => {
+  // It may already have sent the email. A wedged chat beats sending it twice.
+  assert.equal(isWatchdogStallAbort({
+    ...watchdogAbort,
+    content: [...watchdogAbort.content, { type: "toolCall", toolName: "send_email" }],
+  }), false);
+});
+
+test("an abort nobody claimed is the technician pressing Stop - never retried", async () => {
+  const r = makeLlmRecovery({ log: () => {}, baseDelayMs: 1 });
+  r.beginTurn();
+  assert.equal(r.isOwnStallAbort(watchdogAbort), false, "unclaimed");
+  assert.equal(r.consider(watchdogAbort), false);
+  assert.equal(r.pending, false);
+});
+
+test("an abort the watchdog claimed IS retried, preamble notwithstanding", async () => {
+  const logs = [];
+  const r = makeLlmRecovery({ log: (...a) => logs.push(a[0]), baseDelayMs: 1 });
+  r.beginTurn();
+  r.noteWatchdogStall(208);
+  assert.equal(r.stallSilentFor, 208);
+  assert.equal(r.isOwnStallAbort(watchdogAbort), true);
+  assert.equal(r.consider(watchdogAbort), true, "should arm");
+
+  const session = stallSession();
+  assert.equal(await r.run(session), true);
+  // The aborted message left live state so continue() resumes from the user's request.
+  assert.equal(session.continued(), 1);
+  assert.ok(logs.includes("llm_recover"));
+});
+
+test("the claim is released before the re-run, so a real Stop still stops", async () => {
+  const r = makeLlmRecovery({ log: () => {}, baseDelayMs: 1, maxStallAttempts: 5 });
+  r.beginTurn();
+  r.noteWatchdogStall(190);
+  r.consider(watchdogAbort);
+  await r.run(stallSession());
+  // Mid-retry the technician presses Stop: that abort is theirs, not ours.
+  assert.equal(r.isOwnStallAbort(watchdogAbort), false);
+  assert.equal(r.consider(watchdogAbort), false, "an unclaimed abort must be honoured");
+});
+
+test("the stall budget is finite and says something useful when spent", async () => {
+  const r = makeLlmRecovery({ log: () => {}, baseDelayMs: 1, maxStallAttempts: 1 });
+  r.beginTurn();
+  r.noteWatchdogStall(208);
+  assert.equal(r.consider(watchdogAbort), true);
+  await r.run(stallSession());
+  // Second stall on the same request: the widened budget did not help either.
+  r.noteWatchdogStall(560);
+  assert.equal(r.consider(watchdogAbort), false, "budget exhausted");
+  const note = r.exhaustedNote("stall watchdog aborted the turn");
+  assert.match(note, /2 times/);
+  assert.match(note, /conversation is intact/);
+  assert.match(note, /in pieces/, "must tell the tech how to get the work done");
+});
+
+test("a new prompt clears the claim and refills the stall budget", async () => {
+  const r = makeLlmRecovery({ log: () => {}, baseDelayMs: 1, maxStallAttempts: 1 });
+  r.beginTurn();
+  r.noteWatchdogStall(208);
+  r.consider(watchdogAbort);
+  await r.run(stallSession());
+  r.noteWatchdogStall(560);
+  assert.equal(r.consider(watchdogAbort), false, "spent for this turn");
+
+  r.beginTurn();
+  assert.equal(r.isOwnStallAbort(watchdogAbort), false, "stale claim must not survive");
+  r.noteWatchdogStall(208);
+  assert.equal(r.consider(watchdogAbort), true, "fresh turn, fresh budget");
+});
+
+test("stall and blank-rejection budgets are independent", async () => {
+  const r = makeLlmRecovery({ log: () => {}, baseDelayMs: 1, maxAttempts: 1, maxStallAttempts: 1 });
+  r.beginTurn();
+  // Spend the stall budget...
+  r.noteWatchdogStall(208);
+  assert.equal(r.consider(watchdogAbort), true);
+  await r.run(stallSession());
+  // ...the provider-fault budget is untouched.
+  assert.equal(r.consider(xaiBlank), true, "a different fault, a different budget");
+});
+
+test("the harness giving up stands down the stall path too", () => {
+  const r = makeLlmRecovery({ log: () => {}, baseDelayMs: 1 });
+  r.beginTurn();
+  r.noteHarnessGaveUp();
+  r.noteWatchdogStall(208);
+  assert.equal(r.consider(watchdogAbort), false);
 });

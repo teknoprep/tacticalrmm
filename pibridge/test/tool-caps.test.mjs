@@ -204,3 +204,55 @@ console.log(
     `(200,000-token window)`,
 );
 console.log("\nAll cap assertions passed.\n");
+
+// ---------------------------------------------------------------------------
+// Regression 2026-08-19: helpdesk_call had TEN return paths and they disagreed.
+// Six returned JSON.stringify(out) with no cap at all - a ticket-list query put a
+// 2,289 KB payload (~570k tokens) straight into a live context on 2026-08-11 - and the
+// capped ones used .slice(), which cuts a JSON string mid-structure so the model
+// receives syntactically broken data with no indication anything is missing.
+// ---------------------------------------------------------------------------
+import { capJson as _capJson, capString as _capString } from "../src/tools.js";
+
+function check(name, fn) {
+  try { fn(); console.log(`ok   ${name}`); }
+  catch (e) { console.log(`FAIL ${name}: ${e.message}`); process.exitCode = 1; }
+}
+
+const tickets = Array.from({ length: 4000 }, (_, i) => ({
+  ref: `TICKET/${59000 + i}`,
+  subject: "Hamilton IBMi Cert. ".repeat(4),
+  company: "Hamilton Equipment",
+  body: "x".repeat(400),
+}));
+
+check("a huge ticket list is capped to the budget", () => {
+  const out = _capJson(tickets, { what: "helpdesk" });
+  assert.ok(bytes(out) <= CAP + 400, `capped output was ${bytes(out)} bytes`);
+});
+
+check("the capped result is still parseable JSON", () => {
+  const out = _capJson(tickets, { what: "helpdesk" });
+  const body = out.startsWith("NOTE:") ? out.slice(out.indexOf("\n\n") + 2) : out;
+  const parsed = JSON.parse(body);          // .slice() would have thrown here
+  assert.ok(Array.isArray(parsed) && parsed.length > 0);
+  assert.equal(parsed[0].ref, "TICKET/59000", "keeps whole entries from the start");
+});
+
+check("it tells the model it was capped and not to re-run", () => {
+  const out = _capJson(tickets, { what: "helpdesk" });
+  assert.match(out, /showing \d+ of 4000 helpdesk entries/);
+  assert.match(out, /do not re-run this call as-is/i);
+});
+
+check("a small result is passed through untouched", () => {
+  const small = [{ ref: "TICKET/1", subject: "hi" }];
+  assert.equal(_capJson(small, { what: "helpdesk" }), JSON.stringify(small, null, 2));
+});
+
+check("truncated plain text says so", () => {
+  const out = _capString("y".repeat(50000), 20000, "device command output");
+  assert.ok(bytes(out) <= 20000 + 400);
+  assert.match(out, /TRUNCATED by pi-trmm-bridge/);
+  assert.match(out, /Do NOT retry the same broad call/);
+});

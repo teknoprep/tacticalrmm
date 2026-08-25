@@ -129,6 +129,18 @@ export function makeCostMeter({
      * Warn before switching model: the new provider must re-cache the whole context.
      * Called from the set_model handler, BEFORE the switch is applied.
      */
+    /**
+     * A compaction just rewrote the history, so the context figure from the last turn is
+     * now wrong - and it is the number that drives both the meter and the warnings above.
+     * Correct it immediately rather than waiting for the next turn's usage, or the UI keeps
+     * showing the old size and re-warns about a problem that was just solved.
+     */
+    noteCompaction(tokensAfter) {
+      const n = num(tokensAfter);
+      if (n > 0) contextTokens = n;
+      return meter.snapshot();
+    },
+
     previewModelSwitch(newModel, displayName) {
       // A FORECAST, not accounting: no usage exists yet, so this is the only place we
       // touch published rates. Tiered pricing may make the real charge higher, hence
@@ -139,8 +151,9 @@ export function makeCostMeter({
         warn(
           `Switching to ${displayName} will re-send this conversation ` +
             `(${contextTokens.toLocaleString("en-US")} tokens) into that model's cache: ` +
-            `about $${cost.toFixed(2)} before it answers anything. Starting a NEW chat on ` +
-            `${displayName} avoids that cost.`,
+            `about $${cost.toFixed(2)} before it answers anything. Type /compact FIRST to ` +
+            `summarise the conversation and cut most of that, or start a NEW chat on ` +
+            `${displayName} to avoid it entirely.`,
           `switch preview ${displayName} ctx=${contextTokens} est=$${cost.toFixed(4)}`,
         );
       }
@@ -217,8 +230,9 @@ export function makeCostMeter({
         warn(
           `Context is ${Math.round((contextTokens / contextWindow) * 100)}% full ` +
             `(${contextTokens.toLocaleString("en-US")} / ` +
-            `${contextWindow.toLocaleString("en-US")} tokens). Start a new chat soon, or the ` +
-            `next turn may be cut off before it can answer.`,
+            `${contextWindow.toLocaleString("en-US")} tokens). Type /compact to summarise the ` +
+            `conversation and keep working in it, or start a new chat. Otherwise the next ` +
+            `turn may be cut off before it can answer.`,
           `ctx ${contextTokens}/${contextWindow}`,
         );
       }

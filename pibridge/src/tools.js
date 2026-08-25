@@ -382,6 +382,94 @@ const PRIVILEGED_PATTERNS = [
   // ACL / share permission changes
   /\bset-acl\b/i, /\bicacls\b.*\/(grant|deny|remove)/i, /\bcacls\b.*\/(g|d|e)/i,
 ];
+// Mask anything that looks like a secret before it reaches an approval prompt, an audit
+// line or the chat transcript. The technician must see WHICH fields are being written and
+// to which row, and must NOT need the password splashed across the conversation to find
+// out. (The owner's own words when asking for this feature: "I did not put the password in
+// the ticket note - secrets stay out of chatter.")
+//
+// Keyed on the FIELD NAME, not the value: guessing at values is how a redactor misses the
+// one that mattered, and an IT Notebook column is named by a human who intended it to be
+// read - "Admin Pass", "api_key", "Secret".
+const SECRETISH_FIELD = /(pass|pwd|secret|token|api[_\s-]?key|private[_\s-]?key|credential|passphrase)/i;
+export function describeSecretFields(fields) {
+  const out = [];
+  for (const [k, v] of Object.entries(fields || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    if (typeof v === "object") continue;
+    const s = String(v);
+    out.push(SECRETISH_FIELD.test(k)
+      ? `  ${k} = ******** (${s.length} chars, hidden)`
+      : `  ${k} = ${s.length > 120 ? s.slice(0, 120) + "\u2026" : s}`);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Build everything the technician and the audit trail need for an IT Notebook write:
+ * the approval prompt (with secret-looking columns masked) and the column names for the
+ * provenance note. Pure and exported so it is testable - the inline version of this was
+ * where a ReferenceError hid until a technician hit it in production.
+ *
+ * Accepts the shapes the model actually sends: a named-column object under `row`
+ * (preferred), `fields`, or a positional `values` array.
+ */
+export function notebookWriteSummary({ operation = "", args = {}, params = {}, ticketRef = "" } = {}) {
+  const A = args || {};
+  const P = params || {};
+  const pick = (...names) => {
+    for (const n of names) {
+      if (A[n] !== undefined && A[n] !== null && A[n] !== "") return A[n];
+      if (P[n] !== undefined && P[n] !== null && P[n] !== "") return P[n];
+    }
+    return undefined;
+  };
+
+  const named = pick("row", "fields");
+  const values = pick("values");
+  const who = pick("company_name", "partner_id") ?? "this company";
+  const notebook = pick("notebook_id", "notebook") ?? "IT Notebook";
+  // What identifies the row being touched, for the prompt and the note.
+  const rowRef = pick("row_id", "match_info", "match_value") ??
+    (named && typeof named === "object" && !Array.isArray(named) ? named.Info || named.info : "") ?? "";
+
+  let shown = "";
+  let columns = [];
+  if (named && typeof named === "object" && !Array.isArray(named)) {
+    shown = describeSecretFields(named);
+    columns = Object.keys(named).filter((k) => {
+      const v = named[k];
+      return v !== undefined && v !== null && v !== "" && typeof v !== "object";
+    });
+  } else if (Array.isArray(values)) {
+    // Positional form: there are no column names to key masking on, so mask every
+    // non-empty value. A technician approving a positional write is approving the row,
+    // and guessing which slot is the password is exactly how one gets printed.
+    shown =
+      `  ${values.length} positional values (all hidden - a positional write has no column\n` +
+      `  names to tell a password from a hostname, so none are shown):\n` +
+      values
+        .map((v, i) => {
+          const s = v == null ? "" : String(v);
+          return `  [${i}] = ${s ? `******** (${s.length} chars, hidden)` : "(blank)"}`;
+        })
+        .join("\n");
+    columns = [`${values.length} positional values`];
+  }
+
+  const del = /delete|remove|unlink/i.test(String(operation));
+  const verb = del ? "DELETE a row from" : rowRef ? "SAVE (create or update) a row in" : "SAVE a new row to";
+  // `notebook` falls back to the words "IT Notebook", so do not print them twice.
+  const label = String(notebook) === "IT Notebook" ? "the IT Notebook" : `IT Notebook ${notebook}`;
+  const summary =
+    `${verb} ${label} for ${who}` +
+    `${rowRef ? ` (row: ${rowRef})` : ""}${ticketRef ? `, on ${ticketRef}` : ""}:\n\n` +
+    `${shown || "(no field values supplied)"}\n\n` +
+    `This changes what the stored documentation says. Passwords are hidden above.`;
+
+  return { summary, columns, rowRef: rowRef || "", notebook, who, operation: String(operation) };
+}
+
 export function privilegedMatch(command) {
   const s = String(command || "");
   return PRIVILEGED_PATTERNS.some((re) => re.test(s));
@@ -753,7 +841,7 @@ export function buildTools({
         },
         { signal },
       );
-      return text(typeof out === "string" ? out : JSON.stringify(out));
+      return text(typeof out === "string" ? capString(out) : capJson(out, { what: "helpdesk" }));
     },
   });
 
@@ -799,7 +887,7 @@ export function buildTools({
       const ok = await gateFor(m, `Kill process PID ${p.pid} on device`);
       if (!ok) return denied();
       const out = await trmm.killProcess(m.agentId, p.pid, { signal });
-      return text(typeof out === "string" ? out : JSON.stringify(out));
+      return text(typeof out === "string" ? capString(out) : capJson(out, { what: "helpdesk" }));
     },
   });
 
@@ -919,7 +1007,7 @@ export function buildTools({
       const ok = await gateFor(m, `REBOOT the device now`);
       if (!ok) return denied();
       const out = await trmm.reboot(m.agentId, { signal });
-      return text(typeof out === "string" ? out : JSON.stringify(out));
+      return text(typeof out === "string" ? capString(out) : capJson(out, { what: "helpdesk" }));
     },
   });
 
@@ -1021,7 +1109,7 @@ export function buildTools({
         },
         { signal },
       );
-      return text(typeof out === "string" ? out : JSON.stringify(out));
+      return text(typeof out === "string" ? capString(out) : capJson(out, { what: "helpdesk" }));
     },
   });
 
@@ -1224,7 +1312,7 @@ export function buildTools({
           agent_id: m.agentId, ticket_ref: "", action: p.action,
           run_at: p.run_at, allow_mutating: p.allow_mutating !== false,
         });
-        return text(typeof out === "string" ? out : JSON.stringify(out));
+        return text(typeof out === "string" ? capString(out) : capJson(out, { what: "helpdesk" }));
       } catch (e) { return text("schedule_action failed: " + (e?.message || e)); }
     },
   });
@@ -1528,7 +1616,7 @@ export function buildTicketTriageTools({ helpdeskCode, helpdeskApi } = {}) {
   catch (e) { hdError = e.message; }
   const hdcall = async (op, args) => {
     if (!hd || !hd.operations[op]) return text(`operation ${op} not available`);
-    try { const out = await hd.operations[op](args); return text(typeof out === "string" ? out : JSON.stringify(out).slice(0, 20000)); }
+    try { const out = await hd.operations[op](args); return text(typeof out === "string" ? capString(out, 20000) : capJson(out, { maxBytes: 20000, what: "helpdesk" })); }
     catch (e) { return text(`${op} failed: ${e?.message || e}`); }
   };
 
@@ -1547,7 +1635,7 @@ export function buildTicketTriageTools({ helpdeskCode, helpdeskApi } = {}) {
       if (!op) return text("This helpdesk integration defines no get_ticket operation.");
       try {
         const out = await op({ ticket: p.ticket });
-        return text(typeof out === "string" ? out : JSON.stringify(out).slice(0, 30000));
+        return text(typeof out === "string" ? capString(out, 30000) : capJson(out, { maxBytes: 30000, what: "helpdesk" }));
       } catch (e) {
         return text("get_ticket failed: " + (e?.message || e));
       }
@@ -1756,6 +1844,39 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         // customer's message - the customer must not read our approval plumbing.
         replyAuth = g.authorised_by || null;
       }
+      // RECORDING A CREDENTIAL (IT Notebook row). The AI may do the work; the decision to
+      // write it down stays with the technician - either they instructed it in their own
+      // words, or they approve the prompt. Denied outright on every other surface by
+      // SURFACE_CLASSES, so this branch is the only way in.
+      //
+      // The prompt shows the ROW, with secret-looking fields masked. A technician cannot
+      // sensibly approve "write something somewhere", and equally must not have the
+      // password splashed into the transcript to find out what they are approving.
+      let notebookAuth = null;
+      let notebookWrote = null;
+      if (cap.cls === "secret_write") {
+        // Everything shown to the technician is built by notebookWriteSummary(), which is
+        // a pure exported function so it can be tested. The first version of this branch
+        // was inline and referenced an `op` variable that does not exist in this scope -
+        // a ReferenceError that only fired when a technician actually tried to save a row,
+        // because nothing here was reachable from a test. Hence the extraction.
+        notebookWrote = notebookWriteSummary({
+          operation: p.operation,
+          args: p.args || {},
+          params: p,
+          ticketRef,
+        });
+        const g = gate
+          ? await gate("secret_write", notebookWrote.summary)
+          : { ok: false, reason: "no approval channel available - the IT Notebook can only be written from the ai-decision window." };
+        if (!g.ok) {
+          return text(
+            (g.reason || "Writing to the IT Notebook was not permitted.") +
+            " Show the technician the row you would have saved, as a table they can paste, and continue with the rest of the work.",
+          );
+        }
+        notebookAuth = g.authorised_by || null;
+      }
       // CREDENTIALS: the technician permits each retrieval at the time. Denied outright on
       // every other surface by SURFACE_CLASSES, so this branch is the only way in.
       if (cap.cls === "secret") {
@@ -1827,6 +1948,26 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
             detail: `${p.operation} via the ticket chat`,
           }).catch(() => { /* credit is bookkeeping; never fail the operation for it */ });
         }
+        // A credential that changed with nothing recording who decided it is precisely the
+        // audit hole this class exists to close. The note goes in the ticket, so it carries
+        // the ROW and the AUTHORITY and never a value - column names only.
+        // (Not routed through trmm.creditAction: that endpoint takes a fixed set of action
+        // names and inventing one here would fail silently against an API this code cannot
+        // see. The bridge log and this note are the record.)
+        if (notebookWrote && hd.operations.add_note) {
+          try {
+            const how = notebookAuth
+              ? `on the technician's instruction in the AI chat` +
+                `${notebookAuth.at ? ` at ${notebookAuth.at.slice(11, 16)} UTC` : ""}: ` +
+                `"${String(notebookAuth.text).replace(/\s+/g, " ").trim()}"`
+              : `with the technician's approval in the AI chat`;
+            await hd.operations.add_note({ ticket: ticketRef, message:
+              `[IT Notebook updated ${how}. Target: ${notebookWrote.notebook}` +
+              `${notebookWrote.rowRef ? `, row "${notebookWrote.rowRef}"` : ""}` +
+              `${notebookWrote.columns.length ? `. Columns written: ${notebookWrote.columns.join(", ")}` : ""}` +
+              `. Values are stored in the notebook only - no credential is recorded in this ticket.]` });
+          } catch (e) { /* the row is saved; a failed provenance note must not undo that */ }
+        }
         if (replyAuth && hd.operations.add_note) {
           // Best-effort: the reply already went out; a failed note must not fail the call.
           try {
@@ -1836,7 +1977,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
               `"${String(replyAuth.text).replace(/\s+/g, " ").trim()}"]` });
           } catch (e) { /* provenance note is not worth failing the operation over */ }
         }
-        return text(typeof out === "string" ? out : JSON.stringify(out).slice(0, 20000));
+        return text(typeof out === "string" ? capString(out, 20000) : capJson(out, { maxBytes: 20000, what: "helpdesk" }));
       }
       catch (e) { return text(`${p.operation} failed: ${e?.message || e}`); }
     },
@@ -1913,7 +2054,9 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           if (rec.error) return text(rec.error);
           return text(captureReceipt(rec, " with attach_capture or send_email"));
         }
-        return text(raw.slice(0, 20000));
+        // capString, not slice: a silent truncation makes the model think it saw
+        // everything, and it re-runs the same broad command to find the rest.
+        return text(capString(raw, 20000, "device command output"));
       } catch (e) { return text("run_device_command failed: " + (e?.message || e)); }
     },
   });
@@ -2101,7 +2244,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
             attachment_filename: att ? att.attachment_filename : undefined },
           { signal },
         );
-        return text(typeof out === "string" ? out : JSON.stringify(out));
+        return text(typeof out === "string" ? capString(out) : capJson(out, { what: "helpdesk" }));
       } catch (e) { return text("send_email failed: " + (e?.message || e)); }
     },
   });
@@ -2330,7 +2473,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         if (!args.salesperson_email && actorEmail) args.salesperson_email = actorEmail;
         try {
           const out = await sales.operations[p.operation](args);
-          return text(typeof out === "string" ? out : JSON.stringify(out).slice(0, 20000));
+          return text(typeof out === "string" ? capString(out, 20000) : capJson(out, { maxBytes: 20000, what: "helpdesk" }));
         } catch (e) {
           return text(`${p.operation} failed: ${e?.message || e}`);
         }

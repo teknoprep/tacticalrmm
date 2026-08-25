@@ -15,14 +15,27 @@
 // DEFAULT DENY: an operation the deployment declares as mutating, but does not
 // classify, is DENIED. A new operation can never silently inherit authority.
 
-// The eight classes. Anything outside this set is treated as unclassified (denied).
+// The classes. Anything outside this set is treated as unclassified (denied).
 //
 // `secret` is the customer's stored credentials (the IT Notebook tab on a company). It is
 // deliberately NOT a kind of "read": a read is cheap and reversible, whereas handing over a
 // live username and password is neither, and it must never happen because an unattended job
 // decided it needed one. It is granted to exactly one surface - the ai-decision window,
 // where a named technician is present - and even there the gate asks them every single time.
-export const CLASSES = ["read", "create", "note", "knowledge", "global_knowledge", "customer", "close", "routing", "secret", "sales"];
+//
+// `secret_write` is RECORDING a credential, and it is a separate class from `secret`
+// because it is a different risk, not a bigger one. Reading exposes a password to the
+// model; writing changes what every future technician will be handed as the truth. An
+// overwritten row locks people out of a customer system, and a wrong one sends the next
+// person to the wrong door with confident-looking documentation. The two are therefore
+// granted, gated and audited separately - a surface may hold either without the other,
+// and today the interactive decision window holds both.
+//
+// Authority rule (owner, 2026-08-18): "only when requested to do so - they can ask if they
+// should do it and we will let them know, or if I tell it then it can." So a write needs
+// EITHER a verbatim instruction from the technician OR an approval click, and no toggle
+// skips it. See the `secret_write` branch of gate() in server.js.
+export const CLASSES = ["read", "create", "note", "knowledge", "global_knowledge", "customer", "close", "routing", "secret", "secret_write", "sales"];
 
 // Ships-working-out-of-the-box classifier for conventional operation names. This is a
 // DEFAULT CLASSIFIER ONLY, never the authority: explicit exports.opClasses always wins.
@@ -46,6 +59,15 @@ export const NAME_DEFAULTS = {
   reply_to_ticket: "customer",
   // secret  (customer credentials - decision window only, always prompts)
   get_partner_credentials: "secret", get_credentials: "secret", read_secure_notes: "secret",
+  // secret_write  (RECORDING a credential / IT Notebook row - decision window only, and
+  // only on a technician's instruction or an approval click). Named defaults are a
+  // convenience for conventional names; a deployment that calls it something else must
+  // tag it in exports.opClasses, and an untagged mutating op stays denied.
+  upsert_partner_notebook_row: "secret_write", add_partner_notebook_row: "secret_write",
+  upsert_notebook_row: "secret_write", update_notebook_row: "secret_write",
+  create_notebook_row: "secret_write", delete_notebook_row: "secret_write",
+  set_partner_credentials: "secret_write", upsert_credential: "secret_write",
+  write_secure_note: "secret_write",
   // close
   cancel_ticket: "close", close_ticket: "close", ai_close_ticket: "close",
   resolve_ticket: "close",
@@ -76,7 +98,12 @@ export const SURFACE_CLASSES = {
   // Decision chat: a human is driving the ticket and approves each mutating call. The ONLY
   // surface that may reach the credential store, and only with a per-request approval that
   // Auto-approve cannot skip (see the `secret` branch of gate() in server.js).
-  decision_chat: ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "close", "secret", "sales"],
+  // `secret_write` is here and nowhere else, for the same reason `secret` is: it is the
+  // only surface with a named technician present to instruct or approve it at the time.
+  // Deliberately NOT granted to device_chat - that surface cannot read the credential
+  // store either, and its gate takes a bare summary rather than a capability kind, so a
+  // grant there would silently land in the device-approval path instead of this one.
+  decision_chat: ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "close", "secret", "secret_write", "sales"],
   // Ticket Console auto-resolve: read-only investigation, posts a note. Never closes,
   // never emails. Replaces the old blockOps name list (ISSUES.md I6).
   auto_resolve:  ["read", "note", "knowledge"],

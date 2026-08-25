@@ -23,10 +23,33 @@
 //   tokens, is a request the provider dropped before it started - and that is
 //   retryable whatever words came back.
 //
+// WHAT WENT WRONG AGAIN (2026-08-18, TrueNAS speed-test chat)
+// -----------------------------------------------------------
+// The same symptom - a chat that just stops - from the opposite direction. A technician
+// asked for a long, very technical email report. grok-4.5 streamed its one-line preamble
+// and then went silent for 208s while composing a ~20k-char `send_email` argument, which
+// xAI's Responses API emits as a single block rather than incremental deltas. The stall
+// watchdog in server.js concluded the stream was dead and called `session.abort()`.
+//
+// That abort is indistinguishable, downstream, from the technician pressing Stop:
+// pi-ai's `openai-responses.js` labels any error with `signal.aborted` set as
+// `stopReason:"aborted"`, and EVERY retry layer stands down on an abort - the harness's
+// own `retryAssistantCall` returns immediately, and this file required
+// `stopReason === "error"`. So the turn died with no answer, no retry, and the tech was
+// told to resend - which failed identically, because the cause was deterministic, not
+// transient. Two attempts, ~7 minutes, no email.
+//
+// The fix is to stop laundering OUR abort into the technician's: the watchdog now
+// declares the abort as its own (`noteWatchdogStall`), and only an abort so declared is
+// retryable here. An abort nobody claimed is still a human pressing Stop and is still
+// never retried. The re-run also gets a longer stall budget (see CONFIG.turnStall*),
+// because retrying the identical request under the identical tight budget is just a
+// slower way to fail.
+//
 // Deliberately NOT retried:
 //   - anything the harness already retried and gave up on (its budget is authoritative;
 //     retrying past it just wastes the technician's time and money),
-//   - aborts, which are somebody pressing stop,
+//   - aborts NOBODY CLAIMED, which are somebody pressing stop,
 //   - quota / billing / auth / context-overflow, which are permanent and where a retry
 //     is pure cost with no chance of success,
 //   - a turn that produced ANY content or burned ANY tokens: partial work means the
@@ -87,6 +110,9 @@ const PERMANENT = new RegExp([
 /** Somebody pressed stop. Not a fault, and must never be retried. */
 const ABORTED = /abort|cancel/i;
 
+/** The stop reasons a cancelled stream can arrive with. */
+const ABORT_STOP_REASONS = new Set(["aborted", "abort", "cancelled"]);
+
 function messageText(message) {
   const content = Array.isArray(message?.content) ? message.content : [];
   return content
@@ -125,15 +151,44 @@ export function isBlankProviderFailure(message) {
 }
 
 /**
+ * Is this an abort the BRIDGE caused, rather than the technician pressing Stop?
+ *
+ * Only the shape is checked here; WHO aborted is not knowable from the message, so the
+ * caller must have claimed it via `noteWatchdogStall()`. Unlike a blank provider
+ * failure, output is NOT screened out: a watchdog abort characteristically lands after
+ * the model streamed a preamble sentence, and that preamble is the whole reason the
+ * chat looks wedged instead of broken.
+ */
+export function isWatchdogStallAbort(message) {
+  if (!message || message.role !== "assistant") return false;
+  if (!ABORT_STOP_REASONS.has(message.stopReason)) return false;
+  // A tool call inside the killed message is ambiguous: it may already have executed,
+  // with its result landing in a later message, so re-running the turn could repeat a
+  // side effect - sending an email twice, rebooting a server twice. The watchdog only
+  // fires with no tool in flight so this is rare, but when it happens a wedged chat is
+  // the better failure.
+  const content = Array.isArray(message.content) ? message.content : [];
+  if (content.some((p) => p?.type === "toolCall")) return false;
+  return true;
+}
+
+/**
  * Per-turn recovery budget. One instance per chat session.
  *
- * @param maxAttempts  how many silent re-runs before the technician is told
- * @param baseDelayMs  exponential backoff base
+ * @param maxAttempts       how many silent re-runs of a blank provider rejection
+ * @param maxStallAttempts  how many silent re-runs of a watchdog stall abort
+ * @param baseDelayMs       exponential backoff base
  */
-export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, baseDelayMs = 1500 } = {}) {
-  let armed = null;        // the errored message awaiting a re-run
-  let attempts = 0;        // used within the current turn
+export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, maxStallAttempts = 1,
+                                  baseDelayMs = 1500 } = {}) {
+  let armed = null;        // { message, kind } awaiting a re-run
+  let attempts = 0;        // blank-rejection re-runs used within the current turn
+  let stallAttempts = 0;   // watchdog-abort re-runs used within the current turn
+  let stall = null;        // { silentFor } while an abort of OURS is unclaimed
   let harnessGaveUp = false;
+
+  /** An abort is only ours if the watchdog said so before aborting. */
+  const ownStallAbort = (message) => !!stall && isWatchdogStallAbort(message);
 
   return {
     /** The harness tried its own retries and ran out. Its budget wins; stand down. */
@@ -145,7 +200,27 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, baseDela
     beginTurn() {
       armed = null;
       attempts = 0;
+      stallAttempts = 0;
+      stall = null;
       harnessGaveUp = false;
+    },
+
+    /**
+     * The stall watchdog is about to abort this turn. Claim it, so the abort that
+     * follows is classified as a fault of ours and not as the technician stopping.
+     */
+    noteWatchdogStall(silentFor) {
+      stall = { silentFor: Number(silentFor) || 0 };
+    },
+
+    /** Seconds of silence that triggered the abort we are currently holding. */
+    get stallSilentFor() {
+      return stall?.silentFor || 0;
+    },
+
+    /** Did WE abort this message? (Shape + an outstanding claim from the watchdog.) */
+    isOwnStallAbort(message) {
+      return ownStallAbort(message);
     },
 
     /**
@@ -154,9 +229,16 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, baseDela
      */
     consider(message) {
       if (harnessGaveUp) return false;
+      // Our own abort: retryable regardless of the preamble it printed, because we know
+      // exactly why it stopped and that no tool was in flight when it did.
+      if (ownStallAbort(message)) {
+        if (stallAttempts >= maxStallAttempts) return false;
+        armed = { message, kind: "stall" };
+        return true;
+      }
       if (attempts >= maxAttempts) return false;
       if (!isBlankProviderFailure(message)) return false;
-      armed = message;
+      armed = { message, kind: "blank" };
       return true;
     },
 
@@ -170,12 +252,26 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, baseDela
      */
     async run(session) {
       if (!armed) return false;
-      const why = String(armed.errorMessage || "");
+      const { message, kind } = armed;
+      const stalled = kind === "stall";
+      const why = stalled
+        ? `stall watchdog aborted the turn after ${stall?.silentFor || 0}s of silence`
+        : String(message.errorMessage || "");
       armed = null;
-      attempts += 1;
-      const delayMs = baseDelayMs * 2 ** (attempts - 1);
+      if (stalled) {
+        // Release the claim BEFORE re-running: if the technician presses Stop during the
+        // retry, that abort is theirs again and must be honoured as a stop.
+        stall = null;
+        stallAttempts += 1;
+      } else {
+        attempts += 1;
+      }
+      const used = stalled ? stallAttempts : attempts;
+      const budget = stalled ? maxStallAttempts : maxAttempts;
+      const delayMs = baseDelayMs * 2 ** (used - 1);
       log?.("llm_recover", key, sessionId,
-        `attempt ${attempts}/${maxAttempts} after unrecognised provider error "${why.slice(0, 80)}" - waiting ${delayMs}ms`);
+        `attempt ${used}/${budget} after ${stalled ? "" : "unrecognised provider error "}` +
+        `"${why.slice(0, 80)}" - waiting ${delayMs}ms`);
       await new Promise((r) => setTimeout(r, delayMs));
 
       // The harness's own recipe: the errored assistant message stays in the session
@@ -203,6 +299,14 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, baseDela
 
     /** Wording for the technician once recovery has genuinely run out. */
     exhaustedNote(why) {
+      if (stallAttempts > 0) {
+        return `The AI turn produced no output for minutes at a time and was stopped ` +
+          `${stallAttempts + 1} times - the re-run already had a longer allowance. Your ` +
+          `conversation is intact: send anything to pick up where it stopped. If the same ` +
+          `request keeps doing this, it is usually one very large answer being built in a ` +
+          `single step - ask for it in pieces (e.g. save the report to a device note first, ` +
+          `then send that) and it will go through.`;
+      }
       return attempts > 0
         ? `The model returned no answer - the provider rejected the request ${attempts + 1} times ` +
           `(${String(why).slice(0, 200)}). Your conversation is intact: send anything to pick up where it stopped.`

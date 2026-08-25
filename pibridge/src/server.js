@@ -18,11 +18,21 @@ import { trmm } from "./trmm.js";
 import * as history from "./history.js";
 import { makeCostMeter, silentStopMessage } from "./cost-meter.js";
 import { makeLlmRecovery } from "./llm-recovery.js";
+import { makeTurnWatchdog } from "./turn-watchdog.js";
+import { notebookWriteAuthorisation } from "./authorisation.js";
+import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
+import { makeCompactCommand } from "./compaction.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
 
 const redis = new Redis(CONFIG.redisUrl);
+
+// Observe provider streams at the socket, before any model client is built - pi-ai falls
+// back to globalThis.fetch, and an SDK that captured it earlier would never see this.
+// Transparent pass-through; see stream-liveness.js for why the parser cannot tell us this.
+const uninstallLiveness = installStreamLiveness({ log });
+void uninstallLiveness;
 
 
 function log(...a) {
@@ -137,6 +147,10 @@ function globalKBAuthorisation(techTurns) {
   return null;
 }
 
+// (notebookWriteAuthorisation lives in authorisation.js so it can be tested without
+// booting the server; see the note there about the other three.)
+
+
 // Friendly, human-readable label for what the AI is doing (for live updates).
 
 // Built-in default for the decision-chat POLICY. Admins can override it in Global
@@ -152,7 +166,8 @@ const DEFAULT_DECISION_POLICY =
   `  - save_device_note = DEVICE-SPECIFIC facts about ONE machine (its role, disk/volume/pool layout, service/container names, hardware quirks, a fix that worked on it, how to verify its health). Anything tied to a specific host goes here, NOT the KB.\n` +
   `  - upsert_ai_kb_article = GENERAL guidance for working with this CLIENT (their standards/preferences, key contacts, naming conventions, recurring procedures that apply across their fleet). Never put a specific device's history or one-off event into the KB.\n` +
   `  - create_global_kb_article = a NEW GLOBAL/shared article not tied to any client. Use it ONLY when the technician explicitly asks to create/write/publish a GLOBAL KB article. Never choose this proactively, and never substitute the company AI article for a requested global article.\n` +
-  `CAPTURE KNOWLEDGE (do this proactively, without being asked): whenever the technician tells you something you did NOT already know - how a machine is set up, where something lives, how a process/workflow at this client works, a quirk or gotcha, or the fix that actually worked - DOCUMENT it right then so future runs start with it. Route it: a fact about ONE machine -> save_device_note (that device's agent_id); general client/process knowledge -> upsert_ai_kb_article. Briefly tell the tech what you saved. NEVER store secrets/passwords - note WHERE they live, not the value. IMPORTANT - recording knowledge is NOT a 'change' and NEVER needs permission, Write mode, or the tech's go-ahead: save_device_note and upsert_ai_kb_article only write to YOUR OWN memory - they do not touch a device, run a command, reboot anything, or contact a customer. So capture durable facts SILENTLY and proactively AS you learn them, EVEN when the tech has said 'don't make changes' or 'don't act without direction' - those rules govern DEVICES and CUSTOMER communication, not your memory. Do not ask 'should I save this?'; just save it and mention it in one line.\n` +
+  `CAPTURE KNOWLEDGE (do this proactively, without being asked): whenever the technician tells you something you did NOT already know - how a machine is set up, where something lives, how a process/workflow at this client works, a quirk or gotcha, or the fix that actually worked - DOCUMENT it right then so future runs start with it. Route it: a fact about ONE machine -> save_device_note (that device's agent_id); general client/process knowledge -> upsert_ai_kb_article. Briefly tell the tech what you saved. NEVER store secrets/passwords in a device note or the KB - note WHERE they live, not the value (the IT Notebook is the one place a credential belongs; see CREDENTIALS below). IMPORTANT - recording knowledge is NOT a 'change' and NEVER needs permission, Write mode, or the tech's go-ahead: save_device_note and upsert_ai_kb_article only write to YOUR OWN memory - they do not touch a device, run a command, reboot anything, or contact a customer. So capture durable facts SILENTLY and proactively AS you learn them, EVEN when the tech has said 'don't make changes' or 'don't act without direction' - those rules govern DEVICES and CUSTOMER communication, not your memory. Do not ask 'should I save this?'; just save it and mention it in one line.\n` +
+  `CREDENTIALS - THE IT NOTEBOOK IS THE ONLY PLACE A PASSWORD GOES: never put a credential in a ticket note, a customer reply, an email, the KB or a device note - say where it lives, never the value. You CAN write to the customer's IT Notebook (helpdesk_call upsert_notebook_row / update_notebook_row), but ONLY when the technician has told you to save it, or you have ASKED and they said yes. So when you set something up that has a credential: do NOT dump a block of text for them to paste in by hand - tell them in one line what you would record (system, URL, username, 'password' - never the password itself), ask 'want me to save this to the IT Notebook?', and write it when they agree. If they say no, show them the row as a table they can paste and move on. Match the column layout of the notebook's existing rows. Never record a password you did not actually set or were not given, and never guess a row's columns - read one existing row first if you are unsure.\n` +
   `SCHEDULING: only when the tech asks, use schedule_action (device agent_id, ISO 8601 run_at, instruction) - it runs once at that time and updates the ticket. When you finish work early, close a ticket, or a later check supersedes an earlier follow-up, ALWAYS list_scheduled_actions for this ticket and cancel_scheduled_action any leftover jobs so they do not fire.\n` +
   `SALES/ERP: When sales_call is available, create DRAFT quotations in the ERP ONLY when the technician explicitly tells you to create/push the quote in Odoo/ERP. Building numbers in chat or emailing a quote is NOT permission to create an ERP quote. Never confirm a Sales Order. Always show the quotation URL. Partner must come from the ticket — if unclear, stop and ask. After create, add an internal ticket note with quote name/total/URL.\n` +
 
@@ -613,6 +628,18 @@ async function startChat(ws, blob) {
   // busy (device commands can run for minutes) so the stall watchdog must not
   // fire; every TRMM call now has a transport timeout, so tools always settle.
   let toolsInFlight = 0;
+  // Assigned once the session exists (see makeTurnWatchdog below); declared here because
+  // the event handler reports the current stall budget.
+  let watchdog = null;
+  // Bytes arriving from the provider, including the SSE heartbeats the parser discards.
+  // This is what tells us the model is still there during a long quiet think.
+  const liveness = makeTurnLiveness();
+  // Every turn runs inside the liveness context so its provider calls are attributed to
+  // this connection - several chats share this process.
+  const inTurn = (fn) => runWithLiveness(liveness, fn);
+  // When we last put anything on the wire to the browser. Drives the "still working"
+  // ping, so a quiet turn cannot be mistaken for a dead tab.
+  let lastClientFrameAt = Date.now();
   // Cost meter: gated on the role permission resolved by the RMM (can_view_ai_cost).
   const costMeter = makeCostMeter({
     send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
@@ -645,7 +672,9 @@ async function startChat(ws, blob) {
   // Silent recovery from provider faults the harness does not recognise (see
   // llm-recovery.js). A technician watching this window should not lose a turn to a
   // transient blip the provider phrased in words pi-ai has no pattern for.
-  const recovery = makeLlmRecovery({ log, key: agentId, sessionId });
+  const recovery = makeLlmRecovery({
+    log, key: agentId, sessionId, maxStallAttempts: CONFIG.stallRecoveryAttempts,
+  });
 
   const unsubscribe = session.subscribe((event) => {
     lastActivity = Date.now();
@@ -665,7 +694,13 @@ async function startChat(ws, blob) {
     } else if (event.type === "agent_start") {
       log("agent_start", agentId, sessionId);
     } else if (event.type === "agent_end") {
-      log("agent_end", agentId, sessionId);
+      // Report the transport measurement every turn. Without this, a liveness hook that
+      // silently stopped working would look exactly like a healthy one until the day it
+      // let a dead stream hang - and "observed=false" here is the early warning.
+      log("agent_end", agentId, sessionId,
+          `liveness observed=${liveness.observed} bytes=${liveness.bytes} ` +
+          `chunks=${liveness.chunks} quiet=${liveness.quietMs() ?? "-"}ms ` +
+          `elapsed=${Math.round(liveness.elapsedMs() / 1000)}s`);
     } else if (event.type === "message_update" && event.assistantMessageEvent?.type === "error") {
       log("llm_error", agentId, sessionId, String(event.assistantMessageEvent.reason || ""));
     } else if (event.type === "message_end" && event.message?.stopReason === "error") {
@@ -688,6 +723,29 @@ async function startChat(ws, blob) {
           }));
         } catch {}
       }
+    } else if (event.type === "message_end" && recovery.isOwnStallAbort(event.message)) {
+      // The stall watchdog below killed this turn. Downstream that is indistinguishable
+      // from the technician pressing Stop - so nothing retries it and the chat simply
+      // stops, mid-task, having printed only a preamble. It is OUR abort and our guess
+      // that the stream was dead, so re-run it (with a longer budget) and only admit to
+      // the technician if that fails too. See llm-recovery.js, 2026-08-18.
+      const silentFor = recovery.stallSilentFor;
+      const why = `stall watchdog aborted the turn after ${silentFor}s of silence`;
+      log("llm_error", agentId, sessionId, why);
+      if (recovery.consider(event.message)) {
+        log("llm_error_recoverable", agentId, sessionId,
+            `watchdog abort - re-running with a ` +
+            `${Math.round((watchdog?.budgetMs ?? CONFIG.turnStallMs) / 1000)}s stall budget`);
+      } else {
+        try {
+          ws.send(JSON.stringify({
+            type: "error",
+            message: recovery.exhaustedNote(why)
+              || `The AI turn stalled (no response for ${silentFor}s) and was automatically ` +
+                 `aborted. Please resend your message.`,
+          }));
+        } catch {}
+      }
     }
     // Fold usage into the meter and surface any non-answering stop (e.g. "length").
     if (event.type === "message_end" && event.message?.role === "assistant") {
@@ -700,6 +758,7 @@ async function startChat(ws, blob) {
     }
     try {
       ws.send(JSON.stringify({ type: "agent_event", event }));
+      lastClientFrameAt = Date.now();
     } catch {}
     if (event.type === "agent_end" && blob.persist_history) {
       const last = session.messages
@@ -755,31 +814,57 @@ async function startChat(ws, blob) {
   };
   resetIdle();
 
-  // Turn watchdog: if a streaming turn produces no events for too long, the LLM
-  // stream is almost certainly dead/stuck. Force-abort it and tell the operator
-  // to resend, rather than leaving the chat wedged forever with no agent_end.
-  // Silence while a tool call is in flight does NOT count: long device commands
-  // are legitimate, and every tool call is bounded by its own transport timeout.
-  let stallHandled = false;
-  const watchdog = CONFIG.turnStallMs > 0 ? setInterval(async () => {
-    if (session.isStreaming && toolsInFlight === 0 && Date.now() - lastActivity > CONFIG.turnStallMs) {
-      if (stallHandled) return; // already aborting this stall
-      stallHandled = true;
-      const silentFor = Math.round((Date.now() - lastActivity) / 1000);
-      log("turn_stall", agentId, sessionId, `no activity for ${silentFor}s; aborting turn`);
-      try {
-        ws.send(JSON.stringify({
-          type: "error",
-          message: `The AI turn stalled (no response for ${silentFor}s) and was automatically aborted. Please resend your message.`,
-        }));
-      } catch {}
-      try { await session.abort(); } catch (e) {
-        log("turn_stall abort error", agentId, sessionId, String(e?.message || e));
-      }
-    } else if (!session.isStreaming) {
-      stallHandled = false; // reset once the turn is done
-    }
-  }, CONFIG.watchdogIntervalMs) : null;
+  // Turn watchdog: abort a streaming turn that has gone silent, claim the abort as ours
+  // so it is retried rather than mistaken for the technician pressing Stop, and widen the
+  // budget for that retry. See turn-watchdog.js for why silence is only a guess.
+  watchdog = makeTurnWatchdog({
+    session, recovery, log, key: agentId, sessionId,
+    toolsInFlight: () => toolsInFlight,
+    lastActivityAt: () => lastActivity,
+    liveness,
+    deadStreamMs: CONFIG.deadStreamMs,
+    maxTurnMs: CONFIG.maxTurnMs,
+    stallMs: CONFIG.turnStallMs,
+    escalation: CONFIG.turnStallEscalation,
+    maxStallMs: CONFIG.turnStallMaxMs,
+    intervalMs: CONFIG.watchdogIntervalMs,
+    runTurn: inTurn,
+  }).start();
+
+  // /compact - summarise the conversation in place. See compaction.js for why a long chat
+  // and a model switch are the two expensive shapes this exists to fix.
+  const compactCmd = makeCompactCommand({
+    session, costMeter,
+    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    log, key: agentId, sessionId,
+    currentModel: () => session.model || model,
+    rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
+    inTurn,
+  });
+
+  // "Still working" ping. A turn can legitimately produce nothing the browser can render
+  // for minutes (the model assembling one large tool argument), which is indistinguishable
+  // from a crash at the far end - the complaint that started all of this. Report the
+  // measured liveness instead of leaving a spinner to speak for itself.
+  const workingPing = CONFIG.workingPingMs > 0 ? setInterval(() => {
+    if (!session.isStreaming) return;
+    const quiet = Date.now() - lastClientFrameAt;
+    if (quiet < CONFIG.workingPingMs) return;
+    const lastByteMs = liveness.quietMs();
+    try {
+      ws.send(JSON.stringify({
+        type: "working",
+        elapsed_ms: liveness.elapsedMs(),
+        quiet_ms: quiet,
+        // null = we have no transport signal for this turn, so we are not claiming one.
+        alive: lastByteMs === null ? null : lastByteMs <= CONFIG.deadStreamMs,
+        last_byte_ms: lastByteMs,
+        bytes: liveness.bytes,
+        tools_in_flight: toolsInFlight,
+      }));
+      lastClientFrameAt = Date.now();
+    } catch { /* socket gone */ }
+  }, Math.max(1000, Math.floor(CONFIG.workingPingMs / 2))) : null;
 
   ws.on("message", async (raw) => {
     resetIdle();
@@ -791,24 +876,42 @@ async function startChat(ws, blob) {
     }
     try {
       switch (msg.type) {
+        case "compact":
+          await compactCmd.run(String(msg.message || ""), { reason: "technician asked (button)" });
+          break;
         case "prompt":
+          // "/compact" is handled HERE, before the prompt reaches the model: it is an
+          // instruction to the session, not a question for the LLM, and sending it on
+          // would just add another expensive turn to the context it is meant to shrink.
+          if (compactCmd.isCommand(msg.message)) {
+            await compactCmd.run(msg.message);
+            break;
+          }
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           recovery.beginTurn();
-          if (session.isStreaming) {
-            await session.prompt(msg.message, { streamingBehavior: "steer" });
-          } else {
-            await session.prompt(msg.message);
-          }
-          // prompt() resolves once the whole turn has settled (including the harness's own
-          // retries), so this is the point at which we know a blank rejection ended it.
-          // Loop rather than retry once: the recovery object owns the budget.
-          while (recovery.pending) {
-            if (!(await recovery.run(session))) break;
-          }
+          // A new request earns a fresh, tight watchdog budget: the widened one exists
+          // only to give the SAME request a second, more patient chance.
+          watchdog.resetBudget();
+          // Fresh transport measurement for a fresh request, and everything the turn does
+          // runs inside the liveness context so its provider bytes land on this session.
+          liveness.reset();
+          await inTurn(async () => {
+            if (session.isStreaming) {
+              await session.prompt(msg.message, { streamingBehavior: "steer" });
+            } else {
+              await session.prompt(msg.message);
+            }
+            // prompt() resolves once the whole turn has settled (including the harness's own
+            // retries), so this is the point at which we know a blank rejection ended it.
+            // Loop rather than retry once: the recovery object owns the budget.
+            while (recovery.pending) {
+              if (!(await recovery.run(session))) break;
+            }
+          });
           break;
         case "steer":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
-          await session.steer(msg.message);
+          await inTurn(() => session.steer(msg.message));
           break;
         case "abort":
           await session.abort();
@@ -899,7 +1002,8 @@ async function startChat(ws, blob) {
 
   ws.on("close", () => {
     clearTimeout(idleTimer);
-    if (watchdog) clearInterval(watchdog);
+    watchdog?.stop();
+    if (workingPing) clearInterval(workingPing);
     unsubscribe();
     // reject any dangling approvals so tool calls don't hang forever
     for (const [, resolve] of pendingApprovals) resolve(false);
@@ -1062,9 +1166,59 @@ async function startDecisionChat(ws, blob) {
         log("credential read auto-permitted (Auto-credential)", histKey, sessionId, String(summary).slice(0, 160));
         return { ok: true };
       }
-      const ok = await requestApproval(summary);
+      // SAY WHY THE SWITCH DID NOT APPLY (reported 2026-08-19: "Auto-credential is on and
+      // it's still asking me to approve credential access").
+      //
+      // It was working correctly - every prompt in that session was a PRIVILEGED-row
+      // request, which no toggle skips. But the prompt only said the rows were "normally
+      // withheld", never that the switch they had just turned on deliberately does not
+      // cover them, so the reasonable conclusion was that the feature was broken. The log
+      // shows what that costs: three approvals, then the technician toggling
+      // Auto-credential off and back on to try to fix something that was not wrong.
+      //
+      // A safeguard that looks like a malfunction gets worked around, so explaining it is
+      // part of enforcing it.
+      const privBlocked = opts.privileged && autoCredential && autocredentialAllowed;
+      const ask = privBlocked
+        ? `${summary}\n\nAuto-credential is ON, but it deliberately does NOT cover privileged ` +
+          `rows - those ask you every time. Nothing is broken; approving here is the only way ` +
+          `to release a privileged row.`
+        : summary;
+      if (privBlocked) {
+        log("credential prompt (privileged - Auto-credential does not cover it)",
+            histKey, sessionId, String(summary).slice(0, 160));
+      }
+      const ok = await requestApproval(ask);
       if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
       log("credential read permitted by tech", histKey, sessionId, String(summary).slice(0, 160));
+      return { ok: true };
+    }
+    // RECORDING a credential / IT Notebook row. Two routes in, no toggle past.
+    //
+    // The technician asked for this feature because the AI kept doing the work and then
+    // handing them a block of text to paste in by hand. So it may write - but the decision
+    // to write stays human, exactly as they specified: either they said so, or they click.
+    //
+    // Auto-approve and Auto-credential are BOTH deliberately ignored here. Auto-credential
+    // is a standing permission to READ a password when one is needed to get work done; it
+    // says nothing about changing what the credential store claims is true, and reading a
+    // switch labelled for one thing as consent for another is how a safeguard quietly
+    // stops meaning anything. Write mode is likewise not consulted: that switch scopes
+    // changes to DEVICES (see WHAT READ-ONLY MEANS above), and this touches none.
+    if (kind === "secret_write") {
+      const auth = notebookWriteAuthorisation(techSaid);
+      if (auth) {
+        log("notebook write authorised by tech", histKey, sessionId,
+            `"${auth.text.slice(0, 120)}" :: ${String(summary).slice(0, 200)}`);
+        return { ok: true, authorised_by: auth };
+      }
+      const ok = await requestApproval(summary);
+      if (!ok) {
+        return { ok: false, reason:
+          "the technician did not approve writing to the IT Notebook. Show them the row you " +
+          "would have saved so they can paste it themselves, and do not retry." };
+      }
+      log("notebook write permitted by tech", histKey, sessionId, String(summary).slice(0, 200));
       return { ok: true };
     }
     if (kind === "sales") {
@@ -1264,6 +1418,16 @@ async function startDecisionChat(ws, blob) {
     try { ws.send(JSON.stringify({ type: "agent_event", event })); } catch {}
   });
 
+  // /compact - same command on the ticket surface. No liveness context here (this surface
+  // has no stall watchdog), so the turn wrapper is a pass-through.
+  const compactCmd = makeCompactCommand({
+    session, costMeter,
+    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    log, key: histKey, sessionId,
+    currentModel: () => session.model || model,
+    rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
+  });
+
   ws.send(JSON.stringify({
     type: "ready", session_id: sessionId, hostname: `Ticket ${ticketRef}`,
     multi: false, machines: [],
@@ -1308,7 +1472,15 @@ async function startDecisionChat(ws, blob) {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     try {
       switch (msg.type) {
+        case "compact":
+          await compactCmd.run(String(msg.message || ""), { reason: "technician asked (button)" });
+          break;
         case "prompt":
+          // See the device chat: a session instruction, not a question for the model.
+          if (compactCmd.isCommand(msg.message)) {
+            await compactCmd.run(msg.message);
+            break;
+          }
           // Keep the tech's own words for the close-authorisation test above.
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           work.humanTurn();
