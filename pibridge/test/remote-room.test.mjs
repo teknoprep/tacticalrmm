@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { makeRemoteBinding, toWireMessages, toWireHistory, browserFrameToPhone } from "../src/remote-room.js";
+import { makeRemoteBinding, toWireMessages, toWireHistory, browserFrameToPhone, modelForPhone } from "../src/remote-room.js";
 
 function harness(blob = {}) {
   const sent = [];
@@ -279,4 +279,45 @@ test("chatter the phone has no use for is dropped", () => {
   ]) {
     assert.equal(browserFrameToPhone(frame), null, `${frame.type} is not a message`);
   }
+});
+
+// ---- the phone's model picker -------------------------------------------------------
+//
+// `blob.model_id` is what the window ASKED for. Since model-memory landed, a reopened
+// window can be running something else, so the phone has to be told what the session is
+// actually on - and whether it can take a photo.
+
+test("the phone is told the LIVE model, not the one the blob asked for", () => {
+  // The window opened asking for haiku; model-memory reopened it on grok. A picker
+  // showing "claude-haiku-4" is how a technician switches to the model they are on.
+  const blob = { provider: "anthropic", model_id: "claude-haiku-4" };
+  const live = {
+    id: "grok-4.5", name: "Grok 4.5", provider: "xai",
+    reasoning: true, input: ["text", "image"], contextWindow: 2000000,
+  };
+  assert.deepEqual(modelForPhone(live, blob), {
+    id: "grok-4.5",
+    name: "Grok 4.5",
+    provider: "xai",
+    reasoning: true,
+    context_window: 2000000,
+    vision: true,
+  });
+});
+
+test("with no live model yet, the blob is the fallback and promises nothing", () => {
+  const out = modelForPhone(null, { provider: "anthropic", model_id: "claude-haiku-4" });
+  assert.equal(out.id, "claude-haiku-4");
+  assert.equal(out.provider, "anthropic");
+  assert.equal(out.vision, false, "an unresolved model must not promise a camera");
+  assert.equal(out.reasoning, false);
+  assert.equal(out.context_window, 0);
+});
+
+test("vision decides whether the phone may attach a photo", () => {
+  // The app greys its attach button on this. Hard-coded false took away the one thing a
+  // phone has that the browser does not.
+  assert.equal(modelForPhone({ input: ["text", "image"] }).vision, true);
+  assert.equal(modelForPhone({ input: ["text"] }).vision, false);
+  assert.equal(modelForPhone({}).vision, false, "an unknown input list is not a camera");
 });

@@ -1163,6 +1163,10 @@ async function startChat(ws, blob) {
     },
     transcript: () => uiTranscript(sessionManager, session),
     startedAt,
+    // The LIVE model, not the one the blob asked for. Since model-memory landed a
+    // reopened window can be running something the blob never named, and the phone's
+    // model picker reads this.
+    currentModel: () => session.model || model,
   });
 
   ws.on("message", async (raw) => {
@@ -1867,6 +1871,10 @@ async function startDecisionChat(ws, blob) {
     },
     transcript: () => uiTranscript(sessionManager, session),
     startedAt,
+    // The LIVE model, not the one the blob asked for. Since model-memory landed a
+    // reopened window can be running something the blob never named, and the phone's
+    // model picker reads this.
+    currentModel: () => session.model || model,
   });
 
   let idleTimer;

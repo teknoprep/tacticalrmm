@@ -396,6 +396,7 @@ export function makeRemoteBinding({
   resolveApproval,
   transcript,
   startedAt = Date.now(),
+  currentModel = null,
 }) {
   const allowed = !!blob.remote_allowed && !!blob.remote_relay_url;
   const username = blob.username || "";
@@ -517,22 +518,19 @@ export function makeRemoteBinding({
             error: "Model and thinking level are set in the RMM window.",
           });
           break;
-        case "list_models":
-          // Truthful and harmless: the one model this session is actually running.
+        case "list_models": {
+          // Asked of the LIVE session, never read off the blob - a picker showing the
+          // wrong current model is how a technician "switches" to the model they are
+          // already on and wonders why nothing changed.
+          const live = (() => { try { return currentModel?.() || null; } catch { return null; } })();
           room?.send({
             type: "models_list",
             in_reply_to: String(msg.id || ""),
             models: [],
-            current: {
-              id: blob.model_id || "",
-              name: blob.model_id || "",
-              provider: blob.provider || "",
-              reasoning: false,
-              context_window: 0,
-              vision: false,
-            },
+            current: modelForPhone(live, blob),
           });
           break;
+        }
         default:
           break;
       }
@@ -659,6 +657,28 @@ export function makeRemoteBinding({
  * The app's decoder REJECTS unknown server types, so everything has to land as one of the
  * shapes it renders: `error` or `agent_message`.
  */
+/**
+ * The `current` model in the shape the app's picker renders.
+ *
+ * `live` is the model the SESSION is running; `blob` is only a fallback for the window
+ * that has not resolved one yet. They are not the same thing: the blob carries what was
+ * REQUESTED when the window opened, and since model-memory landed a reopened window can
+ * be running something the blob never named.
+ */
+export function modelForPhone(live, blob = {}) {
+  const m = live || null;
+  return {
+    id: m?.id || blob.model_id || "",
+    name: m?.name || m?.id || blob.model_id || "",
+    provider: m?.provider || blob.provider || "",
+    reasoning: !!m?.reasoning,
+    context_window: Number(m?.contextWindow || 0),
+    // What the app greys its attach button on. Hard-coding this false took away the one
+    // thing a phone has that the browser does not - a camera.
+    vision: Array.isArray(m?.input) ? m.input.includes("image") : false,
+  };
+}
+
 export function browserFrameToPhone(frame, turnId = "turn-0") {
   if (!frame || typeof frame !== "object") return null;
   const t = frame.type;
