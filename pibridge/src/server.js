@@ -23,6 +23,7 @@ import { notebookWriteAuthorisation, privilegedCredentialAuthorisation } from ".
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
 import { makeRemoteBinding } from "./remote-room.js";
+import * as modelMemory from "./model-memory.js";
 import { makeChatCommands } from "./chat-commands.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
@@ -562,12 +563,26 @@ async function startChat(ws, blob) {
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
   const rt = await piRuntime(keys);
   const modelRegistry = rt;                       // .findModel() below; kept name for diff clarity
-  const model = rt.findModel(blob.provider, blob.model_id);
+  // Reopen on the model this conversation was last using, not on the global default - see
+  // model-memory.js. Falls back to the default when nothing is remembered or when this
+  // technician's role does not carry the remembered model.
+  const pick = modelMemory.chooseModel(agentId, blob);
+  let model = rt.findModel(pick.provider, pick.model_id);
+  if (!model && pick.source !== "default") {
+    // The remembered model no longer resolves (retired upstream, provider disabled). Not
+    // an error for the technician - just open on the default and say so.
+    log("model memory unusable", agentId, "-", `${pick.provider}/${pick.model_id} did not resolve; using the default`);
+    model = rt.findModel(blob.provider, blob.model_id);
+  }
   if (!model) {
     ws.send(JSON.stringify({ type: "error", message: `Model not found: ${blob.provider}/${blob.model_id}` }));
     ws.close();
     return;
   }
+  const effectiveModel = rt.findModel(pick.provider, pick.model_id)
+    ? pick
+    : { ...pick, provider: blob.provider, model_id: blob.model_id, source: "default" };
+  if (effectiveModel.thinking_level) blob.thinking_level = effectiveModel.thinking_level;
 
   // Approval gating
   // Start from the operator's REMEMBERED choice, not from OFF. This flag used to live only
@@ -968,7 +983,13 @@ async function startChat(ws, blob) {
         hostname: m.label,
         role: m.role,
       })),
-      model: { provider: blob.provider, model_id: blob.model_id, display: model.name },
+      // The model actually in force, which is NOT necessarily the blob's default: this
+      // window reopens on whatever it was last using (model-memory.js). The browser sets
+      // its picker from this, or it would show the default while the session ran on
+      // something else.
+      model: { provider: effectiveModel.provider, model_id: effectiveModel.model_id, display: model.name },
+      model_source: effectiveModel.source,
+      model_remembered_denied: effectiveModel.remembered || "",
       allowed_models: (blob.allowed_models || []).map((m) => ({
         provider: m.provider,
         model_id: m.model_id,
@@ -1230,6 +1251,15 @@ async function startChat(ws, blob) {
               session.setThinkingLevel(allowed.thinking_level);
             } catch { /* model may not support thinking */ }
           }
+          // Remember it for the next time this window opens. Without this the choice lived
+          // only in this socket, so a refresh silently put the technician back on the
+          // default - and a model switch re-caches the whole conversation, so they paid
+          // for the switch again without being told they had lost it.
+          modelMemory.remember(agentId, {
+            provider: allowed.provider,
+            model_id: allowed.model_id,
+            by: blob.username || "",
+          });
           ws.send(
             JSON.stringify({
               type: "model_changed",
@@ -1314,8 +1344,18 @@ async function startDecisionChat(ws, blob) {
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
   const rt = await piRuntime(keys);
   const modelRegistry = rt;
-  const model = rt.findModel(blob.provider, blob.model_id);
+  // Same as the device chat: resume on the model this TICKET was last worked with.
+  const pick = modelMemory.chooseModel(histKey, blob);
+  let model = rt.findModel(pick.provider, pick.model_id);
+  if (!model && pick.source !== "default") {
+    log("model memory unusable", histKey, "-", `${pick.provider}/${pick.model_id} did not resolve; using the default`);
+    model = rt.findModel(blob.provider, blob.model_id);
+  }
   if (!model) { ws.send(JSON.stringify({ type: "error", message: `Model not found: ${blob.provider}/${blob.model_id}` })); ws.close(); return; }
+  const effectiveModel = rt.findModel(pick.provider, pick.model_id)
+    ? pick
+    : { ...pick, provider: blob.provider, model_id: blob.model_id, source: "default" };
+  if (effectiveModel.thinking_level) blob.thinking_level = effectiveModel.thinking_level;
 
   // Approval gating (disruptive device commands + customer replies).
   const pendingApprovals = new Map();
@@ -1732,7 +1772,9 @@ async function startDecisionChat(ws, blob) {
     multi: false, machines: [],
     // Server-fed autocomplete: never offers a switch this role does not carry.
     commands: chatCmds.spec(),
-    model: { provider: blob.provider, model_id: blob.model_id, display: model.name },
+    model: { provider: effectiveModel.provider, model_id: effectiveModel.model_id, display: model.name },
+    model_source: effectiveModel.source,
+    model_remembered_denied: effectiveModel.remembered || "",
     allowed_models: (blob.allowed_models || []).map((m) => ({ provider: m.provider, model_id: m.model_id, display_name: m.display_name, thinking_level: m.thinking_level, base_url: m.base_url })),
     require_approval: true, autoapprove_allowed: autoapproveAllowed, auto_approve: autoApprove,
     read_only: readonly, mutate_allowed: mutateAllowed,
@@ -1858,6 +1900,11 @@ async function startDecisionChat(ws, blob) {
           try { costMeter.previewModelSwitch(nm, allowed.display_name || allowed.model_id); } catch {}
           await session.setModel(nm);
           if (allowed.thinking_level) { try { session.setThinkingLevel(allowed.thinking_level); } catch {} }
+          modelMemory.remember(histKey, {
+            provider: allowed.provider,
+            model_id: allowed.model_id,
+            by: blob.username || "",
+          });
           ws.send(JSON.stringify({ type: "model_changed", model_id: allowed.model_id, display: nm.name }));
           break;
         }

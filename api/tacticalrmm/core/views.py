@@ -2401,6 +2401,10 @@ class AIDecisionSession(APIView):
             "thinking_level": chosen.thinking_level,
             "base_url": chosen.provider.base_url,
             "api_key": chosen.provider.api_key,
+            # True when the BROWSER named a model (an AI History resume, or a picker
+            # choice carried into a reconnect). An explicit ask outranks whatever this
+            # conversation was last using - see pibridge/src/model-memory.js.
+            "model_requested": bool(req_id),
             "allowed_models": [mdict(m, full=True) for m in allowed],
             "decision_prompt": core.ai_ticket_decision_prompt or "",
             # Start the chat in the state the operator last chose, not always OFF. Gated by

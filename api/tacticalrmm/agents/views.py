@@ -1898,6 +1898,10 @@ class PiMultiSession(APIView):
             "thinking_level": chosen.thinking_level,
             "base_url": chosen.provider.base_url,
             "api_key": chosen.provider.api_key,
+            # True when the BROWSER named a model (an AI History resume, or a picker
+            # choice carried into a reconnect). An explicit ask outranks whatever this
+            # conversation was last using - see pibridge/src/model-memory.js.
+            "model_requested": bool(req_id),
             "allowed_models": [model_dict_full(m) for m in allowed],
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(
@@ -2092,6 +2096,10 @@ class AgentPiSession(APIView):
             "thinking_level": chosen.thinking_level,
             "base_url": chosen.provider.base_url,
             "api_key": chosen.provider.api_key,
+            # True when the BROWSER named a model (an AI History resume, or a picker
+            # choice carried into a reconnect). An explicit ask outranks whatever this
+            # conversation was last using - see pibridge/src/model-memory.js.
+            "model_requested": bool(req_id),
             "allowed_models": [model_dict_full(m) for m in allowed],
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
