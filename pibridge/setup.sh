@@ -81,7 +81,26 @@ print('https://' + h)
 )"
 
 # --- 5. env file -----------------------------------------------------------
-info "Writing ${ENV_FILE}"
+# PRESERVE anything this script does not own.
+#
+# This block used to `tee` a fixed 8-line file over ${ENV_FILE}, destroying every
+# hand-added variable on every deploy. On 2026-08-25 that silently removed
+# PI_OPERATOR_TOKEN, and because buildOperatorTools() returns [] without it, the AI lost
+# the operator_desktop_* tools entirely - so it fell back to launching browsers through
+# run_device_command, in the workstation's own signed-in profile. A deploy script that
+# eats configuration it does not manage is how you get a fault nobody can trace to a
+# deploy.
+#
+# So: the keys below are OURS and are rewritten every time; everything else in the file is
+# carried across untouched.
+info "Writing ${ENV_FILE} (preserving variables this script does not own)"
+OWNED="PORT HOST REDIS_URL TRMM_API_URL TRMM_API_KEY PI_SESSIONS_ROOT IDLE_TIMEOUT_MS MAX_SESSIONS"
+PRESERVED=""
+if [ -f "${ENV_FILE}" ]; then
+  sudo cp -a "${ENV_FILE}" "${ENV_FILE}.bak.$(date +%s)"
+  KEEP_RE="^($(echo "${OWNED}" | tr ' ' '|'))="
+  PRESERVED="$(sudo grep -vE "${KEEP_RE}" "${ENV_FILE}" 2>/dev/null || true)"
+fi
 sudo tee "${ENV_FILE}" >/dev/null <<EOF
 PORT=8787
 HOST=127.0.0.1
@@ -91,8 +110,19 @@ TRMM_API_KEY=${API_KEY}
 PI_SESSIONS_ROOT=${BRIDGE_DIR}/sessions
 IDLE_TIMEOUT_MS=1800000
 MAX_SESSIONS=10
+${PRESERVED}
 EOF
 sudo chmod 600 "${ENV_FILE}"
+
+# The Operator plugin is loaded from /opt, but its TOKEN is read from this file. Without
+# it the AI has no supervised desktop control at all, and nothing says so out loud.
+if ! sudo grep -q "^PI_OPERATOR_TOKEN=" "${ENV_FILE}" 2>/dev/null; then
+  if sudo test -f /etc/pi-ai-operator/operator.env; then
+    printf "\033[0;33m%s\033[0m\n" "WARNING: PI_OPERATOR_TOKEN is not set in ${ENV_FILE}, but the Pi AI Operator is installed."
+    printf "\033[0;33m%s\033[0m\n" "         The bridge will build NO operator_desktop_* tools, and the AI will have no supervised way to drive a desktop."
+    printf "\033[0;33m%s\033[0m\n" "         Copy PI_OPERATOR_BOOTSTRAP_TOKEN from /etc/pi-ai-operator/operator.env into ${ENV_FILE} as PI_OPERATOR_TOKEN."
+  fi
+fi
 sudo mkdir -p "${BRIDGE_DIR}/sessions"
 sudo chown -R "${TRMM_USER}:${TRMM_USER}" "${BRIDGE_DIR}/sessions"
 
