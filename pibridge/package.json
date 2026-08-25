@@ -7,7 +7,7 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/cost-meter.test.mjs && node test/tool-caps.test.mjs && node test/transcript.test.mjs && node test/device-hardware.test.mjs && node --test test/llm-recovery.test.mjs && node --test test/turn-watchdog.test.mjs && node --test test/stream-liveness.test.mjs && node --test test/notebook-write.test.mjs && node --test test/compaction.test.mjs && node --test test/remote-room.test.mjs && node --test test/credential-gate.test.mjs && node --test test/caps-secret.test.mjs"
+    "test": "node test/cost-meter.test.mjs && node test/tool-caps.test.mjs && node test/transcript.test.mjs && node test/device-hardware.test.mjs && node --test test/llm-recovery.test.mjs && node --test test/turn-watchdog.test.mjs && node --test test/stream-liveness.test.mjs && node --test test/notebook-write.test.mjs && node --test test/compaction.test.mjs && node --test test/remote-room.test.mjs && node --test test/credential-gate.test.mjs && node --test test/caps-secret.test.mjs && node --test test/chat-commands.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.3",

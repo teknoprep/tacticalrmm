@@ -23,6 +23,7 @@ import { notebookWriteAuthorisation, privilegedCredentialAuthorisation } from ".
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
 import { makeRemoteBinding } from "./remote-room.js";
+import { makeChatCommands } from "./chat-commands.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
@@ -414,6 +415,31 @@ const COMPACTION_NOTICE =
   "--- Earlier turns were summarised to free up context. They are shown above for " +
   "your reference, but the assistant no longer sees them verbatim - only the summary. ---";
 
+// Every frame the browser is sent, offered to the phone as well.
+//
+// ONE interception point instead of N call sites. The alternative - remembering to add a
+// `remote?.something()` beside every `ws.send` in three thousand lines - is the same bet
+// that already lost once: `onError` existed on the binding from the start and was never
+// called anywhere, so a phone sat silent through every provider error the window showed.
+//
+// The regex avoids re-parsing the big, frequent `agent_event` frames. `JSON.stringify`
+// writes keys in insertion order and every one of these literals declares `type` first,
+// so a match is cheap and a miss just means no mirror - never a broken frame.
+const MIRRORED_TO_PHONE =
+  /^\{"type":"(error|system_note|compacted|cost_warning|info|model_changed)"/;
+
+function mirrorBrowserFramesToPhone(ws, getRemote) {
+  const rawSend = ws.send.bind(ws);
+  ws.send = (data) => {
+    try {
+      if (typeof data === "string" && MIRRORED_TO_PHONE.test(data)) {
+        getRemote()?.mirrorToPhone(JSON.parse(data));
+      }
+    } catch { /* a mirror must never be able to break the browser's frame */ }
+    return rawSend(data);
+  };
+}
+
 function uiTranscript(sessionManager, session) {
   let branch = [];
   try {
@@ -565,6 +591,8 @@ async function startChat(ws, blob) {
   // Declared here (hoisted `var`-style via let) because requestApproval above closes over
   // it, but the binding needs the session's prompt path, which does not exist yet.
   let remote = null;
+  const startedAt = Date.now();
+  mirrorBrowserFramesToPhone(ws, () => remote);
 
   // mutateAllowed = the operator's role can write at all. readonly = the current
   // (toggleable) state; an "AI Resolve" session starts read-only but the operator
@@ -861,11 +889,79 @@ async function startChat(ws, blob) {
     }
   });
 
+  // The toolbar switches, as setters. Both the socket frames below and the typed
+  // commands go through these, so a phone and a browser can never drift apart on what is
+  // in force - there is one place that changes each switch, and it always announces.
+  function applyReadonly(v) {
+    if (mutateAllowed) readonly = !v;
+    try { ws.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
+  }
+  function applyAutoApprove(v) {
+    autoApprove = !!v && !!blob.autoapprove_allowed;
+    try { ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
+  }
+  function applyAutoCredential(v) {
+    autoCredential = !!v && autocredentialAllowed;
+    log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
+        agentId, sessionId, `by ${blob.username || "?"}`);
+    try { ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
+  }
+  function applyLabel(v) {
+    sessionLabel = String(v ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+    if (blob.persist_history) history.recordSession(agentId, sessionId, { label: sessionLabel });
+    log("label set", agentId, sessionId, sessionLabel || "(cleared)");
+    try { ws.send(JSON.stringify({ type: "label_state", value: sessionLabel })); } catch {}
+    // Remote (if on) names itself from this field; tell the browser what the next
+    // pairing code will be called.
+    remote?.pushState();
+  }
+
+  const chatCmds = makeChatCommands({
+    log: (...a) => log(...a, agentId, sessionId),
+    switches: {
+      write: {
+        label: "Write mode",
+        allowed: mutateAllowed,
+        denied: "Your role is read-only on devices.",
+        get: () => !readonly,
+        set: (v) => applyReadonly(v),
+        on: "Pi may apply changes; each action still asks for approval unless Auto-approve is on.",
+        off: "Pi can look but not touch.",
+      },
+      approve: {
+        label: "Auto-approve",
+        allowed: !!blob.autoapprove_allowed,
+        denied: "Your role must approve each device action.",
+        get: () => autoApprove,
+        set: (v) => applyAutoApprove(v),
+        on: "Device actions will run without stopping to ask you.",
+        off: "Every device action will ask you first.",
+      },
+      credentials: {
+        label: "Auto-credential",
+        allowed: autocredentialAllowed,
+        denied: "Your role must approve each credential read.",
+        get: () => autoCredential,
+        set: (v) => applyAutoCredential(v),
+        on: "Ordinary IT Notebook logins can be read without asking. Privileged rows still ask every time, and every lookup is audited.",
+        off: "Pi must ask you before reading any stored credential.",
+      },
+    },
+    label: { get: () => sessionLabel, set: (v) => applyLabel(v) },
+    info: () => ({
+      Model: session?.model?.name || model?.name || blob.model_id,
+      Device: multi ? toolMachines.map((m) => m.label).join(" + ") : facts.hostname,
+    }),
+  });
+
   ws.send(
     JSON.stringify({
       type: "ready",
       session_id: sessionId,
       hostname: multi ? toolMachines.map((m) => m.label).join(" + ") : facts.hostname,
+      // Autocomplete is fed by the server so the list can never offer a switch this
+      // role does not carry as if it would work.
+      commands: chatCmds.spec(),
       multi,
       machines: toolMachines.map((m) => ({
         agent_id: m.agentId,
@@ -967,11 +1063,28 @@ async function startChat(ws, blob) {
   // Splitting them would mean the watchdog budget, the liveness reset and the silent
   // recovery loop applied to one surface and not the other - and the surface that would
   // have missed out is the one being used from a car park on a phone signal.
+  // One line of plain text that both surfaces must see. A switch flipped from a phone
+  // has to appear in the browser transcript too: two people driving one machine on
+  // different assumptions about Write mode is the failure this prevents.
+  function announce(text) {
+    if (!text) return;
+    // One frame. `mirrorBrowserFramesToPhone` puts the same line on the phone, so the
+    // desk and the pocket read the same transcript without two call sites to keep in step.
+    try { ws.send(JSON.stringify({ type: "system_note", text })); } catch { /* socket gone */ }
+  }
+
   async function runPrompt(text, images = [], origin = "browser") {
     // Mirror a browser-typed turn onto the phone, so someone following on mobile sees
     // what the person at the desk just asked rather than an answer to nothing. (A phone
     // turn already carries its own id, which the app uses to thread the reply.)
     if (origin === "browser") remote?.beginBrowserTurn(text);
+    // A typed switch ("/write on"). Handled before the model sees it: it is an
+    // instruction to the WINDOW, and the phone has no toolbar to reach it any other way.
+    const typed = chatCmds.parse(text);
+    if (typed) {
+      const out = chatCmds.run(typed, origin);
+      if (!out.passthrough) { announce(out.reply); return; }
+    }
     // "/compact" is handled HERE, before the prompt reaches the model: it is an
     // instruction to the session, not a question for the LLM, and sending it on
     // would just add another expensive turn to the context it is meant to shrink.
@@ -1013,7 +1126,10 @@ async function startChat(ws, blob) {
   remote = makeRemoteBinding({
     blob,
     key: agentId,
-    label: `${facts?.hostname || agentId} \u2014 ${BRAND.name || "RMM"}`,
+    // The technician's own Label for this chat, read live (a function, not a snapshot)
+    // so renaming the window renames what the phone shows on the next code it is given.
+    // Falls back to the machine when the field is still empty.
+    label: () => sessionLabel.trim() || `${facts?.hostname || agentId} \u2014 ${BRAND.name || "RMM"}`,
     log,
     toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
     submitPrompt: (text, images) => runPrompt(text, images, "phone"),
@@ -1025,6 +1141,7 @@ async function startChat(ws, blob) {
       try { ws.send(JSON.stringify({ type: "approval_resolved", id, approved: !!ok, by: "mobile" })); } catch {}
     },
     transcript: () => uiTranscript(sessionManager, session),
+    startedAt,
   });
 
   ws.on("message", async (raw) => {
@@ -1051,33 +1168,29 @@ async function startChat(ws, blob) {
         case "abort":
           await session.abort();
           break;
+        // A toolbar click and a typed command are the same event with a different input
+        // device, so both end in the same setter AND the same sentence - which is what
+        // reaches a phone that has no toolbar to watch.
         case "set_autoapprove":
-          autoApprove = !!msg.value && blob.autoapprove_allowed;
-          ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove }));
+          applyAutoApprove(msg.value);
+          announce(chatCmds.describe("approve"));
           break;
         case "set_autocredential":
           // Gated by the role, exactly like the ticket chat: remembering a choice, or
           // receiving one over the socket, can never grant the permission itself.
-          autoCredential = !!msg.value && autocredentialAllowed;
-          log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
-              agentId, sessionId, `by ${blob.username || "?"}`);
-          ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential }));
+          applyAutoCredential(msg.value);
+          announce(chatCmds.describe("credentials"));
           break;
         case "set_readonly":
           // operator toggles read-only <-> write; only honored if the role can write
-          if (mutateAllowed) {
-            readonly = !!msg.value;
-          }
-          ws.send(JSON.stringify({ type: "readonly_state", value: readonly }));
+          applyReadonly(!msg.value);
+          announce(chatCmds.describe("write"));
           break;
         case "set_label": {
           // Trimmed and capped, because this is a label rather than a note and it has to
           // fit a table column. Blank clears it and AI History falls back to the
           // generated name, so there is no way to get stuck with a label you cannot remove.
-          sessionLabel = String(msg.value ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
-          if (blob.persist_history) history.recordSession(agentId, sessionId, { label: sessionLabel });
-          log("label set", agentId, sessionId, sessionLabel || "(cleared)");
-          ws.send(JSON.stringify({ type: "label_state", value: sessionLabel }));
+          applyLabel(msg.value);
           break;
         }
         case "set_model": {
@@ -1216,6 +1329,8 @@ async function startDecisionChat(ws, blob) {
   }
   // See the device chat: requestApproval closes over this before the binding can exist.
   let remote = null;
+  const startedAt = Date.now();
+  mirrorBrowserFramesToPhone(ws, () => remote);
 
   // WHAT THE TECHNICIAN ACTUALLY TYPED, kept verbatim by product code.
   //
@@ -1538,9 +1653,85 @@ async function startDecisionChat(ws, blob) {
     rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
   });
 
+  // See the device chat: one setter per switch, shared by the socket frames and the
+  // typed commands, each one announcing so both surfaces stay in step.
+  function applyReadonly(v) {
+    if (mutateAllowed) readonly = !v;
+    try { ws.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
+  }
+  function applyAutoApprove(v) {
+    autoApprove = !!v && autoapproveAllowed;
+    try { ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
+  }
+  function applyAutoCredential(v) {
+    autoCredential = !!v && autocredentialAllowed;
+    log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
+        histKey, sessionId, `by ${blob.username || "?"}`);
+    try { ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
+  }
+  function applyAllowEmail(v) {
+    allowEmail = !!v;
+    try { ws.send(JSON.stringify({ type: "allow_email_state", value: allowEmail })); } catch {}
+  }
+  function applyLabel(v) {
+    sessionLabel = String(v ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+    history.recordSession(histKey, sessionId, { label: sessionLabel });
+    log("label set", histKey, sessionId, sessionLabel || "(cleared)");
+    try { ws.send(JSON.stringify({ type: "label_state", value: sessionLabel })); } catch {}
+    remote?.pushState();
+  }
+
+  const chatCmds = makeChatCommands({
+    log: (...a) => log(...a, histKey, sessionId),
+    switches: {
+      write: {
+        label: "Write mode",
+        allowed: mutateAllowed,
+        denied: "Your role is read-only on devices.",
+        get: () => !readonly,
+        set: (v) => applyReadonly(v),
+        on: "Pi may apply changes; each action still asks for approval unless Auto-approve is on.",
+        off: "Pi can look but not touch.",
+      },
+      approve: {
+        label: "Auto-approve",
+        allowed: autoapproveAllowed,
+        denied: "Your role must approve each device action.",
+        get: () => autoApprove,
+        set: (v) => applyAutoApprove(v),
+        on: "Device actions will run without stopping to ask you.",
+        off: "Every device action will ask you first.",
+      },
+      credentials: {
+        label: "Auto-credential",
+        allowed: autocredentialAllowed,
+        denied: "Your role must approve each credential read.",
+        get: () => autoCredential,
+        set: (v) => applyAutoCredential(v),
+        on: "Ordinary IT Notebook logins can be read without asking. Privileged rows still ask every time, and every lookup is audited.",
+        off: "Pi must ask you before reading any stored credential.",
+      },
+      email: {
+        label: "Customer email",
+        allowed: true,
+        get: () => allowEmail,
+        set: (v) => applyAllowEmail(v),
+        on: "Pi may email the customer from this ticket.",
+        off: "Pi will not email the customer; it will draft for you instead.",
+      },
+    },
+    label: { get: () => sessionLabel, set: (v) => applyLabel(v) },
+    info: () => ({
+      Model: session?.model?.name || model?.name || blob.model_id,
+      Ticket: ticketRef,
+    }),
+  });
+
   ws.send(JSON.stringify({
     type: "ready", session_id: sessionId, hostname: `Ticket ${ticketRef}`,
     multi: false, machines: [],
+    // Server-fed autocomplete: never offers a switch this role does not carry.
+    commands: chatCmds.spec(),
     model: { provider: blob.provider, model_id: blob.model_id, display: model.name },
     allowed_models: (blob.allowed_models || []).map((m) => ({ provider: m.provider, model_id: m.model_id, display_name: m.display_name, thinking_level: m.thinking_level, base_url: m.base_url })),
     require_approval: true, autoapprove_allowed: autoapproveAllowed, auto_approve: autoApprove,
@@ -1578,8 +1769,22 @@ async function startDecisionChat(ws, blob) {
   // One prompt path for the browser and the phone - see the device chat's note. On this
   // surface it also means a message sent from a phone claims the ticket for that
   // technician exactly as typing it at the desk would.
+  // See the device chat: one line both surfaces must see.
+  function announce(text) {
+    if (!text) return;
+    // One frame. `mirrorBrowserFramesToPhone` puts the same line on the phone, so the
+    // desk and the pocket read the same transcript without two call sites to keep in step.
+    try { ws.send(JSON.stringify({ type: "system_note", text })); } catch { /* socket gone */ }
+  }
+
   async function runPrompt(text, images = [], origin = "browser") {
     if (origin === "browser") remote?.beginBrowserTurn(text);
+    // A typed switch ("/email off"). See the device chat.
+    const typed = chatCmds.parse(text);
+    if (typed) {
+      const out = chatCmds.run(typed, origin);
+      if (!out.passthrough) { announce(out.reply); return; }
+    }
     // See the device chat: a session instruction, not a question for the model.
     if (compactCmd.isCommand(text)) {
       await compactCmd.run(text);
@@ -1607,7 +1812,8 @@ async function startDecisionChat(ws, blob) {
   remote = makeRemoteBinding({
     blob,
     key: histKey,
-    label: `Ticket ${ticketRef}`,
+    // Same as the device chat: the Label field wins, the ticket is the fallback.
+    label: () => sessionLabel.trim() || `Ticket ${ticketRef}`,
     log,
     toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
     submitPrompt: (text, images) => runPrompt(text, images, "phone"),
@@ -1618,6 +1824,7 @@ async function startDecisionChat(ws, blob) {
       try { ws.send(JSON.stringify({ type: "approval_resolved", id, approved: !!ok, by: "mobile" })); } catch {}
     },
     transcript: () => uiTranscript(sessionManager, session),
+    startedAt,
   });
 
   let idleTimer;
@@ -1654,34 +1861,28 @@ async function startDecisionChat(ws, blob) {
           ws.send(JSON.stringify({ type: "model_changed", model_id: allowed.model_id, display: nm.name }));
           break;
         }
+        // See the device chat: one setter, one sentence, both surfaces.
         case "set_autoapprove":
-          autoApprove = !!msg.value && autoapproveAllowed;
-          ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove }));
+          applyAutoApprove(msg.value);
+          announce(chatCmds.describe("approve"));
           break;
         case "set_readonly":
-          if (mutateAllowed) readonly = !!msg.value;
-          ws.send(JSON.stringify({ type: "readonly_state", value: readonly }));
+          applyReadonly(!msg.value);
+          announce(chatCmds.describe("write"));
           break;
         case "set_allow_email":
-          allowEmail = !!msg.value;
-          ws.send(JSON.stringify({ type: "allow_email_state", value: allowEmail }));
+          applyAllowEmail(msg.value);
+          announce(chatCmds.describe("email"));
           break;
         case "set_label": {
-          sessionLabel = String(msg.value ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
-          history.recordSession(histKey, sessionId, { label: sessionLabel });
-          log("label set", histKey, sessionId, sessionLabel || "(cleared)");
-          ws.send(JSON.stringify({ type: "label_state", value: sessionLabel }));
+          applyLabel(msg.value);
           break;
         }
         case "set_autocredential":
           // Gated by the role, exactly like Auto-approve: remembering a choice, or
           // receiving one over the socket, can never grant the permission itself.
-          autoCredential = !!msg.value && autocredentialAllowed;
-          log(
-            autoCredential ? "auto-credential ON" : "auto-credential OFF",
-            histKey, sessionId, `by ${blob.username || "?"}`,
-          );
-          ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential }));
+          applyAutoCredential(msg.value);
+          announce(chatCmds.describe("credentials"));
           break;
         case "approve":
         case "deny": {

@@ -182,7 +182,9 @@ function newToken() {
  * @param {object} o
  * @param {string} o.relayUrl   http(s):// - converted to ws(s):// by the transport
  * @param {string} o.username   RMM username; owns the pairing records
- * @param {string} o.label      what the phone shows as the session name
+ * @param {string|function} o.label  what the phone shows as the session name. A FUNCTION
+ *                              when the caller has a name that can change under it - see
+ *                              `resolveLabel` below.
  * @param {string} o.key        history key (agent id / decision:<ticket>) - room scoping + logs
  * @param {function} o.onClient (ClientMessage) => void, from a paired device only
  * @param {function} o.onState  ({state, device}) => void, for the browser's chip
@@ -191,6 +193,17 @@ function newToken() {
 export async function openRemoteRoom({ relayUrl, username, label, key, onClient, onState, log }) {
   const { RelayClient, PlainPeerChannel, buildQRUri } = await mods();
   const kp = await identity();
+
+  // The window's own Label field is the name a technician gives this piece of work, and it
+  // is editable at any moment - including after Remote is switched on. So the label is
+  // resolved every time it actually goes on the wire (room meta, QR payload, pair_ok)
+  // rather than being frozen when the room opened. A phone list showing "DC01 - BlueCloud"
+  // three times is useless; "Exchange migration - HQ" is the whole point of the field.
+  const resolveLabel = () => {
+    let v = "";
+    try { v = typeof label === "function" ? label() : label; } catch { v = ""; }
+    return String(v || "").replace(/\s+/g, " ").trim().slice(0, 120) || "RMM session";
+  };
 
   // Room id: this window, not this directory. `remote-pi` derives it from cwd because one
   // terminal Pi is one folder; our windows all share a cwd, so cwd would collide every
@@ -203,7 +216,7 @@ export async function openRemoteRoom({ relayUrl, username, label, key, onClient,
   const relay = new RelayClient(relayUrl, kp);
   await relay.connect({
     roomId,
-    roomMeta: { name: label, cwd: CONFIG.sessionsRoot },
+    roomMeta: { name: resolveLabel(), cwd: CONFIG.sessionsRoot },
   });
 
   /** @type {Map<string, {channel: any, name: string}>} */
@@ -298,7 +311,7 @@ export async function openRemoteRoom({ relayUrl, username, label, key, onClient,
       reply({
         type: "pair_ok",
         in_reply_to: inner.id,
-        session_name: label,
+        session_name: resolveLabel(),
         session_started_at: Date.now(),
         room_id: roomId,
         harness: { name: "BlueCloud RMM (pi-trmm-bridge)", version: "1" },
@@ -317,7 +330,7 @@ export async function openRemoteRoom({ relayUrl, username, label, key, onClient,
       channel.send({
         type: "pair_ok",
         in_reply_to: inner?.id || "reattach",
-        session_name: label,
+        session_name: resolveLabel(),
         session_started_at: Date.now(),
         room_id: roomId,
         harness: { name: "BlueCloud RMM (pi-trmm-bridge)", version: "1" },
@@ -333,8 +346,9 @@ export async function openRemoteRoom({ relayUrl, username, label, key, onClient,
   function pairingCode() {
     token = newToken();
     tokenExpires = Date.now() + TOKEN_TTL_MS;
-    const uri = buildQRUri(token, kp.publicKey, label, roomId);
-    return { uri, expires_in_ms: TOKEN_TTL_MS };
+    const name = resolveLabel();
+    const uri = buildQRUri(token, kp.publicKey, name, roomId);
+    return { uri, expires_in_ms: TOKEN_TTL_MS, label: name };
   }
 
   function close(reason = "peer_stop") {
@@ -357,6 +371,7 @@ export async function openRemoteRoom({ relayUrl, username, label, key, onClient,
     pairingCode,
     close,
     get pairedCount() { return peers.size; },
+    get label() { return resolveLabel(); },
     state,
   };
 }
@@ -380,12 +395,15 @@ export function makeRemoteBinding({
   abort,
   resolveApproval,
   transcript,
+  startedAt = Date.now(),
 }) {
   const allowed = !!blob.remote_allowed && !!blob.remote_relay_url;
   const username = blob.username || "";
   let room = null;
   let turnId = "turn-0";
   let turnSeq = 0;
+  // Per-turn scratchpad for the translation - see `toWireMessages`.
+  const seen = { streamed: false };
 
   function tell(frame) {
     try { toBrowser(frame); } catch { /* browser gone */ }
@@ -396,10 +414,24 @@ export function makeRemoteBinding({
       type: "remote_state",
       enabled: !!room,
       allowed,
+      label: room ? room.label : "",
       devices: allowed ? pairedDevices(username) : [],
       ...(room ? room.state() : { state: "off", device: "" }),
       ...extra,
     });
+  }
+
+  /** Issue a code and hand it to the browser's pairing dialog. */
+  function emitPairing() {
+    if (!room) return false;
+    const code = room.pairingCode();
+    tell({
+      type: "remote_pairing",
+      uri: code.uri,
+      expires_in_ms: code.expires_in_ms,
+      label: code.label,
+    });
+    return true;
   }
 
   async function open() {
@@ -448,16 +480,20 @@ export function makeRemoteBinding({
           // How an approval prompt comes back: the app renders it as a confirm dialog.
           resolveApproval(String(msg.id || ""), msg.confirmed === true);
           break;
-        case "session_sync":
+        case "session_sync": {
+          // The phone joined a conversation already in progress. This is the whole of it.
+          const events = toWireHistory(transcript?.() || [], startedAt);
+          log?.("remote sync", key, username, `${events.length} events to ${who.name}`);
           room?.send({
             type: "session_history",
             in_reply_to: String(msg.id || ""),
-            session_started_at: Date.now(),
-            events: toWireHistory(transcript?.() || []),
+            session_started_at: startedAt,
+            events,
             eos: true,
             truncated: false,
           });
           break;
+        }
         case "ping":
           room?.send({ type: "pong", in_reply_to: String(msg.id || "") });
           break;
@@ -522,6 +558,12 @@ export function makeRemoteBinding({
           try {
             await open();
             pushState();
+            // Switching Remote on IS the request for a code. The browser opens its
+            // dialog on the click and sits on a spinner until a `remote_pairing` frame
+            // arrives, so making the FIRST code wait for a second click leaves the
+            // technician staring at "Opening the relay..." forever - which is exactly
+            // what it did. One code, issued here, the moment the room is up.
+            emitPairing();
           } catch (e) {
             log?.("remote open failed", key, username, String(e?.message || e));
             close("open failed");
@@ -534,9 +576,24 @@ export function makeRemoteBinding({
         return true;
       }
       if (msg?.type === "remote_pair") {
-        if (!room) { pushState({ error: "Turn Remote on first." }); return true; }
-        const code = room.pairingCode();
-        tell({ type: "remote_pairing", uri: code.uri, expires_in_ms: code.expires_in_ms });
+        if (!room) {
+          // Asking for a code with no room is not an error worth refusing - it is the
+          // same intent as switching Remote on. Open, then hand back the code.
+          if (!allowed) {
+            pushState({ error: "Mobile access is not enabled for your role, or no relay is configured." });
+            return true;
+          }
+          try {
+            await open();
+            pushState();
+          } catch (e) {
+            log?.("remote open failed", key, username, String(e?.message || e));
+            close("open failed");
+            pushState({ error: `Could not reach the relay: ${String(e?.message || e).slice(0, 200)}` });
+            return true;
+          }
+        }
+        emitPairing();
         return true;
       }
       if (msg?.type === "remote_status") {
@@ -555,7 +612,22 @@ export function makeRemoteBinding({
     /** Every SDK event, already being sent to the browser. */
     onAgentEvent(event) {
       if (!room) return;
-      for (const m of toWireMessages(event, turnId)) room.send(m);
+      for (const m of toWireMessages(event, turnId, seen)) room.send(m);
+    },
+
+    /**
+     * A frame the BROWSER is being sent, mirrored to the phone when it carries something
+     * the window puts on screen. Errors, compaction notices, cost warnings and switch
+     * changes are all things a technician reads and acts on; a phone that silently misses
+     * them is showing a different conversation from the one at the desk.
+     *
+     * The app's decoder REJECTS unknown types, so everything lands as `error` or
+     * `agent_message` - the two shapes it will render.
+     */
+    mirrorToPhone(frame) {
+      if (!room) return;
+      const wire = browserFrameToPhone(frame, turnId);
+      if (wire) room.send(wire);
     },
 
     /** An approval the model is waiting on - the phone can answer it. */
@@ -579,17 +651,99 @@ export function makeRemoteBinding({
   };
 }
 
+/**
+ * A frame bound for the browser, as the phone should hear it - or null for the ones it
+ * has no business seeing (cost meters ticking, working pings, toggle echoes it already
+ * got as a sentence).
+ *
+ * The app's decoder REJECTS unknown server types, so everything has to land as one of the
+ * shapes it renders: `error` or `agent_message`.
+ */
+export function browserFrameToPhone(frame, turnId = "turn-0") {
+  if (!frame || typeof frame !== "object") return null;
+  const t = frame.type;
+  if (t === "error") {
+    const text = String(frame.message || "").trim();
+    return text ? { type: "error", code: "internal_error", message: text.slice(0, 800) } : null;
+  }
+  const line =
+    t === "system_note" ? String(frame.text || "")
+    : t === "compacted" ? `\u{1F5DC} ${frame.message || "Conversation summarised."}`
+    : t === "cost_warning" ? `\u26a0 ${frame.message || ""}`
+    : t === "info" ? String(frame.message || "")
+    : t === "model_changed" ? `Switched model to ${frame.display || frame.model_id || ""}`
+    : "";
+  return line.trim() ? { type: "agent_message", in_reply_to: turnId, text: line.trim() } : null;
+}
+
+// ---- SDK shapes -> text -------------------------------------------------------------
+// The phone is a small screen on a slow link, so tool output is an indicator here and
+// the full thing stays in the browser transcript. Everything else must match what the
+// window shows, word for word: two people reading different accounts of the same turn is
+// the failure this file exists to prevent.
+const TOOL_RESULT_MAX = 2000;
+
+/** Join the text blocks of an SDK content array (or pass a plain string through). */
+function blockText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((c) => (c && c.type === "text" ? String(c.text ?? "") : "")).join("");
+}
+
+/**
+ * One tool result, one string - whether it arrived as the LIVE event's wrapper
+ * (`{content:[…], details}`) or as the stored message's bare content array. They used to
+ * be read by two different bits of code, which is how the phone ended up showing
+ * "[object Object]" live and the real output after a re-sync.
+ */
+function toolResultText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return blockText(value);
+  if (value && typeof value === "object") {
+    if (Array.isArray(value.content)) return blockText(value.content);
+    if (typeof value.text === "string") return value.text;
+    try { return JSON.stringify(value); } catch { return ""; }
+  }
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function clipForPhone(text) {
+  const t = String(text || "");
+  return t.length > TOOL_RESULT_MAX
+    ? `${t.slice(0, TOOL_RESULT_MAX)}\n…(truncated - see the RMM window)`
+    : t;
+}
+
+/** Photos the technician attached, in the shape the app rebuilds a bubble from. */
+function imagesFromContent(content) {
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const c of content) {
+    if (c && c.type === "image" && typeof c.data === "string" && typeof c.mimeType === "string") {
+      out.push({ data: c.data, mime: c.mimeType });
+    }
+  }
+  return out;
+}
+
 // ---- SDK event -> app wire ---------------------------------------------------------
 // The browser gets the raw SDK event and renders it; the phone speaks a flatter protocol.
 // One translation, in one place, so a protocol bump is a single file to fix.
 //
 // Returns an array because one SDK event can be zero or more wire messages.
-export function toWireMessages(event, turnId) {
+//
+// `seen` is the per-turn scratchpad the caller owns (see `onAgentEvent`). It exists for
+// one case: an assistant message that arrives with NO text deltas - a replayed turn, a
+// recovery, a provider that does not stream. The browser renders it from the finished
+// message and the phone, which only ever saw deltas, showed an empty bubble. Now the end
+// of the turn fills it in.
+export function toWireMessages(event, turnId, seen = null) {
   const out = [];
   switch (event?.type) {
     case "message_update": {
       const ev = event.assistantMessageEvent;
       if (ev?.type === "text_delta" && ev.delta) {
+        if (seen) seen.streamed = true;
         out.push({ type: "agent_chunk", in_reply_to: turnId, delta: ev.delta });
       }
       break;
@@ -603,17 +757,11 @@ export function toWireMessages(event, turnId) {
       });
       break;
     case "tool_execution_end": {
-      const text = (event.result?.content || [])
-        .filter((c) => c.type === "text")
-        .map((c) => c.text)
-        .join("\n");
-      // The phone is a small screen on a slow link. Full device output belongs in the
-      // browser transcript, which still has all of it; here it is an indicator.
-      const clipped = text.length > 2000 ? `${text.slice(0, 2000)}\n…(truncated - see the RMM window)` : text;
+      const text = clipForPhone(toolResultText(event.result));
       out.push(
         event.isError
-          ? { type: "tool_result", tool_call_id: event.toolCallId, error: clipped || "failed" }
-          : { type: "tool_result", tool_call_id: event.toolCallId, result: clipped },
+          ? { type: "tool_result", tool_call_id: event.toolCallId, error: text || "failed" }
+          : { type: "tool_result", tool_call_id: event.toolCallId, result: text },
       );
       break;
     }
@@ -625,6 +773,13 @@ export function toWireMessages(event, turnId) {
               output_tokens: Number(event.message.usage.output || 0),
             }
           : undefined;
+        // Nothing streamed, but the finished message has words in it: send them whole,
+        // or the phone shows a turn that answered nothing.
+        if (seen && !seen.streamed) {
+          const text = blockText(event.message.content);
+          if (text.trim()) out.push({ type: "agent_message", in_reply_to: turnId, text });
+        }
+        if (seen) seen.streamed = false;
         out.push({ type: "agent_done", in_reply_to: turnId, ...(usage ? { usage } : {}) });
       }
       break;
@@ -634,16 +789,107 @@ export function toWireMessages(event, turnId) {
   return out;
 }
 
-/** Prior conversation, in the shape `session_sync` expects. */
-export function toWireHistory(transcript) {
+/**
+ * The conversation so far, in the shape `session_sync` expects.
+ *
+ * A phone pairs into a chat that is already running, so this IS the phone's view of
+ * everything that happened before it arrived. It takes the SAME transcript the browser
+ * renders (`uiTranscript`) - SDK messages with content BLOCKS, not flat strings.
+ *
+ * The previous version read `m.text`, which no message has: every synced bubble came out
+ * empty, tool calls were dropped entirely, and a reply was threaded to its own timestamp
+ * instead of the question. A technician pairing mid-ticket got a blank conversation and
+ * had to walk back to the desk to read it - the exact thing Remote exists to avoid.
+ *
+ * @param {Array} transcript  uiTranscript() output: {role, content, toolCallId, isError}
+ * @param {number} startedAt  session start, so the ordering clock is real
+ */
+export function toWireHistory(transcript, startedAt = 0) {
   const events = [];
-  let ts = Date.now() - (transcript?.length || 0) * 1000;
+  // Anchor the clock to the first REAL timestamp when the SDK kept one, so a resumed
+  // conversation is not stamped as if it all happened in the last few seconds.
+  const firstStamp = (transcript || [])
+    .map((m) => (typeof m?.timestamp === "number" ? m.timestamp : 0))
+    .find((t) => t > 0);
+  let clock = firstStamp
+    ? firstStamp - 1
+    : (Number(startedAt) > 0 ? Number(startedAt) : Date.now() - (transcript?.length || 0) * 1000);
+  let lastUserId = null;
+
   for (const m of transcript || []) {
-    ts += 1000;
+    // Real timestamps when the SDK kept them, monotonic filler when it did not. Order is
+    // the thing that must never be wrong; exact times are a bonus.
+    const stamped = typeof m?.timestamp === "number" && m.timestamp > 0 ? m.timestamp : 0;
+    clock = Math.max(clock + 1, stamped);
+    const ts = clock;
+
+    if (!m || typeof m !== "object") continue;
+
     if (m.role === "user") {
-      events.push({ ts, type: "user_input", id: `sync_${ts}`, text: String(m.text || "") });
-    } else if (m.role === "assistant") {
-      events.push({ ts, type: "agent_message", in_reply_to: `sync_${ts}`, text: String(m.text || "") });
+      const text = blockText(m.content);
+      const images = imagesFromContent(m.content);
+      if (!text.trim() && !images.length) continue;
+      const id = `sync_${ts}`;
+      lastUserId = id;
+      events.push({ ts, type: "user_input", id, text, ...(images.length ? { images } : {}) });
+      continue;
+    }
+
+    if (m.role === "assistant") {
+      const content = Array.isArray(m.content) ? m.content : [];
+      const usage = m.usage
+        ? { input_tokens: Number(m.usage.input || 0), output_tokens: Number(m.usage.output || 0) }
+        : undefined;
+      if (!content.length) {
+        const text = blockText(m.content);
+        if (text.trim()) {
+          events.push({ ts, type: "agent_message", in_reply_to: lastUserId || `sync_${ts}`, text });
+        }
+        continue;
+      }
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        if (block.type === "text") {
+          const text = String(block.text ?? "");
+          if (!text.trim()) continue;
+          events.push({
+            ts,
+            type: "agent_message",
+            in_reply_to: lastUserId || `sync_${ts}`,
+            text,
+            ...(usage ? { usage } : {}),
+          });
+        } else if (block.type === "toolCall") {
+          // The window shows what Pi RAN, not just what it said about it. Without these
+          // the phone reads like a monologue with unexplained gaps.
+          events.push({
+            ts,
+            type: "tool_request",
+            tool_call_id: String(block.id ?? ""),
+            tool: String(block.name ?? ""),
+            args: block.arguments ?? {},
+          });
+        }
+      }
+      continue;
+    }
+
+    if (m.role === "toolResult") {
+      const text = clipForPhone(toolResultText(m.content));
+      const id = String(m.toolCallId ?? "");
+      events.push(
+        m.isError
+          ? { ts, type: "tool_result", tool_call_id: id, error: text || "failed" }
+          : { ts, type: "tool_result", tool_call_id: id, result: text },
+      );
+      continue;
+    }
+
+    if (m.role === "system") {
+      // The bridge's own divider at a compaction point. The app renders this natively,
+      // so a resumed chat explains its own gap on the phone exactly as it does on screen.
+      const text = blockText(m.content);
+      if (text.trim()) events.push({ ts, type: "compaction", summary: text, tokens_before: 0 });
     }
   }
   return events;
