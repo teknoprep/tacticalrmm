@@ -44,6 +44,7 @@ from tacticalrmm.constants import (
     AGENT_STATUS_ONLINE,
     AGENT_STATUS_OVERDUE,
     CACHE_DB_FIELDS_TASK_LOCK,
+    AI_REPORT_SCHEDULES_LOCK,
     RESOLVE_ALERTS_LOCK,
     SYNC_MESH_PERMS_TASK_LOCK,
     SYNC_SCHED_TASK_LOCK,
@@ -2603,14 +2604,43 @@ def send_open_ticket_review(force=False, recipients_override=None, hours=None,
                    + ("" if ok else f" - {msg}"))
 
 
-@app.task
-def dispatch_ai_report_schedules():
+@app.task(bind=True)
+def dispatch_ai_report_schedules(self):
     """Run whichever operator-defined reports are due. Ticks often; the schedule decides.
 
     Each schedule is checked against its own most recent occurrence rather than a fixed clock
     slot, so a report is sent once per occurrence, a missed window is picked up late instead of
     skipped in silence, and a five-minute tick cannot send the same email twelve times.
+
+    TWO guards against sending the same report twice, because it happened. This task was the
+    only AI beat task with no lock, and it did an unguarded read-then-write: it checked
+    last_run, sent the mail, and only then recorded the send. Two workers reading before
+    either wrote both decided the same slot was due. Normally that window is narrow; on
+    2026-08-13 it was not, because a wedged worker had accumulated 1,151 stale ticks of this
+    task and several replayed at once when the backlog was cleared. Two identical activity
+    reports went to Chris and Fred.
+
+      * redis_lock stops two dispatchers running at all, matching resolve_alerts_task;
+      * the slot is then CLAIMED atomically -- a conditional UPDATE on the row's previous
+        last_run, sending only if this worker was the one that changed it.
+
+    Belt and braces deliberately: the lock handles the ordinary case, and the conditional
+    update makes a duplicate structurally impossible even if the lock is ever lost.
     """
+    import zoneinfo
+    from datetime import timedelta
+
+    from django.utils import timezone as djangotime
+
+    from core.models import AIReportSchedule, CoreSettings
+
+    with redis_lock(AI_REPORT_SCHEDULES_LOCK, self.app.oid) as acquired:
+        if not acquired:
+            return f"{self.app.oid} still running"
+        return _dispatch_ai_report_schedules_inner()
+
+
+def _dispatch_ai_report_schedules_inner():
     import zoneinfo
     from datetime import timedelta
 
@@ -2635,6 +2665,14 @@ def dispatch_ai_report_schedules():
             continue
         if sch.last_run and sch.last_run.astimezone(tz) >= due:
             continue
+        # Claim the slot before sending, not after. Only the worker whose UPDATE actually
+        # changed the row proceeds; anyone else reading the same stale last_run loses the
+        # race and skips, instead of sending a second copy.
+        claimed = AIReportSchedule.objects.filter(
+            pk=sch.pk, last_run=sch.last_run
+        ).update(last_run=djangotime.now())
+        if not claimed:
+            continue
         rcpt = sch.recipients or ""
         opts = sch.options if isinstance(sch.options, dict) else {}
         try:
@@ -2643,6 +2681,9 @@ def dispatch_ai_report_schedules():
                     hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
             elif sch.kind == "ai_spend":
                 res = send_ai_spend_report(
+                    hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+            elif sch.kind == "autowork_readiness":
+                res = send_autowork_readiness_report(
                     hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
             elif sch.kind == "open_tickets":
                 res = send_open_ticket_review(
@@ -2655,11 +2696,62 @@ def dispatch_ai_report_schedules():
         except Exception as e:
             res = f"FAILED: {str(e)[:300]}"
             DebugLog.error(message=f"scheduled report '{sch.name}' failed: {e}")
-        sch.last_run = djangotime.now()
+        # last_run was set by the claim above; record only the outcome here.
         sch.last_result = str(res)[:1000]
-        sch.save(update_fields=["last_run", "last_result"])
+        sch.save(update_fields=["last_result"])
         ran.append(f"{sch.name}: {str(res)[:80]}")
     return "; ".join(ran) if ran else "nothing due"
+
+
+@app.task
+def send_autowork_readiness_report(hours=None, recipients_override=None, options=None):
+    """Email the auto-work readiness report. Registered as the `autowork_readiness` kind.
+
+    Answers, per ticket: would the AI have worked this alone, using which procedure, and
+    what is blocking it. Read-only -- it arms nothing and changes no ticket, which is what
+    makes it safe to run daily while trust is still being established.
+    """
+    from core.ai_autowork_report import collect, render_html
+
+    core = get_core_settings()
+    if not core.ai_module_enabled:
+        return "ai module disabled"
+
+    opts = options or {}
+    hours = max(1, int(hours or 24))
+    data = collect(hours=hours, options=opts,
+                   fetch_bodies=bool(opts.get("fetch_bodies", True)),
+                   body_cap=int(opts.get("body_cap", 60)))
+
+    if not data["total"] and not opts.get("send_when_empty"):
+        return "no tickets arrived in this window"
+
+    recipients = [x.strip() for x in
+                  (recipients_override or core.ai_daily_report_recipients or "")
+                  .replace(";", ",").split(",") if x.strip()]
+    if not recipients:
+        recipients = list(core.email_alert_recipients or [])
+    if not recipients:
+        return "no recipients configured"
+
+    c = data["counts"]
+    subject = ("AI auto-work readiness - %d of %d ticket(s) would run unattended (%d blocked)"
+               % (c["would_auto_work"], data["total"], c["blocked"]))
+    html = render_html(data, core=core)
+    text = ["AI auto-work readiness, last %dh" % hours,
+            "  would auto-work : %d" % c["would_auto_work"],
+            "  blocked         : %d" % c["blocked"],
+            "  no procedure    : %d" % c["no_procedure"],
+            "  armed procedures: %d of %d approved" % (
+                data["procedure_totals"]["armed"], data["procedure_totals"]["approved"]),
+            ""]
+    for r in data["rows"]:
+        text.append("%-14s %-9s %s" % (r["ref"], r["verdict"], r["subject"][:60]))
+        if r["blockers"]:
+            text.append("               blocked by: " + "; ".join(r["blockers"]))
+    msg, ok = core.send_mail(subject=subject, body="\n".join(text), html_body=html,
+                             override_recipients=recipients)
+    return ("sent to %s" % ", ".join(recipients)) if ok else ("send failed: %s" % msg)
 
 
 @app.task

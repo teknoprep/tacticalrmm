@@ -222,6 +222,7 @@ class CoreSettings(BaseAuditModel):
     )
     ai_operator_allowed_agent_ids = models.JSONField(default=list, blank=True)
 
+
     # SCHEDULED RUNTIME UPDATE - upgrading the AI runtime restarts the bridge, which drops
     # live chats and in-flight background runs. So it happens (a) only inside a window an
     # operator chose, and (b) only once nothing is running. If the new version is not
@@ -1476,6 +1477,10 @@ class AIReportSchedule(models.Model):
         ("open_tickets", "Open-ticket review - what could be done"),
         ("tech_productivity", "Technician Productivity Analysis - how each tech is doing"),
         ("ai_spend", "AI Spend - what the AI cost, from the spend ledger"),
+        # Per-ticket verdict: would the AI have worked this unattended, using which
+        # procedure, and what is blocking it. Read-only by design -- it arms nothing and
+        # touches no ticket, so it can run daily while trust is still being built.
+        ("autowork_readiness", "AI Auto-work Readiness - would it work each ticket alone"),
     )
     CADENCE = (
         ("daily", "Every day"),
@@ -1485,7 +1490,7 @@ class AIReportSchedule(models.Model):
     )
 
     name = models.CharField(max_length=120)
-    kind = models.CharField(max_length=20, choices=KIND, default="activity")
+    kind = models.CharField(max_length=32, choices=KIND, default="activity")
     enabled = models.BooleanField(default=True)
 
     cadence = models.CharField(max_length=12, choices=CADENCE, default="daily")
