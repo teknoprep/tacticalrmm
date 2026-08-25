@@ -1,4 +1,8 @@
-// Which model was this conversation last using?
+// What state was this conversation left in?
+//
+// Model, Write mode, Auto-approve, Auto-credential and Allow-customer-email. One file per
+// conversation, restored when the window reopens, and every one of them re-checked against
+// the permissions of whoever is opening it.
 //
 // THE PROBLEM. Every window opened on the GLOBAL default model. A technician who switched
 // to Grok for a job, then hit F5 (or came back after the socket dropped), landed back on
@@ -32,20 +36,100 @@ function memoryPath(scopeKey) {
   return path.join(dir, "last-model.json");
 }
 
+/** Whole remembered record for a conversation, or {} - tolerating the older
+ *  model-only file shape, which had provider/model_id at the top level. */
+function readRecord(scopeKey) {
+  if (!scopeKey) return {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(memoryPath(scopeKey), "utf8"));
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRecord(scopeKey, rec) {
+  try {
+    fs.writeFileSync(memoryPath(scopeKey), JSON.stringify(rec, null, 2));
+  } catch {
+    /* preference only */
+  }
+}
+
+/**
+ * Record the state of one switch. Merges, so each setter can record only its own.
+ *
+ * NOTE the values stored are what the technician CHOSE, not what they were permitted.
+ * Someone with write rights leaves Write mode on; a colleague without them opens the same
+ * window read-only and the memory is not rewritten by that. Storing the granted value
+ * instead would let one person's missing permission silently erase another's setting.
+ */
+export function rememberSwitch(scopeKey, name, value, by = "") {
+  if (!scopeKey || !SWITCHES.includes(name)) return;
+  const rec = readRecord(scopeKey);
+  rec.switches = { ...(rec.switches || {}), [name]: !!value };
+  rec.by = by || rec.by || "";
+  rec.at = new Date().toISOString();
+  writeRecord(scopeKey, rec);
+}
+
+export const SWITCHES = ["write", "auto_approve", "auto_credential", "allow_email"];
+
+/**
+ * The switch states this window should reopen with.
+ *
+ * Same rule as the model: memory NAMES a state, it never grants one. Every switch is
+ * re-checked against this caller's permissions, so a window left in Write mode by someone
+ * who has that right opens read-only for someone who does not - and says so.
+ *
+ * Precedence: this conversation's memory, then the person's own saved default (which
+ * Django puts in the blob), then the surface default.
+ */
+export function chooseSwitches(scopeKey, blob = {}) {
+  const remembered = readRecord(scopeKey).switches || {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(remembered, k);
+  const restored = [];
+  const denied = [];
+
+  const mutateAllowed = !!blob.mutate_allowed;
+  let write = has("write") ? !!remembered.write : !!blob.allow_mutating;
+  if (has("write") && !!remembered.write !== !!blob.allow_mutating) restored.push("Write mode");
+  if (write && !mutateAllowed) {
+    write = false;
+    if (has("write")) { restored.pop(); denied.push("Write mode"); }
+  }
+
+  const aaAllowed = !!(blob.autoapprove_allowed);
+  let autoApprove = has("auto_approve") ? !!remembered.auto_approve : !!blob.auto_approve;
+  if (has("auto_approve") && remembered.auto_approve) restored.push("Auto-approve");
+  if (autoApprove && !aaAllowed) {
+    autoApprove = false;
+    if (has("auto_approve")) { restored.pop(); denied.push("Auto-approve"); }
+  }
+
+  const acAllowed = !!(blob.autocredential_allowed);
+  let autoCredential = has("auto_credential") ? !!remembered.auto_credential : !!blob.auto_credential;
+  if (has("auto_credential") && remembered.auto_credential) restored.push("Auto-credential");
+  if (autoCredential && !acAllowed) {
+    autoCredential = false;
+    if (has("auto_credential")) { restored.pop(); denied.push("Auto-credential"); }
+  }
+
+  // No role permission of its own - it is a per-window switch on the ticket surface.
+  const allowEmail = has("allow_email") ? !!remembered.allow_email : blob.allow_email !== false;
+  if (has("allow_email") && !allowEmail) restored.push("Customer email OFF");
+
+  return { readonly: !write, autoApprove, autoCredential, allowEmail, restored, denied };
+}
+
 /**
  * Record the model this conversation is now using.
  * Never throws: losing this preference must not be able to break a chat.
  */
 export function remember(scopeKey, { provider, model_id, by = "" } = {}) {
   if (!scopeKey || !provider || !model_id) return;
-  try {
-    fs.writeFileSync(
-      memoryPath(scopeKey),
-      JSON.stringify({ provider, model_id, by, at: new Date().toISOString() }, null, 2),
-    );
-  } catch {
-    /* preference only */
-  }
+  const rec = readRecord(scopeKey);
+  writeRecord(scopeKey, { ...rec, provider, model_id, by, at: new Date().toISOString() });
 }
 
 /** What this conversation last used, or null. */

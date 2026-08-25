@@ -23,7 +23,7 @@ import { notebookWriteAuthorisation, privilegedCredentialAuthorisation } from ".
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
 import { makeRemoteBinding } from "./remote-room.js";
-import * as modelMemory from "./model-memory.js";
+import * as windowMemory from "./window-memory.js";
 import { makeChatCommands } from "./chat-commands.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
@@ -564,9 +564,9 @@ async function startChat(ws, blob) {
   const rt = await piRuntime(keys);
   const modelRegistry = rt;                       // .findModel() below; kept name for diff clarity
   // Reopen on the model this conversation was last using, not on the global default - see
-  // model-memory.js. Falls back to the default when nothing is remembered or when this
+  // window-memory.js. Falls back to the default when nothing is remembered or when this
   // technician's role does not carry the remembered model.
-  const pick = modelMemory.chooseModel(agentId, blob);
+  const pick = windowMemory.chooseModel(agentId, blob);
   let model = rt.findModel(pick.provider, pick.model_id);
   if (!model && pick.source !== "default") {
     // The remembered model no longer resolves (retired upstream, provider disabled). Not
@@ -589,7 +589,12 @@ async function startChat(ws, blob) {
   // in this WebSocket connection, so a refresh, a second window or a dropped socket silently
   // turned auto-approve off while the UI still looked on - which is why it "sometimes" did
   // not work. The role permission still decides whether it may be honoured at all.
-  let autoApprove = !!blob.auto_approve && !!blob.autoapprove_allowed;
+  //
+  // Reopen in the state the window was LEFT in rather than the surface default - Write
+  // mode, Auto-approve, Auto-credential. Each is re-checked against THIS caller's
+  // permissions inside chooseSwitches(); see window-memory.js.
+  const switches = windowMemory.chooseSwitches(agentId, blob);
+  let autoApprove = switches.autoApprove;
   const pendingApprovals = new Map();
   function requestApproval(summary) {
     if (!blob.require_approval) return Promise.resolve(true);
@@ -613,7 +618,7 @@ async function startChat(ws, blob) {
   // (toggleable) state; an "AI Resolve" session starts read-only but the operator
   // can flip write mode on if their role allows it.
   const mutateAllowed = !!blob.mutate_allowed;
-  let readonly = !blob.allow_mutating;
+  let readonly = switches.readonly;
   if (!mutateAllowed) readonly = true; // can never write
   const techSaid = [];
 
@@ -623,7 +628,7 @@ async function startChat(ws, blob) {
   // ticket does, and having the switch on one surface and not the other was not a policy
   // decision, it was where the feature happened to be built first.
   const autocredentialAllowed = !!blob.autocredential_allowed;
-  let autoCredential = !!blob.auto_credential && autocredentialAllowed;
+  let autoCredential = switches.autoCredential;
   const credentialGate = makeCredentialGate({
     isOn: () => autoCredential,
     allowed: autocredentialAllowed,
@@ -907,16 +912,22 @@ async function startChat(ws, blob) {
   // The toolbar switches, as setters. Both the socket frames below and the typed
   // commands go through these, so a phone and a browser can never drift apart on what is
   // in force - there is one place that changes each switch, and it always announces.
+  // Each setter also RECORDS the choice, so the window reopens the way it was left. The
+  // value stored is what the technician asked for, not what they were granted - see
+  // window-memory.js rememberSwitch().
   function applyReadonly(v) {
     if (mutateAllowed) readonly = !v;
+    windowMemory.rememberSwitch(agentId, "write", !!v, blob.username || "");
     try { ws.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
   }
   function applyAutoApprove(v) {
     autoApprove = !!v && !!blob.autoapprove_allowed;
+    windowMemory.rememberSwitch(agentId, "auto_approve", !!v, blob.username || "");
     try { ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
   }
   function applyAutoCredential(v) {
     autoCredential = !!v && autocredentialAllowed;
+    windowMemory.rememberSwitch(agentId, "auto_credential", !!v, blob.username || "");
     log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
         agentId, sessionId, `by ${blob.username || "?"}`);
     try { ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
@@ -984,12 +995,16 @@ async function startChat(ws, blob) {
         role: m.role,
       })),
       // The model actually in force, which is NOT necessarily the blob's default: this
-      // window reopens on whatever it was last using (model-memory.js). The browser sets
+      // window reopens on whatever it was last using (window-memory.js). The browser sets
       // its picker from this, or it would show the default while the session ran on
       // something else.
       model: { provider: effectiveModel.provider, model_id: effectiveModel.model_id, display: model.name },
       model_source: effectiveModel.source,
       model_remembered_denied: effectiveModel.remembered || "",
+      // Switches restored from the last time this window was open, and any that were
+      // remembered ON but are not available to this person.
+      switches_restored: switches.restored,
+      switches_denied: switches.denied,
       allowed_models: (blob.allowed_models || []).map((m) => ({
         provider: m.provider,
         model_id: m.model_id,
@@ -1259,7 +1274,7 @@ async function startChat(ws, blob) {
           // only in this socket, so a refresh silently put the technician back on the
           // default - and a model switch re-caches the whole conversation, so they paid
           // for the switch again without being told they had lost it.
-          modelMemory.remember(agentId, {
+          windowMemory.remember(agentId, {
             provider: allowed.provider,
             model_id: allowed.model_id,
             by: blob.username || "",
@@ -1330,26 +1345,28 @@ async function startDecisionChat(ws, blob) {
 
   // Controls (mirror the device chat): Write mode, Auto-approve, Allow customer email.
   const mutateAllowed = blob.mutate_allowed !== false;
-  let readonly = !(blob.allow_mutating !== false); // default: Write mode ON
+  // Same as the device chat: the state this TICKET window was left in, permission-checked.
+  const switches = windowMemory.chooseSwitches(histKey, blob);
+  let readonly = switches.readonly;
   if (!mutateAllowed) readonly = true;
   const autoapproveAllowed = !!blob.autoapprove_allowed;
   // Same remembered-choice rule as the device chat (see above).
-  let autoApprove = !!blob.auto_approve && !!blob.autoapprove_allowed;
-  let allowEmail = blob.allow_email !== false; // default: ON
+  let autoApprove = switches.autoApprove;
+  let allowEmail = switches.allowEmail;
   // AUTO-CREDENTIAL. Its own role permission (can_use_ai_autocredential), its own
   // toggle, and its own remembered default - never inferred from Auto-approve. What it
   // buys: an ordinary IT Notebook row can be read without stopping the work to ask.
   // What it deliberately does NOT buy: the privileged rows, which keep asking a human
   // every single time (see gate("secret") below).
   const autocredentialAllowed = !!blob.autocredential_allowed;
-  let autoCredential = !!blob.auto_credential && autocredentialAllowed;
+  let autoCredential = switches.autoCredential;
 
   const keys = { [blob.provider]: blob.api_key };
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
   const rt = await piRuntime(keys);
   const modelRegistry = rt;
   // Same as the device chat: resume on the model this TICKET was last worked with.
-  const pick = modelMemory.chooseModel(histKey, blob);
+  const pick = windowMemory.chooseModel(histKey, blob);
   let model = rt.findModel(pick.provider, pick.model_id);
   if (!model && pick.source !== "default") {
     log("model memory unusable", histKey, "-", `${pick.provider}/${pick.model_id} did not resolve; using the default`);
@@ -1699,22 +1716,27 @@ async function startDecisionChat(ws, blob) {
 
   // See the device chat: one setter per switch, shared by the socket frames and the
   // typed commands, each one announcing so both surfaces stay in step.
+  // Each setter records the choice too - see the device chat's note.
   function applyReadonly(v) {
     if (mutateAllowed) readonly = !v;
+    windowMemory.rememberSwitch(histKey, "write", !!v, blob.username || "");
     try { ws.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
   }
   function applyAutoApprove(v) {
     autoApprove = !!v && autoapproveAllowed;
+    windowMemory.rememberSwitch(histKey, "auto_approve", !!v, blob.username || "");
     try { ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
   }
   function applyAutoCredential(v) {
     autoCredential = !!v && autocredentialAllowed;
+    windowMemory.rememberSwitch(histKey, "auto_credential", !!v, blob.username || "");
     log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
         histKey, sessionId, `by ${blob.username || "?"}`);
     try { ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
   }
   function applyAllowEmail(v) {
     allowEmail = !!v;
+    windowMemory.rememberSwitch(histKey, "allow_email", !!v, blob.username || "");
     try { ws.send(JSON.stringify({ type: "allow_email_state", value: allowEmail })); } catch {}
   }
   function applyLabel(v) {
@@ -1779,6 +1801,8 @@ async function startDecisionChat(ws, blob) {
     model: { provider: effectiveModel.provider, model_id: effectiveModel.model_id, display: model.name },
     model_source: effectiveModel.source,
     model_remembered_denied: effectiveModel.remembered || "",
+    switches_restored: switches.restored,
+    switches_denied: switches.denied,
     allowed_models: (blob.allowed_models || []).map((m) => ({ provider: m.provider, model_id: m.model_id, display_name: m.display_name, thinking_level: m.thinking_level, base_url: m.base_url })),
     require_approval: true, autoapprove_allowed: autoapproveAllowed, auto_approve: autoApprove,
     read_only: readonly, mutate_allowed: mutateAllowed,
@@ -1908,7 +1932,7 @@ async function startDecisionChat(ws, blob) {
           try { costMeter.previewModelSwitch(nm, allowed.display_name || allowed.model_id); } catch {}
           await session.setModel(nm);
           if (allowed.thinking_level) { try { session.setThinkingLevel(allowed.thinking_level); } catch {} }
-          modelMemory.remember(histKey, {
+          windowMemory.remember(histKey, {
             provider: allowed.provider,
             model_id: allowed.model_id,
             by: blob.username || "",

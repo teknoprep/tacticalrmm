@@ -15,7 +15,7 @@ import os from "node:os";
 import path from "node:path";
 
 process.env.PI_SESSIONS_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-memory-"));
-const { remember, recall, chooseModel } = await import("../src/model-memory.js");
+const { remember, recall, chooseModel } = await import("../src/window-memory.js");
 
 const SONNET = { provider: "anthropic", model_id: "claude-sonnet-4-5", display_name: "Sonnet 4.5", thinking_level: "medium" };
 const GROK = { provider: "xai", model_id: "grok-4.5", display_name: "Grok 4.5", thinking_level: "high" };
@@ -110,4 +110,85 @@ test("incomplete writes are ignored rather than half-remembered", () => {
   remember("agent-9", { provider: GROK.provider, model_id: "" });
   remember("", { provider: GROK.provider, model_id: GROK.model_id });
   assert.equal(recall("agent-9"), null);
+});
+
+// ---- the switches ------------------------------------------------------------------
+// "on refreshes whatever options are enabled (like write mode) stay enabled". Same rule as
+// the model: memory NAMES a state, it never grants one - every switch is re-checked
+// against the permissions of whoever is opening the window.
+const { rememberSwitch, chooseSwitches } = await import("../src/window-memory.js");
+
+/** A blob for a technician with every right, and the surface defaults. */
+const full = (extra = {}) => ({
+  mutate_allowed: true, autoapprove_allowed: true, autocredential_allowed: true,
+  allow_mutating: false, auto_approve: false, auto_credential: false, allow_email: true,
+  ...extra,
+});
+
+test("nothing remembered: the surface defaults, untouched", () => {
+  const s = chooseSwitches("w-none", full());
+  assert.equal(s.readonly, true, "Write mode off by default");
+  assert.equal(s.autoApprove, false);
+  assert.equal(s.autoCredential, false);
+  assert.equal(s.allowEmail, true);
+  assert.deepEqual(s.restored, []);
+});
+
+test("Write mode left ON comes back ON", () => {
+  rememberSwitch("w-write", "write", true, "chris");
+  const s = chooseSwitches("w-write", full());
+  assert.equal(s.readonly, false, "this is the reported ask");
+  assert.deepEqual(s.restored, ["Write mode"]);
+});
+
+test("Write mode left OFF stays OFF even where the surface defaults to ON", () => {
+  rememberSwitch("w-off", "write", false, "chris");
+  const s = chooseSwitches("w-off", full({ allow_mutating: true }));
+  assert.equal(s.readonly, true, "an explicit OFF is a choice, not an absence");
+});
+
+test("every switch round-trips", () => {
+  for (const [name, key] of [["auto_approve", "autoApprove"], ["auto_credential", "autoCredential"]]) {
+    rememberSwitch(`w-${name}`, name, true, "chris");
+    assert.equal(chooseSwitches(`w-${name}`, full())[key], true, name);
+  }
+  rememberSwitch("w-email", "allow_email", false, "chris");
+  assert.equal(chooseSwitches("w-email", full()).allowEmail, false, "customer email OFF is remembered");
+});
+
+test("a colleague without the permission does NOT get the remembered switch", () => {
+  rememberSwitch("w-perm", "write", true, "chris");
+  rememberSwitch("w-perm", "auto_approve", true, "chris");
+  rememberSwitch("w-perm", "auto_credential", true, "chris");
+  const s = chooseSwitches("w-perm", full({
+    mutate_allowed: false, autoapprove_allowed: false, autocredential_allowed: false,
+  }));
+  assert.equal(s.readonly, true, "read-only for someone who cannot write");
+  assert.equal(s.autoApprove, false);
+  assert.equal(s.autoCredential, false);
+  assert.deepEqual(s.denied.sort(), ["Auto-approve", "Auto-credential", "Write mode"],
+    "and the window can say why it did not come back the way they left it");
+  assert.deepEqual(s.restored, []);
+});
+
+test("a denial does not erase the setting for the person who owns it", () => {
+  // The colleague above opened it read-only; the original technician must still find
+  // Write mode on when they come back.
+  const s = chooseSwitches("w-perm", full());
+  assert.equal(s.readonly, false);
+  assert.equal(s.autoApprove, true);
+});
+
+test("switch memory and model memory share one record without clobbering", () => {
+  remember("w-both", { provider: "xai", model_id: "grok-4.5", by: "chris" });
+  rememberSwitch("w-both", "write", true, "chris");
+  assert.equal(recall("w-both").model_id, "grok-4.5", "recording a switch must not lose the model");
+  assert.equal(chooseSwitches("w-both", full()).readonly, false);
+  remember("w-both", { provider: "anthropic", model_id: "claude-opus-5" });
+  assert.equal(chooseSwitches("w-both", full()).readonly, false, "and changing the model must not lose the switches");
+});
+
+test("an unknown switch name is ignored", () => {
+  rememberSwitch("w-bad", "delete_everything", true, "chris");
+  assert.deepEqual(chooseSwitches("w-bad", full()).restored, []);
 });
