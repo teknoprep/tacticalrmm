@@ -1,8 +1,12 @@
 # Remote Pi from the AI windows — drive a chat from your phone
 
-Status: **designed, not built.** Written after reading `remote-pi@0.7.0` (the installed
-extension at `~/.pi/agent/npm/node_modules/remote-pi`) against how the bridge actually
-hosts sessions.
+Status: **built and live** (2026-08-25). Written after reading `remote-pi@0.7.0` against
+how the bridge actually hosts sessions, then implemented as described below.
+
+Shipped in `11a6e389` (backend + bridge) and `tacticalrmm-web@80cb0f7` (UI). Files:
+`api/tacticalrmm/core/ai_remote.py`, `core/migrations/0110_ai_remote_relay.py`,
+`accounts/migrations/0050_role_can_use_ai_remote.py`, `pibridge/src/remote-room.js`,
+`pibridge/test/remote-room.test.mjs`.
 
 ## The ask
 
@@ -254,7 +258,43 @@ window is closed.
 
 ---
 
-## 6. Build order
+## 6. As built — what differs from the plan above
+
+Three things changed once it met the real code:
+
+1. **One prompt path per surface, not a parallel one.** `startChat` and
+   `startDecisionChat` each grew a `runPrompt(text, images, origin)`; the browser's
+   `case "prompt"` and the phone's `user_message` both call it. Splitting them would have
+   applied the watchdog budget, the liveness reset and the silent LLM recovery to the
+   browser only — and the surface that would have missed out is the one on a phone signal.
+2. **The room is created by `makeRemoteBinding`, not by the surface.** Both surfaces now
+   carry ~12 lines of wiring; everything shared (toggle, pairing, fan-out, teardown) lives
+   in `remote-room.js`, which is what the tests exercise.
+3. **Known devices re-attach without a QR.** A phone this technician already paired that
+   turns up in a NEW room is promoted straight to a channel. Second and later use is one
+   tap, which is what makes the feature usable rather than a novelty.
+
+Verified end to end against the live relay on 2026-08-25:
+
+```
+[ready] remote_allowed = true
+[remote_state] {"enabled":true,"allowed":true,"state":"waiting"}
+[remote_pairing] uri = remotepi://pair?t=…&epk=…&n=PDM+—+BlueCloud&rm=9BisObX1Re9s
+[ws] closing the window
+→ bridge log: remote room opened … room=9BisObX1Re9s
+              remote room closed … window closed
+```
+
+and the refusal path, with a blob minted for a role without the permission:
+
+```
+[ready] remote_allowed = false
+[remote_state] {"enabled":false,"allowed":false,"state":"off",
+                "error":"Mobile access is not enabled for your role, or no relay is configured."}
+→ zero relay connections opened
+```
+
+## 7. Original build order
 
 1. **Backend** — 2 CoreSettings fields + 1 role permission + migration (with the guarded
    seed) + blob fields + serializer/RolesForm/AISettings UI. Ship this first: it's inert
