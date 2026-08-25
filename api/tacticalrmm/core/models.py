@@ -222,6 +222,21 @@ class CoreSettings(BaseAuditModel):
     )
     ai_operator_allowed_agent_ids = models.JSONField(default=list, blank=True)
 
+    # ---- REMOTE (MOBILE) ACCESS TO THE AI WINDOWS ---------------------------------------
+    # A technician working a ticket is often not at the desk the ticket is being worked
+    # from. This lets them pair a phone to ONE open AI window (Pi Chat / AI Decision) and
+    # carry on the SAME conversation - read the stream, answer, approve a device action -
+    # from the machine room, a customer site, or a car park.
+    #
+    # The relay is a network boundary and it can see routed plaintext protocol content and
+    # metadata (the wire container is not end-to-end encryption). So there is deliberately
+    # NO shipped default: `ai_remote_relay_url` is blank on a fresh install and the feature
+    # cannot turn itself on. An operator has to type in a relay they trust - normally one
+    # they host themselves - before any AI window can be reached from outside this server.
+    ai_remote_enabled = models.BooleanField(default=False)
+    # Canonical form is http(s)://; the bridge converts to ws(s):// when it opens the
+    # socket. Blank = feature unavailable, whatever the permission or the switch say.
+    ai_remote_relay_url = models.CharField(max_length=255, blank=True, default="")
 
     # SCHEDULED RUNTIME UPDATE - upgrading the AI runtime restarts the bridge, which drops
     # live chats and in-flight background runs. So it happens (a) only inside a window an

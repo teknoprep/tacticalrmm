@@ -22,6 +22,7 @@ import { makeTurnWatchdog } from "./turn-watchdog.js";
 import { notebookWriteAuthorisation } from "./authorisation.js";
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
+import { makeRemoteBinding } from "./remote-room.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
@@ -497,8 +498,14 @@ async function startChat(ws, blob) {
     return new Promise((resolve) => {
       pendingApprovals.set(id, resolve);
       ws.send(JSON.stringify({ type: "approval_request", id, summary }));
+      // The whole point of working from a phone is being able to say yes to this while
+      // standing in front of the machine it is about.
+      remote?.onApprovalRequest(id, summary);
     });
   }
+  // Declared here (hoisted `var`-style via let) because requestApproval above closes over
+  // it, but the binding needs the session's prompt path, which does not exist yet.
+  let remote = null;
 
   // mutateAllowed = the operator's role can write at all. readonly = the current
   // (toggleable) state; an "AI Resolve" session starts read-only but the operator
@@ -756,6 +763,7 @@ async function startChat(ws, blob) {
         try { ws.send(JSON.stringify({ type: "error", message: silent })); } catch {}
       }
     }
+    remote?.onAgentEvent(event);
     try {
       ws.send(JSON.stringify({ type: "agent_event", event }));
       lastClientFrameAt = Date.now();
@@ -796,6 +804,8 @@ async function startChat(ws, blob) {
       mutate_allowed: mutateAllowed,
       // Whether this operator's role may see the running cost meter.
       cost_visible: !!blob.cost_visible,
+      // Does this window offer the Remote (phone) button? Role + global switch + relay.
+      remote_allowed: !!blob.remote_allowed && !!blob.remote_relay_url,
       context_window: Number(model?.contextWindow || 0),
       operator_enabled: !!(blob.operator && blob.operator.enabled),
       operator_machines: (blob.operator && blob.operator.machines) || [],
@@ -866,6 +876,70 @@ async function startChat(ws, blob) {
     } catch { /* socket gone */ }
   }, Math.max(1000, Math.floor(CONFIG.workingPingMs / 2))) : null;
 
+  // ONE prompt path, whether the words arrived from the browser or from a paired phone.
+  // Splitting them would mean the watchdog budget, the liveness reset and the silent
+  // recovery loop applied to one surface and not the other - and the surface that would
+  // have missed out is the one being used from a car park on a phone signal.
+  async function runPrompt(text, images = [], origin = "browser") {
+    // Mirror a browser-typed turn onto the phone, so someone following on mobile sees
+    // what the person at the desk just asked rather than an answer to nothing. (A phone
+    // turn already carries its own id, which the app uses to thread the reply.)
+    if (origin === "browser") remote?.beginBrowserTurn(text);
+    // "/compact" is handled HERE, before the prompt reaches the model: it is an
+    // instruction to the session, not a question for the LLM, and sending it on
+    // would just add another expensive turn to the context it is meant to shrink.
+    if (compactCmd.isCommand(text)) {
+      await compactCmd.run(text);
+      return;
+    }
+    techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
+    recovery.beginTurn();
+    // A new request earns a fresh, tight watchdog budget: the widened one exists
+    // only to give the SAME request a second, more patient chance.
+    watchdog.resetBudget();
+    // Fresh transport measurement for a fresh request, and everything the turn does
+    // runs inside the liveness context so its provider bytes land on this session.
+    liveness.reset();
+    // A photo of the screen or the asset label is often the fastest way to say what is
+    // wrong, and it is the one thing a phone has that the browser does not.
+    const content = images.length
+      ? [
+          ...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })),
+          { type: "text", text: String(text || "") },
+        ]
+      : text;
+    await inTurn(async () => {
+      if (session.isStreaming) {
+        await session.prompt(content, { streamingBehavior: "steer" });
+      } else {
+        await session.prompt(content);
+      }
+      // prompt() resolves once the whole turn has settled (including the harness's own
+      // retries), so this is the point at which we know a blank rejection ended it.
+      // Loop rather than retry once: the recovery object owns the budget.
+      while (recovery.pending) {
+        if (!(await recovery.run(session))) break;
+      }
+    });
+  }
+
+  remote = makeRemoteBinding({
+    blob,
+    key: agentId,
+    label: `${facts?.hostname || agentId} \u2014 ${BRAND.name || "RMM"}`,
+    log,
+    toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
+    submitPrompt: (text, images) => runPrompt(text, images, "phone"),
+    abort: () => session.abort(),
+    resolveApproval: (id, ok) => {
+      const resolve = pendingApprovals.get(id);
+      if (resolve) { pendingApprovals.delete(id); resolve(!!ok); }
+      // Keep the browser's approval banner in step - the tech may be looking at both.
+      try { ws.send(JSON.stringify({ type: "approval_resolved", id, approved: !!ok, by: "mobile" })); } catch {}
+    },
+    transcript: () => uiTranscript(sessionManager, session),
+  });
+
   ws.on("message", async (raw) => {
     resetIdle();
     let msg;
@@ -875,39 +949,13 @@ async function startChat(ws, blob) {
       return;
     }
     try {
+      if (await remote?.handleBrowser(msg)) return;
       switch (msg.type) {
         case "compact":
           await compactCmd.run(String(msg.message || ""), { reason: "technician asked (button)" });
           break;
         case "prompt":
-          // "/compact" is handled HERE, before the prompt reaches the model: it is an
-          // instruction to the session, not a question for the LLM, and sending it on
-          // would just add another expensive turn to the context it is meant to shrink.
-          if (compactCmd.isCommand(msg.message)) {
-            await compactCmd.run(msg.message);
-            break;
-          }
-          techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
-          recovery.beginTurn();
-          // A new request earns a fresh, tight watchdog budget: the widened one exists
-          // only to give the SAME request a second, more patient chance.
-          watchdog.resetBudget();
-          // Fresh transport measurement for a fresh request, and everything the turn does
-          // runs inside the liveness context so its provider bytes land on this session.
-          liveness.reset();
-          await inTurn(async () => {
-            if (session.isStreaming) {
-              await session.prompt(msg.message, { streamingBehavior: "steer" });
-            } else {
-              await session.prompt(msg.message);
-            }
-            // prompt() resolves once the whole turn has settled (including the harness's own
-            // retries), so this is the point at which we know a blank rejection ended it.
-            // Loop rather than retry once: the recovery object owns the budget.
-            while (recovery.pending) {
-              if (!(await recovery.run(session))) break;
-            }
-          });
+          await runPrompt(msg.message);
           break;
         case "steer":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
@@ -1008,6 +1056,9 @@ async function startChat(ws, blob) {
     // reject any dangling approvals so tool calls don't hang forever
     for (const [, resolve] of pendingApprovals) resolve(false);
     pendingApprovals.clear();
+    // The window is the room's owner. Closing it closes the relay connection - that is
+    // the promise the feature is sold on, so it lives on the same line as the dispose.
+    remote?.close("window closed");
     try { session.dispose(); } catch {}
     log("chat closed", agentId, sessionId);
   });
@@ -1065,8 +1116,11 @@ async function startDecisionChat(ws, blob) {
     return new Promise((resolve) => {
       pendingApprovals.set(id, resolve);
       ws.send(JSON.stringify({ type: "approval_request", id, summary }));
+      remote?.onApprovalRequest(id, summary);
     });
   }
+  // See the device chat: requestApproval closes over this before the binding can exist.
+  let remote = null;
 
   // WHAT THE TECHNICIAN ACTUALLY TYPED, kept verbatim by product code.
   //
@@ -1415,6 +1469,7 @@ async function startDecisionChat(ws, blob) {
         try { ws.send(JSON.stringify({ type: "error", message: silent })); } catch {}
       }
     }
+    remote?.onAgentEvent(event);
     try { ws.send(JSON.stringify({ type: "agent_event", event })); } catch {}
   });
 
@@ -1440,6 +1495,8 @@ async function startDecisionChat(ws, blob) {
     label: sessionLabel,
     // Whether this operator's role may see the running cost meter.
     cost_visible: !!blob.cost_visible,
+    // Does this window offer the Remote (phone) button? Role + global switch + relay.
+    remote_allowed: !!blob.remote_allowed && !!blob.remote_relay_url,
     context_window: Number(model?.contextWindow || 0),
     operator_enabled: !!(blob.operator && blob.operator.enabled),
     operator_machines: (blob.operator && blob.operator.machines) || [],
@@ -1463,6 +1520,51 @@ async function startDecisionChat(ws, blob) {
     } catch (e) { log("decision assign err", histKey, String(e).slice(0, 180)); }
   }
 
+  // One prompt path for the browser and the phone - see the device chat's note. On this
+  // surface it also means a message sent from a phone claims the ticket for that
+  // technician exactly as typing it at the desk would.
+  async function runPrompt(text, images = [], origin = "browser") {
+    if (origin === "browser") remote?.beginBrowserTurn(text);
+    // See the device chat: a session instruction, not a question for the model.
+    if (compactCmd.isCommand(text)) {
+      await compactCmd.run(text);
+      return;
+    }
+    // Keep the tech's own words for the close-authorisation test above.
+    techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
+    work.humanTurn();
+    assignWorkingUser(); // fire-and-forget: claim the ticket for the working tech on first message
+    recovery.beginTurn();
+    const content = images.length
+      ? [
+          ...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })),
+          { type: "text", text: String(text || "") },
+        ]
+      : text;
+    if (session.isStreaming) await session.prompt(content, { streamingBehavior: "steer" });
+    else await session.prompt(content);
+    // See the device chat: re-run a blank provider rejection before telling the tech.
+    while (recovery.pending) {
+      if (!(await recovery.run(session))) break;
+    }
+  }
+
+  remote = makeRemoteBinding({
+    blob,
+    key: histKey,
+    label: `Ticket ${ticketRef}`,
+    log,
+    toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
+    submitPrompt: (text, images) => runPrompt(text, images, "phone"),
+    abort: () => session.abort(),
+    resolveApproval: (id, ok) => {
+      const resolve = pendingApprovals.get(id);
+      if (resolve) { pendingApprovals.delete(id); resolve(!!ok); }
+      try { ws.send(JSON.stringify({ type: "approval_resolved", id, approved: !!ok, by: "mobile" })); } catch {}
+    },
+    transcript: () => uiTranscript(sessionManager, session),
+  });
+
   let idleTimer;
   const resetIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => { try { ws.close(); } catch {} }, CONFIG.idleTimeoutMs); };
   resetIdle();
@@ -1471,27 +1573,13 @@ async function startDecisionChat(ws, blob) {
     resetIdle();
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     try {
+      if (await remote?.handleBrowser(msg)) return;
       switch (msg.type) {
         case "compact":
           await compactCmd.run(String(msg.message || ""), { reason: "technician asked (button)" });
           break;
         case "prompt":
-          // See the device chat: a session instruction, not a question for the model.
-          if (compactCmd.isCommand(msg.message)) {
-            await compactCmd.run(msg.message);
-            break;
-          }
-          // Keep the tech's own words for the close-authorisation test above.
-          techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
-          work.humanTurn();
-          assignWorkingUser(); // fire-and-forget: claim the ticket for the working tech on first message
-          recovery.beginTurn();
-          if (session.isStreaming) await session.prompt(msg.message, { streamingBehavior: "steer" });
-          else await session.prompt(msg.message);
-          // See the device chat: re-run a blank provider rejection before telling the tech.
-          while (recovery.pending) {
-            if (!(await recovery.run(session))) break;
-          }
+          await runPrompt(msg.message);
           break;
         case "steer":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
@@ -1556,6 +1644,8 @@ async function startDecisionChat(ws, blob) {
     unsubscribe();
     for (const [, resolve] of pendingApprovals) resolve(false);
     pendingApprovals.clear();
+    // The window owns the room; closing one closes the other.
+    remote?.close("window closed");
     try { session.dispose(); } catch {}
     // Flush whatever burst was open, so a chat closed mid-thought still records its time.
     try { work.close("socket closed"); } catch {}

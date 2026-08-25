@@ -25,6 +25,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from core.ai_match import match_procedures
+from core.ai_remote import remote_blob_fields
 from core.decorators import monitoring_view, monitoring_view_v2
 from core.tasks import sync_mesh_perms_task
 from core.utils import (
@@ -2384,6 +2385,8 @@ class AIDecisionSession(APIView):
             "autocredential_allowed": ac,
             # Show the live token/cost meter? Visibility only - grants no capability.
             "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
+            # May this ticket window be paired to a phone? See core/ai_remote.py.
+            **remote_blob_fields(core, user, is_super),
             "allow_email": True,      # Allow customer email ON by default
             "require_approval": True,
             "question": d.question,
@@ -2454,6 +2457,7 @@ class AIDecisionSession(APIView):
             "auto_approve": bool(aa and getattr(request.user, "ai_autoapprove_default", False)),
             "autocredential_allowed": ac,
             "auto_credential": bool(ac and getattr(request.user, "ai_autocredential_default", False)),
+            "remote_allowed": blob["remote_allowed"],
             "operator_enabled": operator_policy["enabled"],
             "operator_machines": [
                 {"agent_id": m["agent_id"], "hostname": m["hostname"]}

@@ -22,6 +22,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from agents.utils import get_agent_url
+from core.ai_remote import remote_blob_fields
 from core.models import CoreSettings
 from core.permissions import RunServerScriptPerms
 from core.tasks import sync_mesh_perms_task
@@ -1911,6 +1912,8 @@ class PiMultiSession(APIView):
             "cost_visible": bool(
                 is_super or (user.role and user.role.can_view_ai_cost)
             ),
+            # May this window be paired to a phone? See core/ai_remote.py.
+            **remote_blob_fields(core, user, is_super),
             # Remembered preference - see accounts.User.ai_autoapprove_default.
             "auto_approve": bool(
                 (is_super or (user.role and user.role.can_use_ai_autoapprove))
@@ -1977,6 +1980,7 @@ class PiMultiSession(APIView):
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
                 "autocredential_allowed": blob["autocredential_allowed"],
+                "remote_allowed": blob["remote_allowed"],
             }
         )
 
@@ -2095,6 +2099,8 @@ class AgentPiSession(APIView):
             "autocredential_allowed": bool(is_super or (user.role and user.role.can_use_ai_autocredential)),
             # Show the live token/cost meter? Visibility only - grants no capability.
             "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
+            # May this window be paired to a phone? See core/ai_remote.py.
+            **remote_blob_fields(core, user, is_super),
             # Remembered preference (see accounts.User.ai_autoapprove_default): the device
             # chat had the same reset-on-refresh behaviour as the ticket chat.
             "auto_approve": bool((is_super or (user.role and user.role.can_use_ai_autoapprove))
@@ -2142,6 +2148,7 @@ class AgentPiSession(APIView):
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
                 "autocredential_allowed": blob["autocredential_allowed"],
+                "remote_allowed": blob["remote_allowed"],
                 "operator_enabled": operator_policy["enabled"],
                 "operator_machines": [
                     {"agent_id": m["agent_id"], "hostname": m["hostname"]}

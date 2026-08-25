@@ -360,6 +360,12 @@ def session(request):
             if user
             else payload.get("cost_visible_hint")
         ),
+        # Mobile pairing is not offered on this surface. The window lives inside Odoo, is
+        # shared by everyone looking at that record, and often has no RMM user behind it
+        # at all - so there is no single technician whose phone a room could belong to.
+        # Pairing needs an owner; this surface does not have one.
+        "remote_allowed": False,
+        "remote_relay_url": "",
         "persist_history": True,
         # Reasoning standards that belong to the RMM side. The Odoo addon carries
         # its own prompts for the work it executes itself; this is what the RMM

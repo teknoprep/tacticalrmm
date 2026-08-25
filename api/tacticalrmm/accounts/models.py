@@ -178,6 +178,14 @@ class Role(BaseAuditModel):
     #     permission is what makes the plain read unattended.
     # Superusers always have it, like can_view_ai_cost.
     can_use_ai_autocredential = models.BooleanField(default=False)
+    # Pair a phone to an OPEN AI window and work that same conversation from it.
+    # Grants no new capability: the phone inherits the window's session state (read-only
+    # vs Write mode, auto-approve, allowed models) and cannot raise any of it. What it
+    # does grant is REACH - the conversation leaves the building - which is why it is its
+    # own permission and why the relay URL is a separate, deliberately blank, global
+    # setting. Superusers have it implicitly, like the other AI permissions - the switch
+    # that actually decides whether ANY of this is reachable is the blank relay URL.
+    can_use_ai_remote = models.BooleanField(default=False)
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )

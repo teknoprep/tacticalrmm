@@ -111,6 +111,45 @@ class CoreSettingsSerializer(HostedCoreMixin, serializers.ModelSerializer):
                 {"ai_operator_default_model": "Desktop default model and provider must both be enabled."}
             )
 
+        # ---- Remote (mobile) relay ------------------------------------------------
+        # Canonical storage is http(s)://; the bridge converts to ws(s):// when it opens
+        # the socket. Rejecting ws(s):// at the user boundary (rather than quietly
+        # coercing it) keeps one single form in the database - two forms drift, and the
+        # person who pasted the wrong one never finds out why pairing fails.
+        relay = (get_value("ai_remote_relay_url") or "").strip()
+        if relay:
+            lower = relay.lower()
+            if lower.startswith("ws://") or lower.startswith("wss://"):
+                raise serializers.ValidationError(
+                    {
+                        "ai_remote_relay_url": (
+                            "Enter the relay as http:// or https:// - the same URL your "
+                            "reverse proxy serves. The WebSocket form is derived from it."
+                        )
+                    }
+                )
+            if not (lower.startswith("http://") or lower.startswith("https://")):
+                raise serializers.ValidationError(
+                    {"ai_remote_relay_url": "Relay URL must start with http:// or https://."}
+                )
+            from urllib.parse import urlparse
+
+            if not urlparse(relay).netloc:
+                raise serializers.ValidationError(
+                    {"ai_remote_relay_url": "That is not a usable relay URL."}
+                )
+        attrs["ai_remote_relay_url"] = relay
+        if bool(get_value("ai_remote_enabled")) and not relay:
+            raise serializers.ValidationError(
+                {
+                    "ai_remote_relay_url": (
+                        "Set the relay URL before enabling mobile access. There is no "
+                        "default relay on purpose - a relay can see the conversation "
+                        "passing through it, so it has to be one you chose."
+                    )
+                }
+            )
+
         return attrs
 
     class Meta:
