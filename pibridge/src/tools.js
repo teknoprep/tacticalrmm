@@ -382,6 +382,43 @@ function guiDrivingMatch(command) {
   return null;
 }
 
+// LAUNCHING A BROWSER BEHIND THE OPERATOR'S BACK.
+//
+// The first version of this guard only caught hand-rolled UI Automation, and missed the
+// commonest case by a mile. In TICKET/60427 the model opened the sign-in page five times
+// with:
+//
+//   Start-Process $edge -ArgumentList '--new-window https://login.microsoft.com/device'
+//
+// No UI Automation, no SendKeys - just a browser launch. NONE of the five passed
+// --inprivate, so every one of them opened an ordinary window in the workstation's own
+// profile, signed in as somebody else. That is the "it keeps using a regular browser
+// window" the owner is seeing, and it is why the device code kept matching the wrong
+// tenant.
+//
+// The Operator's open_url is the only route that forces InPrivate AND then verifies the
+// window it actually got. A browser launched from a shell command has neither, and the
+// model cannot tell the difference from a screenshot.
+//
+// Deliberately narrow: LAUNCHING is blocked, inspecting is not. `Get-Process msedge`,
+// `Stop-Process -Name msedge` and reading Edge's config are all still fine, because none
+// of them put a customer's session into the wrong profile.
+const BROWSER_LAUNCH = [
+  /\bStart-Process\b[^\n]{0,200}?(msedge|chrome|firefox|iexplore|\$edge|\$browser)/i,
+  /\b(msedge|chrome|firefox)\.exe\b[^\n]{0,120}https?:\/\//i,
+  /^\s*start\s+(msedge|chrome|firefox|microsoft-edge:)/im,
+  /\bmicrosoft-edge:https?:\/\//i,
+  /\[System\.Diagnostics\.Process\]::Start\([^)]{0,80}(msedge|chrome|firefox)/i,
+  /\b(Invoke-Item|ii|explorer(\.exe)?)\s+["']?https?:\/\//i,
+];
+function browserLaunchMatch(command) {
+  for (const re of BROWSER_LAUNCH) {
+    const m = String(command || "").match(re);
+    if (m) return m[0].trim().slice(0, 70);
+  }
+  return null;
+}
+
 // A sign-in that has already been refused must not be tried again with the same
 // credential. Azure locks an account after a handful of bad attempts (AADSTS50053), and a
 // retry loop is how a working login becomes a locked one - which is what happened on
@@ -813,6 +850,16 @@ export function buildTools({
       const timeout = p.timeout && p.timeout > 0 ? Math.min(p.timeout, 900) : 60;
       // Same refusal as the ticket chat: on a machine the Operator owns, the Operator is
       // the way to drive the screen. See GUI_DRIVING.
+      const browserHit = browserLaunchMatch(p.command);
+      if (browserHit && operatorAgentIds.has(String(m.agentId))) {
+        return text(
+          `BLOCKED - that command launches a browser (matched "${browserHit}") on ` +
+          `${m.label || m.agentId}, which is an Operator workstation. A browser started from a ` +
+          `shell command opens in this machine's OWN Edge profile - already signed in as ` +
+          `somebody else - and nothing checks it. Use operator_desktop_open_url: it is ALWAYS ` +
+          `InPrivate and it VERIFIES the window it actually got.`,
+        );
+      }
       const guiHit = guiDrivingMatch(p.command);
       if (guiHit && operatorAgentIds.has(String(m.agentId))) {
         return text(
@@ -2141,6 +2188,18 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // This is a refusal rather than an approval prompt: the problem is not that the
       // action is risky, it is that this route has none of the guards the other route was
       // built to apply, so no amount of approving makes it the right way in.
+      const browserHit = browserLaunchMatch(p.command);
+      if (browserHit && operatorAgentIds.has(String(p.agent_id))) {
+        return text(
+          `BLOCKED - that command launches a browser (matched "${browserHit}") on ${p.agent_id}, ` +
+          `which is an Operator workstation. A browser started from a shell command opens in ` +
+          `this machine's OWN Edge profile - already signed in as somebody else - and nothing ` +
+          `checks it. That is exactly how TICKET/60427 matched a device code against the wrong ` +
+          `tenant (AADSTS50034) and then locked the account. ` +
+          `Use operator_desktop_open_url: it is ALWAYS InPrivate and it VERIFIES the window it ` +
+          `actually got before you type anything into it.`,
+        );
+      }
       const guiHit = guiDrivingMatch(p.command);
       if (guiHit && operatorAgentIds.has(String(p.agent_id))) {
         return text(

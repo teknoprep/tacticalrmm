@@ -97,3 +97,72 @@ test("a successful connect is never flagged", () => {
     "TENANT=BlueCloud Consultants";
   assert.equal(terminalAuthFailure(ok), null);
 });
+
+// ---- launching a browser behind the Operator's back --------------------------------
+// The first version of this guard only caught hand-rolled UI Automation and missed the
+// commonest case entirely. In TICKET/60427 the model opened the sign-in page five times
+// with `Start-Process $edge -ArgumentList '--new-window <url>'` - no UIA, no SendKeys,
+// just a launch - and NONE of the five passed --inprivate. Every one opened an ordinary
+// window in the workstation's own signed-in profile. That is the "it keeps using a regular
+// browser window" the owner reported.
+
+const BROWSER_LAUNCH = [
+  /\bStart-Process\b[^\n]{0,200}?(msedge|chrome|firefox|iexplore|\$edge|\$browser)/i,
+  /\b(msedge|chrome|firefox)\.exe\b[^\n]{0,120}https?:\/\//i,
+  /^\s*start\s+(msedge|chrome|firefox|microsoft-edge:)/im,
+  /\bmicrosoft-edge:https?:\/\//i,
+  /\[System\.Diagnostics\.Process\]::Start\([^)]{0,80}(msedge|chrome|firefox)/i,
+  /\b(Invoke-Item|ii|explorer(\.exe)?)\s+["']?https?:\/\//i,
+];
+const launches = (cmd) => BROWSER_LAUNCH.some((re) => re.test(cmd));
+
+test("the five real launches from the failed session are caught", () => {
+  for (const cmd of [
+    "Start-Process $edge -ArgumentList '--new-window https://login.microsoft.com/device'",
+    "Start-Process `$edge -ArgumentList '--new-window https://login.microsoftonline.com/common/oauth2/deviceauth?otc=$code'",
+    "Start-Process $edge -ArgumentList '--new-window https://login.microsoftonline.com/common/oauth2/deviceauth?otc=A87F4L94D'",
+    "Start-Process msedge ",
+    "Start-Process 'msedge.exe' -ArgumentList '--new-window','https://portal.office.com'",
+  ]) {
+    assert.equal(launches(cmd), true, `should be blocked:\n${cmd.slice(0, 80)}`);
+  }
+});
+
+test("none of those five asked for InPrivate - which is the whole point", () => {
+  const real = "Start-Process $edge -ArgumentList '--new-window https://login.microsoft.com/device'";
+  assert.equal(/inprivate/i.test(real), false,
+    "a shell launch has no InPrivate enforcement and nothing verifies the window it got");
+});
+
+test("other ways to open a URL are caught too", () => {
+  for (const cmd of [
+    "start msedge https://portal.office.com",
+    "explorer.exe https://portal.office.com",
+    "Invoke-Item 'https://admin.microsoft.com'",
+    "[System.Diagnostics.Process]::Start('msedge','https://x.test')",
+    "microsoft-edge:https://portal.office.com",
+  ]) {
+    assert.equal(launches(cmd), true, `should be blocked:\n${cmd}`);
+  }
+});
+
+test("inspecting or stopping a browser is NOT blocked", () => {
+  // Narrow on purpose: launching is what puts a customer session in the wrong profile.
+  // Reading and killing do not, and blocking them would remove real diagnostics.
+  for (const cmd of [
+    "Get-Process msedge | Where-Object { $_.MainWindowHandle -ne 0 }",
+    "Stop-Process -Name msedge -Force",
+    "Get-Process msedge -ErrorAction SilentlyContinue | Select-Object MainWindowTitle",
+    "Test-Path 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'",
+    "Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge'",
+  ]) {
+    assert.equal(launches(cmd), false, `should NOT be blocked:\n${cmd}`);
+  }
+});
+
+test("a browser launch on a NON-Operator machine is still allowed", () => {
+  // The Linux PBX box has no Operator and no better route to point at.
+  const operatorAgentIds = new Set(["MCincBNurhcXlhnlcrnMhNHVczeObSyYMZskMDmm"]);
+  const cmd = "Start-Process msedge https://x.test";
+  assert.equal(launches(cmd) && operatorAgentIds.has("DAmsYZMxHBXYqiVuSDTGhREtnruwkouCZEbSIvHb"), false);
+});
