@@ -352,6 +352,60 @@ const WIN_MUTATE = [
   /\bformat\b(?!-)/i, /\bschtasks\b[^\n]*\/(create|delete|change)/i,
   /\bmsiexec\b/i, /\b(winget|choco)\s+(install|uninstall|upgrade|remove)\b/i,
 ];
+// DRIVING A GUI BY HAND, THROUGH A SHELL COMMAND.
+//
+// Found in TICKET/60427 (2026-08-25). Needing to complete a device-code sign-in, the model
+// did not use the Operator - it wrote its own UI Automation and SendKeys PowerShell and
+// pushed it through run_device_command. That is a second, unguarded desktop-control plane:
+// none of the Operator's rules apply to it. No InPrivate enforcement, no privacy
+// verification, no focus guard, no screenshot for the technician, no audit line.
+//
+// The result was exactly what those guards exist to prevent. It opened the device-login
+// page in the workstation's OWN signed-in Edge profile ("in blueucadmin session"), so
+// Microsoft matched the code against the wrong tenant - AADSTS50034, the account does not
+// exist in that directory - and it retried until it hit AADSTS50053, account locked.
+//
+// So: on a machine the Operator owns, the Operator is the way to drive the screen.
+const GUI_DRIVING = [
+  /UIAutomationClient|UIAutomationTypes|\bAutomationElement\b/i,
+  /System\.Windows\.Forms.*\bSendKeys\b|\[System\.Windows\.Forms\.SendKeys\]|SendKeys\]::Send/i,
+  /\bSendWait\b/i,
+  /user32\.dll.*\b(SetForegroundWindow|keybd_event|mouse_event|SendInput|SetCursorPos)\b/is,
+  /\bSetForegroundWindow\b|\bkeybd_event\b|\bmouse_event\b|\bSendInput\b/i,
+  /Add-Type[^\n]*PresentationCore|Add-Type[^\n]*WindowsBase/i,
+];
+function guiDrivingMatch(command) {
+  for (const re of GUI_DRIVING) {
+    const m = String(command || "").match(re);
+    if (m) return m[0].slice(0, 60);
+  }
+  return null;
+}
+
+// A sign-in that has already been refused must not be tried again with the same
+// credential. Azure locks an account after a handful of bad attempts (AADSTS50053), and a
+// retry loop is how a working login becomes a locked one - which is what happened on
+// TICKET/60427, and why nothing worked afterwards. These are terminal answers, not
+// transient errors.
+const AUTH_TERMINAL = /\bAADSTS(50053|50034|50126|50057|50055|53003|50076|50079)\b/;
+export function terminalAuthFailure(output) {
+  const m = String(output || "").match(AUTH_TERMINAL);
+  return m ? m[0] : null;
+}
+
+// Which agent ids does the standalone Operator own on this session? Used to refuse
+// hand-rolled desktop control on a machine that has a proper control plane (see
+// GUI_DRIVING). Empty when Operator is off, which correctly disables the refusal:
+// a machine with no Operator has no better route to point at.
+function operatorAgentIdSet(operatorPolicy) {
+  const out = new Set();
+  for (const m of (operatorPolicy && operatorPolicy.machines) || []) {
+    if (m && m.agent_id) out.add(String(m.agent_id));
+    if (m && m.agentId) out.add(String(m.agentId));
+  }
+  return out;
+}
+
 function mutatingMatch(command, isWindows) {
   for (const re of isWindows ? WIN_MUTATE : NIX_MUTATE) {
     const m = command.match(re);
@@ -608,6 +662,8 @@ export function buildTools({
 
   // Unique label per machine (hostname, deduped with #N when two machines
   // share a hostname). These labels are what the model passes as `machine`.
+  // Machines with a proper desktop-control plane - see GUI_DRIVING.
+  const operatorAgentIds = operatorAgentIdSet(operatorPolicy);
   const seen = new Map();
   for (const m of machines) {
     const base = (m.hostname || m.agentId).trim();
@@ -755,6 +811,18 @@ export function buildTools({
       const win = m.plat === "windows";
       const shell = win ? (p.shell === "cmd" ? "cmd" : "powershell") : "/bin/bash";
       const timeout = p.timeout && p.timeout > 0 ? Math.min(p.timeout, 900) : 60;
+      // Same refusal as the ticket chat: on a machine the Operator owns, the Operator is
+      // the way to drive the screen. See GUI_DRIVING.
+      const guiHit = guiDrivingMatch(p.command);
+      if (guiHit && operatorAgentIds.has(String(m.agentId))) {
+        return text(
+          `BLOCKED - that command drives the screen by hand (matched "${guiHit}"), and ` +
+          `${m.label || m.agentId} is an Operator workstation. Use the operator_desktop_* tools: ` +
+          `they open InPrivate and VERIFY it, check what actually has focus before typing, show ` +
+          `the technician the screen, and write an audit line. If you are completing a ` +
+          `device-code or MFA prompt, ask the technician rather than automating the keyboard.`,
+        );
+      }
       if (isReadonly()) {
         const hit = mutatingMatch(p.command, win);
         if (hit) {
@@ -1813,6 +1881,8 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
 } = {}) {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
   const capStore = makeCaptureStore();
+  // Machines with a proper desktop-control plane - see GUI_DRIVING.
+  const operatorAgentIds = operatorAgentIdSet(operatorPolicy);
   let hd = null, hdError = "";
   try { hd = loadHelpdesk(helpdeskCode, helpdeskApi); }
   catch (e) { hdError = e.message; }
@@ -2067,6 +2137,23 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           );
         }
       }
+      // DO NOT hand-roll desktop control on a machine the Operator owns. See GUI_DRIVING.
+      // This is a refusal rather than an approval prompt: the problem is not that the
+      // action is risky, it is that this route has none of the guards the other route was
+      // built to apply, so no amount of approving makes it the right way in.
+      const guiHit = guiDrivingMatch(p.command);
+      if (guiHit && operatorAgentIds.has(String(p.agent_id))) {
+        return text(
+          `BLOCKED - that command drives the screen by hand (matched "${guiHit}"), and ${p.agent_id} ` +
+          `is an Operator workstation. Use the operator_desktop_* tools instead: they open ` +
+          `InPrivate and VERIFY it, check what actually has focus before typing, show the ` +
+          `technician the screen, and write an audit line. Driving the desktop through ` +
+          `run_device_command has none of that - on TICKET/60427 it signed in through the ` +
+          `workstation's own profile, hit the wrong tenant, and locked the account. ` +
+          `If you are completing a device-code or MFA prompt, ask the technician instead ` +
+          `(they can do it in seconds) rather than automating the keyboard.`,
+        );
+      }
       // Gate ANY command that would MODIFY the device (not just "destructive" ones) -
       // same rule as the device chat: in read-only (Write mode off) it's blocked; with
       // Write mode on it needs approval (unless Auto-approve). Pure read-only diagnostics
@@ -2089,6 +2176,20 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           const rec = capStore.put(nm, raw, `${p.agent_id}: ${p.command.slice(0, 120)}`);
           if (rec.error) return text(rec.error);
           return text(captureReceipt(rec, " with attach_capture or send_email"));
+        }
+        // A sign-in that Azure has REFUSED is not a transient error to retry. Say so in
+        // the result, because the model's instinct is to try again and the retry is what
+        // locks the account.
+        const authFail = terminalAuthFailure(raw);
+        if (authFail) {
+          return text(
+            capString(raw, 20000, "device command output") +
+            `\n\n[STOP - ${authFail} is a TERMINAL sign-in failure, not a transient one. Do NOT ` +
+            `retry this login, and do not try a different password: further attempts lock the ` +
+            `account (AADSTS50053) or extend an existing lock, which is what makes it "never ` +
+            `work" afterwards. Report which account and which tenant were refused, and ask the ` +
+            `technician to sign in or unlock it.]`,
+          );
         }
         // capString, not slice: a silent truncation makes the model think it saw
         // everything, and it re-runs the same broad command to find the rest.
