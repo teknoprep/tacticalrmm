@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy to /etc/pi-trmm-brand.json (or set PI_BRAND_FILE) and fill in your own company. Anything you leave out falls back to a generic placeholder. This file is deployment config and is deliberately NOT tracked with real values in git.",
+  "name": "Example IT",
+  "legalName": "Example IT Services, LLC",
+  "tagline": "IT Solutions, Simplified.",
+  "phone": "555-0100",
+  "phoneTel": "+15550100",
+  "supportEmail": "support@example.com",
+  "infoEmail": "info@example.com",
+  "web": "https://www.example.com",
+  "address": "1 Example Street, Example City, EX 00000",
+  "logoUrl": "",
+  "primary": "#0F62FE",
+  "primaryDark": "#0043CE",
+  "text": "#212529",
+  "dark": "#1B1319",
+  "muted": "#495057",
+  "light": "#F6F5F4",
+  "white": "#FFFFFF",
+  "border": "#dee2e6",
+  "page": "#F0F2F5"
+}
