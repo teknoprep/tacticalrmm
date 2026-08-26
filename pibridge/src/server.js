@@ -25,11 +25,37 @@ import { makeCompactCommand } from "./compaction.js";
 import { makeRemoteBinding } from "./remote-room.js";
 import * as windowMemory from "./window-memory.js";
 import { makeChatCommands } from "./chat-commands.js";
+import { boundTranscript } from "./transcript-bound.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
 
 const redis = new Redis(CONFIG.redisUrl);
+
+// Heartbeat tuning. See the connection handler for why a single missed pong is not
+// evidence of a dead client.
+const HEARTBEAT_MS = 30000;
+const HEARTBEAT_MAX_MISSES = 2;
+const HEARTBEAT_FORGIVE_MS = 5000;
+
+// EVENT LOOP LAG. If this process stops for seconds at a time, everything downstream
+// looks like a network fault: pongs answer late, frames arrive in bursts, and a chat
+// "disconnects" for reasons no network trace will ever explain. One timer, so the
+// question "was it them or was it us" is answerable from the log instead of argued about.
+let loopLagPeak = 0;
+(function watchEventLoop() {
+  const EVERY = 1000;
+  let last = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const lag = now - last - EVERY;
+    last = now;
+    if (lag > loopLagPeak) loopLagPeak = lag;
+    // Only shout when it is long enough to break something: a 30s heartbeat round, a
+    // socket write, a technician's patience.
+    if (lag > 2000) console.log(`${new Date().toISOString()} event loop blocked ${lag}ms`);
+  }, EVERY).unref();
+})();
 
 // Observe provider streams at the socket, before any model client is built - pi-ai falls
 // back to globalThis.fetch, and an SDK that captured it earlier would never see this.
@@ -478,7 +504,7 @@ function uiTranscript(sessionManager, session) {
     out.push(m);
   }
   // Fall back to the live message list for a brand-new session (empty branch).
-  return out.length ? out : session?.messages || [];
+  return boundTranscript(out.length ? out : session?.messages || []);
 }
 
 // ---- The credential-read policy, in ONE place --------------------------------
@@ -3852,23 +3878,57 @@ server.on("upgrade", async (req, socket, head) => {
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
     activeSessions++;
-    // heartbeat: drop dead/zombie connections so sessions get cleaned up
+    // HEARTBEAT: drop dead/zombie connections so sessions get cleaned up.
+    //
+    // It used to terminate on ONE missed pong at a 30s interval, which conflates two very
+    // different things: a browser that has gone away, and a browser that answered late
+    // because THIS process was too busy to notice. A blocked event loop - a large tool
+    // result being serialised, a compaction, a big transcript - delays the pong handler
+    // and the timer together, so the check can fail while the technician is sitting there
+    // watching the window. That reads as "it keeps disconnecting" and leaves no trace,
+    // because nothing here logged a reason.
+    //
+    // Now: two missed pongs before terminating, and every decision is logged with the
+    // evidence that produced it - including how late the timer itself was, which is what
+    // distinguishes "the client is gone" from "we were busy".
     ws.isAlive = true;
+    ws.missedPongs = 0;
     ws.on("pong", () => {
       ws.isAlive = true;
+      ws.missedPongs = 0;
     });
+    let lastTick = Date.now();
     const hb = setInterval(() => {
+      const now = Date.now();
+      const drift = now - lastTick - HEARTBEAT_MS;
+      lastTick = now;
       if (ws.isAlive === false) {
-        try { ws.terminate(); } catch {}
-        return;
+        ws.missedPongs++;
+        // A tick that arrived seconds late is evidence about US, not about the client, so
+        // it is never counted as a miss - it forgives the round it could not have won.
+        if (drift > HEARTBEAT_FORGIVE_MS) {
+          log("ws heartbeat late", `${drift}ms drift - not counting a missed pong`);
+          ws.missedPongs = Math.max(0, ws.missedPongs - 1);
+        } else if (ws.missedPongs >= HEARTBEAT_MAX_MISSES) {
+          log("ws terminated", `${ws.missedPongs} missed pongs, drift ${drift}ms`);
+          try { ws.terminate(); } catch {}
+          return;
+        } else {
+          log("ws pong missed", `${ws.missedPongs}/${HEARTBEAT_MAX_MISSES}, drift ${drift}ms`);
+        }
       }
       ws.isAlive = false;
       try { ws.ping(); } catch {}
-    }, 30000);
-    ws.on("close", () => {
+    }, HEARTBEAT_MS);
+    ws.on("close", (code, reason) => {
       clearInterval(hb);
       activeSessions--;
+      // The one line that was missing. "chat closed" told us a socket went away and
+      // nothing else; a close code separates a browser navigating away (1001) from a
+      // proxy timeout (1006) from our own idle disposal (1000) from a heartbeat kill.
+      log("ws closed", `code=${code} reason=${String(reason || "").slice(0, 120) || "(none)"}`);
     });
+    ws.on("error", (e) => log("ws error", String(e?.message || e).slice(0, 200)));
     // Three surfaces, deliberately different capability:
     //   odoo     -> no tools at all; proposes, Odoo executes as the Odoo user
     //   decision -> helpdesk tool belt (tickets, customer email)
