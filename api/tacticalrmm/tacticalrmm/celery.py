@@ -100,13 +100,9 @@ app.conf.beat_schedule = {
         "task": "core.tasks.run_ai_runtime_update",
         "schedule": timedelta(minutes=5),
     },
-    # Each morning at 10:00, after the overnight scheduled jobs have run, decide whether
-    # ticket-permission enforcement is safe to switch on and email the verdict with the
-    # evidence. Reports only - it changes nothing by itself. Goes quiet once enforcing.
-    "ai-caps-enforcement-readiness": {
-        "task": "core.tasks.report_caps_enforcement_readiness",
-        "schedule": crontab(minute=0, hour=10),
-    },
+    # ("ai-caps-enforcement-readiness" removed 2026-08-26: the daily GO/NO-GO email was
+    #  not earning its keep. Enforcement mode still lives in PI_CAPS_MODE on the bridge;
+    #  unclassified operations are still caught hourly by "ai-capability-health" below.)
     # An operation with no capability class is denied by product code. That is correct but
     # silent, so the system raises an internal notice ticket instead of relying on anyone
     # remembering to look. Hourly is plenty: the ticket is deduped per day.

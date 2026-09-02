@@ -60,6 +60,7 @@ def _can_manage_all_ai(user) -> bool:
     )
 
 from .models import (
+    AIAgentGroup,
     AIModel,
     AIProvider,
     AITask,
@@ -86,6 +87,7 @@ from .permissions import (
     WebTerminalPerms,
 )
 from .serializers import (
+    AIAgentGroupSerializer,
     AIModelSerializer,
     AIProviderSerializer,
     AITaskSerializer,
@@ -1003,6 +1005,61 @@ class AIPromptAssist(APIView):
             return Response({"reply": f"(bridge error: {e})"})
 
 
+class GetAddAIAgentGroup(APIView):
+    permission_classes = [IsAuthenticated, CoreSettingsPerms]
+
+    def get(self, request):
+        from core.agent_groups import ROLE_CATALOG
+
+        groups = AIAgentGroup.objects.all().prefetch_related("members")
+        return Response(
+            {
+                "groups": AIAgentGroupSerializer(groups, many=True).data,
+                "roles": ROLE_CATALOG,
+            }
+        )
+
+    def post(self, request):
+        serializer = AIAgentGroupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class UpdateDeleteAIAgentGroup(APIView):
+    permission_classes = [IsAuthenticated, CoreSettingsPerms]
+
+    def put(self, request, pk):
+        group = get_object_or_404(AIAgentGroup.objects.prefetch_related("members"), pk=pk)
+        serializer = AIAgentGroupSerializer(instance=group, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, pk):
+        get_object_or_404(AIAgentGroup, pk=pk).delete()
+        return Response("ok")
+
+
+class SeedAIAgentGroups(APIView):
+    """Create/refresh the built-in Coding and IT groups. Safe to re-run."""
+
+    permission_classes = [IsAuthenticated, CoreSettingsPerms]
+
+    def post(self, request):
+        from core.agent_groups import seed_builtin_groups
+
+        reset = bool(request.data.get("reset_members"))
+        result = seed_builtin_groups(reset_members=reset)
+        groups = AIAgentGroup.objects.all().prefetch_related("members")
+        return Response(
+            {
+                **result,
+                "groups": AIAgentGroupSerializer(groups, many=True).data,
+            }
+        )
+
+
 class GetAddAIModel(APIView):
     permission_classes = [IsAuthenticated, CoreSettingsPerms]
 
@@ -1898,6 +1955,88 @@ class AISpendEntryView(APIView):
 
     permission_classes = [IsAuthenticated, PiPerms]
 
+    def get(self, request):
+        """Running total for one window (a ticket, or every chat on one device).
+
+        The live meter is in-memory and dies on refresh; this is what restocks it.
+        GET /core/ai/spend-entry/?ticket_ref=TICKET/60427
+        GET /core/ai/spend-entry/?agent_id=<uuid>
+        """
+        from django.db.models import Count, DecimalField, Sum, Value
+        from django.db.models.functions import Coalesce
+
+        from core.models import AISpendEntry
+
+        ticket = str(request.query_params.get("ticket_ref") or "").strip()
+        agent_id = str(request.query_params.get("agent_id") or "").strip()
+        if ticket:
+            rows = AISpendEntry.objects.filter(ticket_ref=ticket)
+        elif agent_id:
+            rows = AISpendEntry.objects.filter(agent__agent_id=agent_id)
+        else:
+            return notify_error("ticket_ref or agent_id is required")
+
+        money = DecimalField(max_digits=18, decimal_places=10)
+        zero = Value(0, output_field=money)
+        sums = {
+            "cost_total": Coalesce(Sum("cost_total"), zero),
+            "cost_input": Coalesce(Sum("cost_input"), zero),
+            "cost_output": Coalesce(Sum("cost_output"), zero),
+            "cost_cache_read": Coalesce(Sum("cost_cache_read"), zero),
+            "cost_cache_write": Coalesce(Sum("cost_cache_write"), zero),
+            "input_tokens": Coalesce(Sum("input_tokens"), Value(0)),
+            "output_tokens": Coalesce(Sum("output_tokens"), Value(0)),
+            "cache_read_tokens": Coalesce(Sum("cache_read_tokens"), Value(0)),
+            "cache_write_tokens": Coalesce(Sum("cache_write_tokens"), Value(0)),
+            "reasoning_tokens": Coalesce(Sum("reasoning_tokens"), Value(0)),
+            "turns": Count("id"),
+        }
+        tot = rows.aggregate(**sums)
+        by_model = list(
+            rows.values("provider", "model_id")
+            .annotate(cost=Coalesce(Sum("cost_total"), zero), turns=Count("id"))
+            .order_by("-cost")
+        )
+        latest = rows.order_by("-at").values("context_tokens").first() or {}
+        switch_agg = rows.filter(was_model_switch=True).aggregate(
+            n=Count("id"),
+            spend=Coalesce(Sum("cost_cache_write"), zero),
+        )
+
+        def f(v):
+            return float(v or 0)
+
+        return Response({
+            "turns": tot["turns"],
+            "cost_total": f(tot["cost_total"]),
+            "spend": {
+                "input": f(tot["cost_input"]),
+                "output": f(tot["cost_output"]),
+                "cacheRead": f(tot["cost_cache_read"]),
+                "cacheWrite": f(tot["cost_cache_write"]),
+            },
+            "tokens": {
+                "input": tot["input_tokens"] or 0,
+                "output": tot["output_tokens"] or 0,
+                "cacheRead": tot["cache_read_tokens"] or 0,
+                "cacheWrite": tot["cache_write_tokens"] or 0,
+                "reasoning": tot["reasoning_tokens"] or 0,
+            },
+            "by_model": [
+                {
+                    "model": (f"{r['provider']}/{r['model_id']}").strip("/") or "unknown",
+                    "turns": r["turns"],
+                    "cost": f(r["cost"]),
+                }
+                for r in by_model
+                if r["model_id"] or r["provider"]
+            ],
+            "model_switches": switch_agg["n"] or 0,
+            "switch_spend": f(switch_agg["spend"]),
+            "context_tokens": int(latest.get("context_tokens") or 0),
+            "pricing_known": not rows.filter(priced=False).exists(),
+        })
+
     def post(self, request):
         from decimal import Decimal, InvalidOperation
 
@@ -2360,6 +2499,9 @@ class AIDecisionSession(APIView):
             if not match:
                 return notify_error("Requested model is not permitted for your role.")
             chosen = match
+        from core.agent_groups import apply_group, group_provider_keys
+        group_meta = {}
+        chosen = apply_group(group_meta, request, chosen)
 
         def mdict(m, full=False):
             base = {"provider": m.provider.name, "model_id": m.model_id,
@@ -2406,6 +2548,9 @@ class AIDecisionSession(APIView):
             # conversation was last using - see pibridge/src/model-memory.js.
             "model_requested": bool(req_id),
             "allowed_models": [mdict(m, full=True) for m in allowed],
+            "agent_group": group_meta.get("agent_group"),
+            "agent_groups": group_meta.get("agent_groups") or [],
+            "agent_group_keys": group_provider_keys(group_meta.get("agent_group")),
             "decision_prompt": core.ai_ticket_decision_prompt or "",
             # Start the chat in the state the operator last chose, not always OFF. Gated by
             # the role permission above, so remembering it can never grant it.
@@ -2456,6 +2601,8 @@ class AIDecisionSession(APIView):
             "model_id": chosen.model_id,
             "model_display": chosen.display_name,
             "allowed_models": [mdict(m) for m in allowed],
+            "agent_groups": group_meta.get("agent_groups") or [],
+            "agent_group": group_meta.get("agent_group"),
             "require_approval": True,
             "autoapprove_allowed": aa,
             "auto_approve": bool(aa and getattr(request.user, "ai_autoapprove_default", False)),

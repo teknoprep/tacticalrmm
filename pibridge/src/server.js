@@ -22,6 +22,15 @@ import { makeTurnWatchdog } from "./turn-watchdog.js";
 import { notebookWriteAuthorisation, privilegedCredentialAuthorisation } from "./authorisation.js";
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
+import {
+  makeGroupState,
+  mergeGroupKeys,
+  ensureGroupModels,
+  attachGroupToLoader,
+  findGroupInBlob,
+  summarizerMember,
+  publicReady,
+} from "./agent-groups.js";
 import { makeRemoteBinding } from "./remote-room.js";
 import * as windowMemory from "./window-memory.js";
 import { makeChatCommands } from "./chat-commands.js";
@@ -425,6 +434,82 @@ function makeWorkRecorder({ ticketRef = "", agentId = "", surface, username, ses
   };
 }
 
+function compactSummarizerHooks(session, rt, groupState) {
+  let previous = null;
+  return {
+    prepareSummarizer: async () => {
+      const sum = summarizerMember(groupState?.current);
+      if (!sum) return;
+      const m = rt.findModel(sum.provider, sum.model_id);
+      if (!m) return;
+      previous = session.model;
+      await session.setModel(m);
+    },
+    restoreAfter: async () => {
+      if (!previous) return;
+      try { await session.setModel(previous); } catch { /* keep going */ }
+      previous = null;
+    },
+  };
+}
+
+async function hydrateWindowCost(costMeter, query, { ws, visible, log, key }) {
+  try {
+    const prior = await trmm.getSpendWindow(query, { timeoutMs: 8000 });
+    if (prior && (prior.turns || prior.cost_total)) {
+      costMeter.hydrate(prior);
+      log?.("cost_hydrated", key, `${prior.turns || 0} turns $${Number(prior.cost_total || 0).toFixed(2)}`);
+    }
+  } catch (e) {
+    log?.("cost_hydrate_error", key, String(e?.message || e).slice(0, 200));
+  }
+  if (visible) {
+    try { ws.send(JSON.stringify(costMeter.snapshot())); } catch { /* socket gone */ }
+  }
+}
+
+async function applySetGroup({ ws, session, rt, blob, groupState, msg, costMeter, log, key }) {
+  const next = findGroupInBlob(blob, msg.group_id);
+  groupState.current = next;
+  blob.agent_group = next;
+  let modelDisplay = session?.model?.name || blob.model_id;
+  let modelId = blob.model_id;
+  const orch = (next?.members || next?.roles || []).find((m) => m.role === "orchestrator");
+  if (orch) {
+    const target = rt.findModel(orch.provider, orch.model_id);
+    if (target) {
+      if (costMeter?.previewModelSwitch) costMeter.previewModelSwitch(target, orch.display_name || orch.model_id);
+      await session.setModel(target);
+      modelDisplay = target.name || orch.display_name || orch.model_id;
+      modelId = orch.model_id;
+      blob.provider = orch.provider;
+      blob.model_id = orch.model_id;
+      blob.thinking_level = orch.thinking_level || blob.thinking_level;
+    } else {
+      ws.send(JSON.stringify({
+        type: "error",
+        message: `Group orchestrator not available: ${orch.provider}/${orch.model_id}`,
+      }));
+    }
+  }
+  const orchForMemory = orch || { provider: blob.provider, model_id: modelId };
+  windowMemory.remember(key, {
+    provider: orchForMemory.provider || blob.provider,
+    model_id: modelId,
+    group_id: next?.id ?? null,
+    by: blob.username || "",
+  });
+  log?.("group_changed", key, next ? `${next.slug} -> ${modelId}` : "cleared");
+  ws.send(JSON.stringify({
+    type: "group_changed",
+    group_id: next?.id ?? null,
+    name: next?.name || "",
+    display: next?.name || "",
+    model_id: modelId,
+    model_display: modelDisplay,
+  }));
+}
+
 // The model's CONTEXT is not the operator's TRANSCRIPT.
 //
 // After a compaction, pi deliberately collapses history for the LLM: the compacted
@@ -441,6 +526,23 @@ const TRANSCRIPT_TOOL_RESULT_MAX = Number(process.env.PI_TRANSCRIPT_TOOL_MAX || 
 const COMPACTION_NOTICE =
   "--- Earlier turns were summarised to free up context. They are shown above for " +
   "your reference, but the assistant no longer sees them verbatim - only the summary. ---";
+const CLEAR_NOTICE =
+  "--- Earlier history was summarised and cleared at the technician's request. Pi " +
+  "continues from the summary; the full transcript remains on disk in AI History. ---";
+
+// Has this session's transcript been deliberately cleared ("Summarise & clear history")?
+// The marker is a durable custom entry in the session branch, so the decision survives
+// reconnects and resumes without any storage of its own.
+function transcriptClearedAt(sessionManager) {
+  let branch = [];
+  try { branch = sessionManager?.getBranch?.() || []; } catch { branch = []; }
+  let cut = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const e = branch[i];
+    if (e?.type === "custom" && e.customType === "transcript_cleared") cut = i;
+  }
+  return { branch, cut };
+}
 
 // Every frame the browser is sent, offered to the phone as well.
 //
@@ -468,16 +570,37 @@ function mirrorBrowserFramesToPhone(ws, getRemote) {
 }
 
 function uiTranscript(sessionManager, session) {
-  let branch = [];
-  try {
-    branch = sessionManager?.getBranch?.() || [];
-  } catch {
-    branch = [];
-  }
+  // "Summarise & clear history": everything before the LAST clear marker is deliberately
+  // hidden from the window. Still on disk, still in AI History - just not re-sent here.
+  const { branch, cut } = transcriptClearedAt(sessionManager);
+  const entries = cut >= 0 ? branch.slice(cut + 1) : branch;
   const out = [];
-  for (const entry of branch) {
+  if (cut >= 0) {
+    out.push({ role: "system", content: [{ type: "text", text: CLEAR_NOTICE }] });
+    // Resurface the summary the clear was based on - it IS "where we are now", and a
+    // reloaded window would otherwise open onto a blank screen with no bearings. The
+    // compaction entry sits just before the cut marker, so walk back to find it.
+    for (let i = cut; i >= 0; i--) {
+      const e = branch[i];
+      if (e?.type === "compaction" && e.summary) {
+        out.push({
+          role: "assistant",
+          content: [{ type: "text", text: `\u{1F4CB} Where we are (summary of the cleared history):\n\n${e.summary}` }],
+        });
+        break;
+      }
+    }
+  }
+  for (const entry of entries) {
     if (entry?.type === "compaction") {
       out.push({ role: "system", content: [{ type: "text", text: COMPACTION_NOTICE }] });
+      // Show WHAT the model now works from, not just that a compaction happened.
+      if (entry.summary) {
+        out.push({
+          role: "assistant",
+          content: [{ type: "text", text: `\u{1F4CB} Where we are (summary of the work above):\n\n${entry.summary}` }],
+        });
+      }
       continue;
     }
     if (entry?.type !== "message" || !entry.message) continue;
@@ -587,12 +710,20 @@ async function startChat(ws, blob) {
   // model's provider so the operator can switch models mid-session.
   const keys = { [blob.provider]: blob.api_key };
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
+  mergeGroupKeys(keys, blob);
   const rt = await piRuntime(keys);
   const modelRegistry = rt;                       // .findModel() below; kept name for diff clarity
-  // Reopen on the model this conversation was last using, not on the global default - see
-  // window-memory.js. Falls back to the default when nothing is remembered or when this
-  // technician's role does not carry the remembered model.
-  const pick = windowMemory.chooseModel(agentId, blob);
+  const groupState = makeGroupState(blob);
+  groupState.rt = rt;
+  // Reopen on the model / group this conversation was last using, not on the global
+  // default - see window-memory.js. Falls back when nothing is remembered or this
+  // technician may not use what was remembered.
+  let pick = windowMemory.chooseTarget(agentId, blob);
+  if (pick.group !== undefined) {
+    blob.agent_group = pick.group;
+    groupState.current = pick.group;
+  }
+  await ensureGroupModels(rt, blob, log);
   let model = rt.findModel(pick.provider, pick.model_id);
   if (!model && pick.source !== "default") {
     // The remembered model no longer resolves (retired upstream, provider disabled). Not
@@ -717,7 +848,7 @@ async function startChat(ws, blob) {
   }
 
   // Resource loader for system prompt override
-  const loader = new DefaultResourceLoader({
+  const loader = new DefaultResourceLoader(attachGroupToLoader({
     agentDir: CONFIG.sessionsRoot,
     cwd: CONFIG.sessionsRoot,
     systemPromptOverride: () =>
@@ -725,7 +856,7 @@ async function startChat(ws, blob) {
       roNotice +
       helpdeskSection(blob, facts?.client) +
       operatorPromptSection(blob.operator),
-  });
+  }, groupState));
   await loader.reload();
 
   // Session persistence (resume or new)
@@ -1038,6 +1169,8 @@ async function startChat(ws, blob) {
         thinking_level: m.thinking_level,
         base_url: m.base_url,
       })),
+      agent_group: publicReady(groupState.current),
+      agent_groups: blob.agent_groups || [],
       require_approval: blob.require_approval,
       autoapprove_allowed: blob.autoapprove_allowed,
       // Echo the CURRENT state so the UI renders what is actually in force.
@@ -1058,6 +1191,9 @@ async function startChat(ws, blob) {
       history: uiTranscript(sessionManager, session),
     }),
   );
+  await hydrateWindowCost(costMeter, { agent_id: agentId }, {
+    ws, visible: !!blob.cost_visible, log, key: agentId,
+  });
 
   // Idle disposal
   let idleTimer;
@@ -1095,6 +1231,9 @@ async function startChat(ws, blob) {
     currentModel: () => session.model || model,
     rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
     inTurn,
+    markCleared: () => sessionManager.appendCustomEntry("transcript_cleared",
+      { at: new Date().toISOString(), by: blob.username || "" }),
+    ...compactSummarizerHooks(session, rt, groupState),
   });
 
   // "Still working" ping. A turn can legitimately produce nothing the browser can render
@@ -1222,7 +1361,11 @@ async function startChat(ws, blob) {
       if (await remote?.handleBrowser(msg)) return;
       switch (msg.type) {
         case "compact":
-          await compactCmd.run(String(msg.message || ""), { reason: "technician asked (button)" });
+          await compactCmd.run(String(msg.message || ""), {
+            reason: msg.clear === true ? "technician asked (summarise & clear)" : "technician asked (button)",
+            clear: msg.clear === true,
+            instructions: msg.instructions,
+          });
           break;
         case "prompt":
           await runPrompt(msg.message);
@@ -1259,6 +1402,9 @@ async function startChat(ws, blob) {
           applyLabel(msg.value);
           break;
         }
+        case "set_group":
+          await applySetGroup({ ws, session, rt, blob, groupState, msg, costMeter, log, key: agentId });
+          break;
         case "set_model": {
           const allowed = (blob.allowed_models || []).find(
             (m) => m.model_id === msg.model_id,
@@ -1303,6 +1449,7 @@ async function startChat(ws, blob) {
           windowMemory.remember(agentId, {
             provider: allowed.provider,
             model_id: allowed.model_id,
+            group_id: groupState.current?.id ?? null,
             by: blob.username || "",
           });
           ws.send(
@@ -1389,10 +1536,18 @@ async function startDecisionChat(ws, blob) {
 
   const keys = { [blob.provider]: blob.api_key };
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
+  mergeGroupKeys(keys, blob);
   const rt = await piRuntime(keys);
   const modelRegistry = rt;
-  // Same as the device chat: resume on the model this TICKET was last worked with.
-  const pick = windowMemory.chooseModel(histKey, blob);
+  const groupState = makeGroupState(blob);
+  groupState.rt = rt;
+  // Same as the device chat: resume on the model / group this TICKET was last using.
+  let pick = windowMemory.chooseTarget(histKey, blob);
+  if (pick.group !== undefined) {
+    blob.agent_group = pick.group;
+    groupState.current = pick.group;
+  }
+  await ensureGroupModels(rt, blob, log);
   let model = rt.findModel(pick.provider, pick.model_id);
   if (!model && pick.source !== "default") {
     log("model memory unusable", histKey, "-", `${pick.provider}/${pick.model_id} did not resolve; using the default`);
@@ -1581,7 +1736,7 @@ async function startDecisionChat(ws, blob) {
   });
   if (!hd) { ws.send(JSON.stringify({ type: "error", message: `helpdesk.js failed to load: ${hdError}` })); ws.close(); return; }
 
-  const loader = new DefaultResourceLoader({
+  const loader = new DefaultResourceLoader(attachGroupToLoader({
     agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
     systemPromptOverride: () =>
       `You are Pi, an AI helpdesk technician working ONE ticket (${ticketRef}) live with a technician in a chat.\n` +
@@ -1608,7 +1763,7 @@ async function startDecisionChat(ws, blob) {
       helpdeskSection(blob, ctx.client) +
       procedureSection(blob) +
       operatorPromptSection(blob.operator),
-  });
+  }, groupState));
   await loader.reload();
 
   // Persist per ticket: resume the latest session for this ticket if one exists.
@@ -1738,6 +1893,9 @@ async function startDecisionChat(ws, blob) {
     log, key: histKey, sessionId,
     currentModel: () => session.model || model,
     rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
+    markCleared: () => sessionManager.appendCustomEntry("transcript_cleared",
+      { at: new Date().toISOString(), by: blob.username || "" }),
+    ...compactSummarizerHooks(session, rt, groupState),
   });
 
   // See the device chat: one setter per switch, shared by the socket frames and the
@@ -1830,6 +1988,8 @@ async function startDecisionChat(ws, blob) {
     switches_restored: switches.restored,
     switches_denied: switches.denied,
     allowed_models: (blob.allowed_models || []).map((m) => ({ provider: m.provider, model_id: m.model_id, display_name: m.display_name, thinking_level: m.thinking_level, base_url: m.base_url })),
+    agent_group: publicReady(groupState.current),
+    agent_groups: blob.agent_groups || [],
     require_approval: true, autoapprove_allowed: autoapproveAllowed, auto_approve: autoApprove,
     read_only: readonly, mutate_allowed: mutateAllowed,
     allow_email: allowEmail,
@@ -1842,8 +2002,16 @@ async function startDecisionChat(ws, blob) {
     context_window: Number(model?.contextWindow || 0),
     operator_enabled: !!(blob.operator && blob.operator.enabled),
     operator_machines: (blob.operator && blob.operator.machines) || [],
-    history: [...priorHist, ...uiTranscript(sessionManager, session)],
+    // A cleared transcript suppresses the ticket's prior thread too - the whole point
+    // was a clean window; the record is still in the ticket and on disk.
+    history: [
+      ...(transcriptClearedAt(sessionManager).cut >= 0 ? [] : priorHist),
+      ...uiTranscript(sessionManager, session),
+    ],
   }));
+  await hydrateWindowCost(costMeter, { ticket_ref: ticketRef }, {
+    ws, visible: !!blob.cost_visible, log, key: histKey,
+  });
 
   // As soon as the tech actually STARTS TALKING to this chat (first prompt), assign
   // the ticket to them (matched by their RMM email/login to an Odoo user). Only takes
@@ -1938,7 +2106,11 @@ async function startDecisionChat(ws, blob) {
       if (await remote?.handleBrowser(msg)) return;
       switch (msg.type) {
         case "compact":
-          await compactCmd.run(String(msg.message || ""), { reason: "technician asked (button)" });
+          await compactCmd.run(String(msg.message || ""), {
+            reason: msg.clear === true ? "technician asked (summarise & clear)" : "technician asked (button)",
+            clear: msg.clear === true,
+            instructions: msg.instructions,
+          });
           break;
         case "prompt":
           await runPrompt(msg.message);
@@ -1949,6 +2121,9 @@ async function startDecisionChat(ws, blob) {
           await session.steer(msg.message);
           break;
         case "abort": await session.abort(); break;
+        case "set_group":
+          await applySetGroup({ ws, session, rt, blob, groupState, msg, costMeter, log, key: histKey });
+          break;
         case "set_model": {
           const allowed = (blob.allowed_models || []).find((m) => m.model_id === msg.model_id);
           if (!allowed) { ws.send(JSON.stringify({ type: "error", message: `Model not permitted: ${msg.model_id}` })); break; }
@@ -1961,6 +2136,7 @@ async function startDecisionChat(ws, blob) {
           windowMemory.remember(histKey, {
             provider: allowed.provider,
             model_id: allowed.model_id,
+            group_id: groupState.current?.id ?? null,
             by: blob.username || "",
           });
           ws.send(JSON.stringify({ type: "model_changed", model_id: allowed.model_id, display: nm.name }));

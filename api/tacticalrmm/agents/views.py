@@ -1865,6 +1865,9 @@ class PiMultiSession(APIView):
             if not match:
                 return notify_error("Requested model is not permitted for your role.")
             chosen = match
+        from core.agent_groups import apply_group, group_provider_keys
+        group_meta = {}
+        chosen = apply_group(group_meta, request, chosen)
 
         def model_dict_full(m):
             return {**_pi_model_dict(m), "api_key": m.provider.api_key}
@@ -1903,6 +1906,9 @@ class PiMultiSession(APIView):
             # conversation was last using - see pibridge/src/model-memory.js.
             "model_requested": bool(req_id),
             "allowed_models": [model_dict_full(m) for m in allowed],
+            "agent_group": group_meta.get("agent_group"),
+            "agent_groups": group_meta.get("agent_groups") or [],
+            "agent_group_keys": group_provider_keys(group_meta.get("agent_group")),
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(
                 is_super or (user.role and user.role.can_use_ai_autoapprove)
@@ -1981,6 +1987,8 @@ class PiMultiSession(APIView):
                 "model_id": chosen.model_id,
                 "model_display": chosen.display_name,
                 "allowed_models": [_pi_model_dict(m) for m in allowed],
+                "agent_groups": group_meta.get("agent_groups") or [],
+                "agent_group": group_meta.get("agent_group"),
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
                 "autocredential_allowed": blob["autocredential_allowed"],
@@ -2052,6 +2060,9 @@ class AgentPiSession(APIView):
             if not match:
                 return notify_error("Requested model is not permitted for your role.")
             chosen = match
+        from core.agent_groups import apply_group, group_provider_keys
+        group_meta = {}
+        chosen = apply_group(group_meta, request, chosen)
 
         def model_dict(m):
             # safe for the browser (no api key)
@@ -2101,6 +2112,9 @@ class AgentPiSession(APIView):
             # conversation was last using - see pibridge/src/model-memory.js.
             "model_requested": bool(req_id),
             "allowed_models": [model_dict_full(m) for m in allowed],
+            "agent_group": group_meta.get("agent_group"),
+            "agent_groups": group_meta.get("agent_groups") or [],
+            "agent_group_keys": group_provider_keys(group_meta.get("agent_group")),
             "device_facts": device_facts,
             "require_approval": bool(core.ai_require_approval),
             "autoapprove_allowed": bool(is_super or (user.role and user.role.can_use_ai_autoapprove)),
@@ -2153,6 +2167,8 @@ class AgentPiSession(APIView):
                 "model_id": chosen.model_id,
                 "model_display": chosen.display_name,
                 "allowed_models": [model_dict(m) for m in allowed],
+                "agent_groups": group_meta.get("agent_groups") or [],
+                "agent_group": group_meta.get("agent_group"),
                 "require_approval": blob["require_approval"],
                 "autoapprove_allowed": blob["autoapprove_allowed"],
                 "autocredential_allowed": blob["autocredential_allowed"],

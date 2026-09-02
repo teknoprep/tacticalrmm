@@ -138,6 +138,13 @@ export const trmm = {
   // Append one billed turn to the AI spend ledger (POST /core/ai/spend-entry/).
   // Fire-and-forget: bookkeeping must never break a chat.
   logSpend: (entry, opts) => req("POST", `/core/ai/spend-entry/`, entry, opts),
+  // Lifetime total for one window (ticket or device). Seeds the live meter on reconnect.
+  getSpendWindow: ({ ticket_ref, agent_id } = {}, opts) => {
+    const q = ticket_ref
+      ? `ticket_ref=${encodeURIComponent(ticket_ref)}`
+      : `agent_id=${encodeURIComponent(agent_id || "")}`;
+    return req("GET", `/core/ai/spend-entry/?${q}`, null, opts);
+  },
   listProcedures: ({ q } = {}, opts) =>
     req("GET", `/core/ai/procedures/${q ? `?q=${encodeURIComponent(q)}` : ""}`, null, opts),
 

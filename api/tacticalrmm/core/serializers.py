@@ -7,6 +7,8 @@ from tacticalrmm.constants import (
 )
 
 from .models import (
+    AIAgentGroup,
+    AIAgentGroupMember,
     AIModel,
     AIProvider,
     AITask,
@@ -256,6 +258,132 @@ class AIModelSerializer(serializers.ModelSerializer):
     class Meta:
         model = AIModel
         fields = "__all__"
+
+
+class AIAgentGroupMemberSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AIAgentGroupMember
+        fields = (
+            "id",
+            "role",
+            "provider",
+            "model_id",
+            "display_name",
+            "thinking_level",
+            "definition",
+            "enabled",
+        )
+
+    def validate_role(self, value):
+        from django.utils.text import slugify
+
+        slug = slugify(str(value or "").strip())
+        if not slug:
+            raise serializers.ValidationError("Role needs a name (letters or numbers).")
+        if len(slug) > 32:
+            raise serializers.ValidationError("Role name is too long.")
+        return slug
+
+
+class AIAgentGroupSerializer(serializers.ModelSerializer):
+    members = AIAgentGroupMemberSerializer(many=True, required=False)
+
+    class Meta:
+        model = AIAgentGroup
+        fields = (
+            "id",
+            "name",
+            "slug",
+            "description",
+            "kind",
+            "workspace",
+            "enabled",
+            "is_default",
+            "members",
+            "created_time",
+            "modified_time",
+        )
+        read_only_fields = ("slug", "created_time", "modified_time")
+
+    def validate(self, attrs):
+        if self.instance is None and not attrs.get("members"):
+            raise serializers.ValidationError(
+                {"members": "A group needs at least an orchestrator."}
+            )
+        return attrs
+
+    def validate_members(self, value):
+        from django.utils.text import slugify
+
+        seen = set()
+        has_orch = False
+        for m in value or []:
+            r = slugify(str(m.get("role") or "").strip())
+            if not r:
+                raise serializers.ValidationError("Every specialist needs a role name.")
+            if r in seen:
+                raise serializers.ValidationError(f"Duplicate role '{r}'.")
+            seen.add(r)
+            if r == "orchestrator":
+                has_orch = True
+            if not m.get("provider") or not m.get("model_id"):
+                raise serializers.ValidationError(
+                    f"Role '{r}' needs a provider and a model."
+                )
+            from core.agent_groups import ROLE_DEFINITIONS
+
+            definition = str(m.get("definition") or "").strip()
+            if not definition and r in ROLE_DEFINITIONS:
+                m["definition"] = ROLE_DEFINITIONS[r]
+            elif r != "orchestrator" and len(definition) < 20:
+                raise serializers.ValidationError(
+                    f"Role '{r}' needs a definition (what this specialist does). "
+                    f"Open the definition icon next to the row."
+                )
+        if not has_orch:
+            raise serializers.ValidationError("A group needs an orchestrator.")
+        return value
+
+    def _write_members(self, group, members):
+        from core.models import AIAgentGroupMember
+
+        keep_roles = set()
+        for m in members or []:
+            role = m["role"]
+            keep_roles.add(role)
+            AIAgentGroupMember.objects.update_or_create(
+                group=group,
+                role=role,
+                defaults={
+                    "provider": m.get("provider") or "",
+                    "model_id": m.get("model_id") or "",
+                    "display_name": m.get("display_name") or m.get("model_id") or "",
+                    "thinking_level": m.get("thinking_level") or "medium",
+                    "definition": m.get("definition") or "",
+                    "enabled": m.get("enabled", True),
+                },
+            )
+        group.members.exclude(role__in=keep_roles).delete()
+
+    def create(self, validated_data):
+        from core.agent_groups import unique_slug
+
+        members = validated_data.pop("members", [])
+        validated_data["slug"] = unique_slug(validated_data.get("name") or "group")
+        group = super().create(validated_data)
+        self._write_members(group, members)
+        return group
+
+    def update(self, instance, validated_data):
+        from core.agent_groups import unique_slug
+
+        members = validated_data.pop("members", None)
+        if "name" in validated_data and validated_data["name"] != instance.name:
+            validated_data["slug"] = unique_slug(validated_data["name"], exclude_pk=instance.pk)
+        group = super().update(instance, validated_data)
+        if members is not None:
+            self._write_members(group, members)
+        return group
 
 
 class AIProcedureSerializer(serializers.ModelSerializer):

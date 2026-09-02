@@ -126,10 +126,13 @@ export function chooseSwitches(scopeKey, blob = {}) {
  * Record the model this conversation is now using.
  * Never throws: losing this preference must not be able to break a chat.
  */
-export function remember(scopeKey, { provider, model_id, by = "" } = {}) {
+export function remember(scopeKey, { provider, model_id, group_id, by = "" } = {}) {
   if (!scopeKey || !provider || !model_id) return;
   const rec = readRecord(scopeKey);
-  writeRecord(scopeKey, { ...rec, provider, model_id, by, at: new Date().toISOString() });
+  const next = { ...rec, provider, model_id, by, at: new Date().toISOString() };
+  // null is a real choice ("single model, no group"). Omit the key to leave it alone.
+  if (group_id !== undefined) next.group_id = group_id;
+  writeRecord(scopeKey, next);
 }
 
 /** What this conversation last used, or null. */
@@ -160,34 +163,91 @@ export function recall(scopeKey) {
  *                  person (`remembered` then carries what was denied, for the log).
  */
 export function chooseModel(scopeKey, blob) {
+  return chooseTarget(scopeKey, blob);
+}
+
+function groupOrchestrator(group) {
+  if (!group) return null;
+  return group.orchestrator
+    || (group.members || group.roles || []).find((m) => m.role === "orchestrator")
+    || null;
+}
+
+/**
+ * Model + group this window should open on.
+ *
+ * Precedence:
+ *   1. Explicit group_id / model_id from the browser (this click / this refresh
+ *      carrying a saved picker value).
+ *   2. What THIS conversation last used, if the caller may still use it.
+ *   3. The default agent group, else the starred model.
+ *
+ * A remembered group or model that this person cannot use loses to the default.
+ * Recall never widens access.
+ */
+export function chooseTarget(scopeKey, blob) {
   const allowed = Array.isArray(blob?.allowed_models) ? blob.allowed_models : [];
+  const groups = Array.isArray(blob?.agent_groups) ? blob.agent_groups : [];
   const fallback = {
     provider: blob?.provider,
     model_id: blob?.model_id,
     thinking_level: blob?.thinking_level,
     source: "default",
+    group: blob?.agent_group || null,
+  };
+  const findGroup = (id) => groups.find((g) => Number(g.id) === Number(id)) || null;
+  const fromGroup = (group, source) => {
+    const o = groupOrchestrator(group);
+    if (!o) return { ...fallback, group, source };
+    return {
+      provider: o.provider,
+      model_id: o.model_id,
+      thinking_level: o.thinking_level || blob?.thinking_level,
+      display_name: o.display_name,
+      source,
+      group,
+    };
+  };
+  const fromAllowed = (provider, modelId, source) => {
+    const match = allowed.find(
+      (m) => m.model_id === modelId && (!provider || m.provider === provider),
+    );
+    if (!match) return null;
+    return {
+      provider: match.provider,
+      model_id: match.model_id,
+      thinking_level: match.thinking_level || blob?.thinking_level,
+      display_name: match.display_name,
+      source,
+      group: null,
+    };
   };
 
-  // An explicit request from the browser is a deliberate act by the person in front of the
-  // window; it outranks anything remembered. Django has already refused any model this
-  // caller may not use before it reached the blob.
-  if (blob?.model_requested) return { ...fallback, source: "requested" };
+  // Browser named a group (including "none") — that click wins.
+  if (blob?.group_requested) {
+    if (blob.agent_group) return fromGroup(blob.agent_group, "requested_group");
+    if (blob.model_requested) return { ...fallback, source: "requested", group: null };
+  } else if (blob?.model_requested && !blob.agent_group) {
+    return { ...fallback, source: "requested", group: null };
+  }
 
   const last = recall(scopeKey);
-  if (!last) return fallback;
-
-  const match = allowed.find(
-    (m) => m.model_id === last.model_id && (!last.provider || m.provider === last.provider),
-  );
-  if (!match) {
-    // Remembered but not permitted for THIS person - the "someone else resumes it" case.
+  if (last && last.group_id != null && last.group_id !== "") {
+    const g = findGroup(last.group_id);
+    if (g) return fromGroup(g, "remembered_group");
+    return { ...fallback, remembered: `group:${last.group_id}` };
+  }
+  if (last && Object.prototype.hasOwnProperty.call(last, "group_id") && last.group_id == null && last.model_id) {
+    const hit = fromAllowed(last.provider, last.model_id, "remembered");
+    if (hit) return hit;
+    return { ...fallback, group: null, remembered: `${last.provider}/${last.model_id}` };
+  }
+  if (last?.model_id && !last.group_id) {
+    const hit = fromAllowed(last.provider, last.model_id, "remembered");
+    if (hit) return hit;
     return { ...fallback, remembered: `${last.provider}/${last.model_id}` };
   }
-  return {
-    provider: match.provider,
-    model_id: match.model_id,
-    thinking_level: match.thinking_level || blob?.thinking_level,
-    display_name: match.display_name,
-    source: "remembered",
-  };
+
+  if (blob.agent_group) return fromGroup(blob.agent_group, "agent_group");
+  return fallback;
 }

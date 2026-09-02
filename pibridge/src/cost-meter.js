@@ -99,6 +99,40 @@ export function makeCostMeter({
     get contextTokens() { return contextTokens; },
     get warnings() { return [...warnings]; },
 
+    /**
+     * Restock from the durable ledger so a refresh shows EVERYTHING this window
+     * has ever spent, not just the turns since the socket opened. Does not warn
+     * and does not write ledger rows - those already exist.
+     */
+    hydrate(prior = {}) {
+      const t = Number(prior.turns || 0);
+      if (t <= 0 && !Number(prior.cost_total || 0)) return meter.snapshot();
+      sessionCost = num(prior.cost_total);
+      turns = t;
+      lastTurnCost = 0;
+      const tok = prior.tokens || {};
+      for (const c of CLASSES) tokens[c] = num(tok[c]);
+      tokens.reasoning = num(tok.reasoning);
+      const sp = prior.spend || {};
+      for (const c of CLASSES) spend[c] = num(sp[c]);
+      if (prior.pricing_known === false) pricingKnown = false;
+      byModel.clear();
+      for (const row of prior.by_model || []) {
+        if (!row?.model) continue;
+        byModel.set(row.model, {
+          turns: num(row.turns),
+          cost: num(row.cost),
+          cacheWrite: 0,
+        });
+      }
+      modelSwitches = num(prior.model_switches);
+      switchSpend = num(prior.switch_spend);
+      if (num(prior.context_tokens) > 0) contextTokens = num(prior.context_tokens);
+      nextSessionWarn = SESSION_COST_WARN;
+      while (sessionCost >= nextSessionWarn) nextSessionWarn += SESSION_COST_WARN;
+      return meter.snapshot();
+    },
+
     snapshot() {
       return {
         type: "cost_update",

@@ -50,6 +50,24 @@ export function shouldCompact({ contextTokens = 0, contextWindow = 0, min = MIN_
 }
 
 /**
+ * Rough token estimate for a session the cost meter has not measured yet (~4 chars per
+ * token). Exists for exactly one case: the bridge restarted and the window RESUMED a
+ * session from disk - the history (and its per-turn cost) is fully there, but the fresh
+ * in-memory meter reads zero until the next turn reports usage. Without this, "compact"
+ * refuses right after a restart, which is precisely when a long chat wants it most.
+ */
+export function estimateContextTokens(session) {
+  try {
+    const msgs = session?.messages || [];
+    let chars = 0;
+    for (const m of msgs) chars += JSON.stringify(m)?.length || 0;
+    return Math.round(chars / 4);
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Run a compaction and describe the result.
  *
  * Never throws: a failed compaction must leave the chat usable, because the technician is
@@ -60,6 +78,21 @@ export function shouldCompact({ contextTokens = 0, contextWindow = 0, min = MIN_
  * @param opts.instructions  optional steer for the summary
  * @param opts.log     logger
  */
+function handoffInstructions(note) {
+  const n = String(note || "").trim();
+  if (!n) return undefined;
+  return (
+    `TECHNICIAN HANDOFF — this is AUTHORITATIVE and overrides earlier checklist items, ` +
+    `"In Progress" lines, and any previous summary in this conversation:\n\n${n}\n\n` +
+    `Rules:\n` +
+    `- If the note says something is done, working, finished, or closed, put it under Done. ` +
+    `Do NOT keep a leftover "verify / retry / in progress" item for that same thing.\n` +
+    `- This is a chapter break. Summarise what is finished, what still matters for the NEXT stretch, ` +
+    `and what to ignore. Drop stale open items the note just closed.\n` +
+    `- Keep names, IDs, paths, numbers, and decisions. Do not invent new work.`
+  );
+}
+
 export async function runCompaction(session, { reason = "requested", instructions, log, key, sessionId } = {}) {
   if (!session || typeof session.compact !== "function") {
     return { ok: false, error: "this session does not support compaction" };
@@ -68,15 +101,17 @@ export async function runCompaction(session, { reason = "requested", instruction
     return { ok: false, error: "a compaction is already running" };
   }
   const started = Date.now();
+  const steer = handoffInstructions(instructions);
   try {
-    const res = await session.compact(instructions);
+    const res = await session.compact(steer);
     const before = Number(res?.tokensBefore || 0);
     // estimatedTokensAfter is the harness's own estimate; it is not always present.
     const after = Number(res?.estimatedTokensAfter || 0);
     const saved = before && after ? Math.max(0, before - after) : 0;
     log?.("compacted", key, sessionId,
       `${reason}: ${before.toLocaleString("en-US")} -> ${after ? after.toLocaleString("en-US") : "?"} tokens ` +
-      `in ${Math.round((Date.now() - started) / 1000)}s`);
+      `in ${Math.round((Date.now() - started) / 1000)}s` +
+      (steer ? ` note=${JSON.stringify(String(instructions).trim().slice(0, 80))}` : ""));
     return {
       ok: true,
       tokensBefore: before,
@@ -122,13 +157,27 @@ export function parseCompactCommand(text) {
 export function makeCompactCommand({
   session, costMeter, send, log, key, sessionId,
   currentModel = () => null, rateLookup = null, inTurn = (fn) => fn(),
+  // "Summarise & clear history": writes a durable cut marker into the session file so
+  // every rebuilt transcript (reload, resume, the phone) starts at the cut. Optional -
+  // a surface that does not pass it simply cannot clear.
+  markCleared = null,
+  // Optional: switch to the group's cheap summarizer for the compact call, then
+  // put the orchestrator back. Failures must still restore the original model.
+  prepareSummarizer = null,
+  restoreAfter = null,
 }) {
   return {
     isCommand: (text) => parseCompactCommand(text) !== null,
 
-    async run(text, { reason = "technician asked" } = {}) {
+    async run(text, { reason = "technician asked", clear = false, instructions } = {}) {
       const parsed = parseCompactCommand(text) || {};
-      const before = Number(costMeter?.contextTokens || 0);
+      if (instructions !== undefined && instructions !== null && String(instructions).trim()) {
+        parsed.instructions = String(instructions).trim();
+      }
+      // Prefer the measured figure; fall back to an estimate for a freshly resumed
+      // session (bridge restart) whose meter has not seen a turn yet.
+      const measured = Number(costMeter?.contextTokens || 0);
+      const before = measured > 0 ? measured : estimateContextTokens(session);
       const window = Number(currentModel()?.contextWindow || 0);
       const worth = shouldCompact({ contextTokens: before, contextWindow: window });
       if (!worth.worth) {
@@ -144,9 +193,19 @@ export function makeCompactCommand({
 
       // Compaction is itself an LLM call, so run it inside the liveness context - it is
       // exactly the kind of long quiet request the stall watchdog used to kill.
-      const res = await inTurn(() => runCompaction(session, {
-        reason, instructions: parsed.instructions, log, key, sessionId,
-      }));
+      let res;
+      try {
+        if (typeof prepareSummarizer === "function") await prepareSummarizer();
+        res = await inTurn(() => runCompaction(session, {
+          reason, instructions: parsed.instructions, log, key, sessionId,
+        }));
+      } finally {
+        if (typeof restoreAfter === "function") {
+          try { await restoreAfter(); } catch (e) {
+            log?.("compact_restore_error", key, sessionId, String(e?.message || e).slice(0, 200));
+          }
+        }
+      }
 
       if (!res.ok) {
         send({ type: "error", message: `Could not compact the conversation: ${res.error}. Nothing was changed - the chat is exactly as it was.` });
@@ -159,15 +218,30 @@ export function makeCompactCommand({
         tokensBefore: res.tokensBefore, tokensAfter: after,
         model: currentModel(), rateLookup,
       });
+      // The clear marker goes in only AFTER a successful compaction: clearing the screen
+      // without the summary would genuinely lose the technician's working context.
+      let cleared = false;
+      if (clear && typeof markCleared === "function") {
+        try { markCleared(); cleared = true; }
+        catch (e) { log?.("compact_clear_error", key, sessionId, String(e?.message || e).slice(0, 200)); }
+      }
       send({
         type: "compacted",
+        cleared,
+        // The summary itself - "where we are now". The window shows it so the technician
+        // is never staring at a cleared screen wondering what the AI still knows.
+        summary: String(res.summary || ""),
         tokens_before: res.tokensBefore,
         tokens_after: after,
         saved: res.saved,
         detail,
-        message: `Conversation compacted: ${detail || `${res.tokensBefore.toLocaleString("en-US")} tokens summarised`}. ` +
-          `Everything above is still readable here; the model now starts from a summary, so ` +
-          `following turns cost far less.`,
+        message: cleared
+          ? `Conversation summarised and history cleared: ${detail || `${res.tokensBefore.toLocaleString("en-US")} tokens summarised`}. ` +
+            `Pi keeps working from the summary in this same window; the full transcript is ` +
+            `still on disk and in AI History.`
+          : `Conversation compacted: ${detail || `${res.tokensBefore.toLocaleString("en-US")} tokens summarised`}. ` +
+            `Everything above is still readable here; the model now starts from a summary, so ` +
+            `following turns cost far less.`,
       });
       // Refresh the meter so the header stops showing the pre-compaction size.
       if (costMeter?.snapshot) send(costMeter.snapshot());

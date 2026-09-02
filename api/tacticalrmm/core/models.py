@@ -1008,6 +1008,78 @@ class AIModel(BaseAuditModel):
         return AIModelSerializer(obj).data
 
 
+class AIAgentGroup(BaseAuditModel):
+    """A named team of specialist models. The orchestrator is what the technician
+    talks to; the other roles are delegated to so a cheap model can grep / summarise
+    / scout without stuffing the expensive conversation."""
+
+    KIND_CODING = "coding"
+    KIND_IT = "it"
+    KIND_CUSTOM = "custom"
+    KIND_CHOICES = [
+        (KIND_CODING, "Coding"),
+        (KIND_IT, "IT / tickets"),
+        (KIND_CUSTOM, "Custom"),
+    ]
+
+    name = models.CharField(max_length=80)
+    slug = models.SlugField(max_length=80, unique=True)
+    description = models.TextField(blank=True, default="")
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default=KIND_CUSTOM)
+    workspace = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="Optional server-side path. When set, file/grep/coder subagents run there.",
+    )
+    enabled = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+    def save(self, *args, **kwargs) -> None:
+        if self.is_default:
+            AIAgentGroup.objects.exclude(pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+    @staticmethod
+    def serialize(obj):
+        from .serializers import AIAgentGroupSerializer
+
+        return AIAgentGroupSerializer(obj).data
+
+
+class AIAgentGroupMember(models.Model):
+    """One role inside a group. Stores provider+model_id as strings so a role can
+    use any model the provider actually serves - not just rows in the Models table."""
+
+    group = models.ForeignKey(
+        "core.AIAgentGroup", related_name="members", on_delete=models.CASCADE
+    )
+    role = models.CharField(max_length=32)
+    provider = models.CharField(max_length=50)
+    model_id = models.CharField(max_length=255)
+    display_name = models.CharField(max_length=255, blank=True, default="")
+    thinking_level = models.CharField(max_length=20, blank=True, default="medium")
+    definition = models.TextField(
+        blank=True,
+        default="",
+        help_text="What this role does. Sent to the specialist as its job description.",
+    )
+    enabled = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ("group", "role")
+        ordering = ["id"]
+
+    def __str__(self) -> str:
+        return f"{self.group.slug}:{self.role} -> {self.provider}/{self.model_id}"
+
+
 class AITask(BaseAuditModel):
     SCHEDULE_INTERVAL = "interval"
     SCHEDULE_DAILY = "daily"
