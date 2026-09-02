@@ -79,12 +79,26 @@ export function makeCostMeter({
   let pricingKnown = true;
   let sessionCost = 0;
   let turns = 0;
+  // Ledger rows are idempotent on (session_id, turn_index), so the index we WRITE must
+  // never repeat one that already exists for this session - a repeat is read as a retry
+  // and the charge is dropped. Kept separate from `turns` (a display counter) because a
+  // resumed session's existing rows may be numbered above its row count: before
+  // per-session hydration the counter was restocked from the whole DEVICE's turn count.
+  let ledgerTurnIndex = 0;
   let lastTurnCost = 0;
   let contextTokens = 0;
   let nextSessionWarn = SESSION_COST_WARN;
   let lastModelKey = null;
   let modelSwitches = 0;
   let switchSpend = 0;                // cacheWrite dollars on turns that followed a switch
+  // WIDER WINDOW (device or ticket lifetime spend), carried alongside the per-chat
+  // figure so nobody loses the billing view that this meter used to show by default.
+  // Never mixed into `sessionCost`: that one is THIS conversation and nothing else.
+  let windowScope = null;             // "agent" | "ticket"
+  let windowBaseCost = 0;
+  let windowBaseTurns = 0;
+  let windowSelfCost = 0;             // this session's spend already inside the base
+  let windowSelfTurns = 0;
   const warnings = [];
 
   const warn = (message, detail) => {
@@ -109,6 +123,7 @@ export function makeCostMeter({
       if (t <= 0 && !Number(prior.cost_total || 0)) return meter.snapshot();
       sessionCost = num(prior.cost_total);
       turns = t;
+      ledgerTurnIndex = Math.max(ledgerTurnIndex, num(prior.max_turn_index), t);
       lastTurnCost = 0;
       const tok = prior.tokens || {};
       for (const c of CLASSES) tokens[c] = num(tok[c]);
@@ -156,7 +171,32 @@ export function makeCostMeter({
         switch_spend: pricingKnown ? Number(switchSpend.toFixed(6)) : null,
         context_tokens: contextTokens,
         context_window: contextWindow || 0,
+        // Lifetime spend for the device/ticket this chat belongs to. `null` when we
+        // could not read the ledger, so the UI can stay silent instead of showing $0.
+        window_scope: windowScope,
+        window_cost: windowScope
+          ? Number((windowBaseCost + (sessionCost - windowSelfCost)).toFixed(6))
+          : null,
+        window_turns: windowScope ? windowBaseTurns + (turns - windowSelfTurns) : null,
       };
+    },
+
+    /**
+     * Record the device/ticket lifetime total this conversation sits inside.
+     *
+     * Called once, right after `hydrate()`, with the ledger's figures for the wider
+     * window. The current session totals are captured as an offset because the wider
+     * total ALREADY contains this conversation's past turns - without that, resuming a
+     * chat would count its own history twice as new turns land.
+     */
+    setWindowBaseline({ scope, cost_total, turns: winTurns } = {}) {
+      if (!scope) return meter.snapshot();
+      windowScope = String(scope);
+      windowBaseCost = num(cost_total);
+      windowBaseTurns = num(winTurns);
+      windowSelfCost = sessionCost;
+      windowSelfTurns = turns;
+      return meter.snapshot();
     },
 
     /**
@@ -210,6 +250,7 @@ export function makeCostMeter({
       lastTurnCost = cost;
       sessionCost += cost;
       turns += 1;
+      ledgerTurnIndex = Math.max(ledgerTurnIndex + 1, turns);
       for (const c of CLASSES) tokens[c] += num(u[c]);
       tokens.reasoning += num(u.reasoning);
       // totalTokens is the size of the request just billed, i.e. how full the context
@@ -276,7 +317,7 @@ export function makeCostMeter({
         try {
           ledger({
             session_id: sessionId,
-            turn_index: turns,
+            turn_index: ledgerTurnIndex,
             surface: context.surface || "device_chat",
             provider,
             model_id: modelId,

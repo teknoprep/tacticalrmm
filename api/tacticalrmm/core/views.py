@@ -1956,25 +1956,34 @@ class AISpendEntryView(APIView):
     permission_classes = [IsAuthenticated, PiPerms]
 
     def get(self, request):
-        """Running total for one window (a ticket, or every chat on one device).
+        """Running total for one window (a chat, a ticket, or every chat on one device).
 
         The live meter is in-memory and dies on refresh; this is what restocks it.
-        GET /core/ai/spend-entry/?ticket_ref=TICKET/60427
-        GET /core/ai/spend-entry/?agent_id=<uuid>
+        GET /core/ai/spend-entry/?session_id=<pi session id>   <- ONE conversation
+        GET /core/ai/spend-entry/?ticket_ref=TICKET/60427      <- every chat on a ticket
+        GET /core/ai/spend-entry/?agent_id=<uuid>              <- every chat on a device
+
+        session_id is what the chat window meters: a NEW conversation must start at
+        $0.00 even on a device that has spent hundreds, while a resumed conversation
+        must restock its own spend after a refresh. The device/ticket totals stay
+        available (and are shown next to the per-chat figure) for billing.
         """
-        from django.db.models import Count, DecimalField, Sum, Value
+        from django.db.models import Count, DecimalField, Max, Sum, Value
         from django.db.models.functions import Coalesce
 
         from core.models import AISpendEntry
 
+        session_id = str(request.query_params.get("session_id") or "").strip()
         ticket = str(request.query_params.get("ticket_ref") or "").strip()
         agent_id = str(request.query_params.get("agent_id") or "").strip()
-        if ticket:
+        if session_id:
+            rows = AISpendEntry.objects.filter(session_id=session_id)
+        elif ticket:
             rows = AISpendEntry.objects.filter(ticket_ref=ticket)
         elif agent_id:
             rows = AISpendEntry.objects.filter(agent__agent_id=agent_id)
         else:
-            return notify_error("ticket_ref or agent_id is required")
+            return notify_error("session_id, ticket_ref or agent_id is required")
 
         money = DecimalField(max_digits=18, decimal_places=10)
         zero = Value(0, output_field=money)
@@ -1998,6 +2007,12 @@ class AISpendEntryView(APIView):
             .order_by("-cost")
         )
         latest = rows.order_by("-at").values("context_tokens").first() or {}
+        # Highest turn_index already written for THIS session. Rows are idempotent on
+        # (session_id, turn_index), so a resumed chat must continue past the largest
+        # index that exists - not past its row COUNT. They differ for sessions written
+        # before per-session hydration, and a collision would silently drop a real
+        # charge (get_or_create returns the old row and the new spend is lost).
+        max_turn = rows.aggregate(n=Max("turn_index"))["n"] if session_id else None
         switch_agg = rows.filter(was_model_switch=True).aggregate(
             n=Count("id"),
             spend=Coalesce(Sum("cost_cache_write"), zero),
@@ -2007,6 +2022,9 @@ class AISpendEntryView(APIView):
             return float(v or 0)
 
         return Response({
+            # Which window these figures describe, so a caller that asked for a chat
+            # cannot mistake them for the device total (or the reverse).
+            "scope": "session" if session_id else ("ticket" if ticket else "agent"),
             "turns": tot["turns"],
             "cost_total": f(tot["cost_total"]),
             "spend": {
@@ -2034,6 +2052,7 @@ class AISpendEntryView(APIView):
             "model_switches": switch_agg["n"] or 0,
             "switch_spend": f(switch_agg["spend"]),
             "context_tokens": int(latest.get("context_tokens") or 0),
+            "max_turn_index": int(max_turn or 0),
             "pricing_known": not rows.filter(priced=False).exists(),
         })
 

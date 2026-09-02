@@ -139,10 +139,15 @@ export const trmm = {
   // Fire-and-forget: bookkeeping must never break a chat.
   logSpend: (entry, opts) => req("POST", `/core/ai/spend-entry/`, entry, opts),
   // Lifetime total for one window (ticket or device). Seeds the live meter on reconnect.
-  getSpendWindow: ({ ticket_ref, agent_id } = {}, opts) => {
-    const q = ticket_ref
-      ? `ticket_ref=${encodeURIComponent(ticket_ref)}`
-      : `agent_id=${encodeURIComponent(agent_id || "")}`;
+  // Running spend for ONE window. `session_id` = this conversation only (what the chat
+  // meter shows); `ticket_ref` / `agent_id` = every conversation on that ticket/device
+  // (what billing shows). Precedence matches the API view.
+  getSpendWindow: ({ session_id, ticket_ref, agent_id } = {}, opts) => {
+    const q = session_id
+      ? `session_id=${encodeURIComponent(session_id)}`
+      : ticket_ref
+        ? `ticket_ref=${encodeURIComponent(ticket_ref)}`
+        : `agent_id=${encodeURIComponent(agent_id || "")}`;
     return req("GET", `/core/ai/spend-entry/?${q}`, null, opts);
   },
   listProcedures: ({ q } = {}, opts) =>

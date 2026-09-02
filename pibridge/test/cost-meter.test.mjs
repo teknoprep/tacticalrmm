@@ -393,4 +393,57 @@ console.log("\nspend ledger rows");
   ok("unbilled message_end events are ignored (no rows, no turn inflation, split intact)");
 }
 
+{
+  // PER-CONVERSATION METER (2026-09-02). The meter used to be restocked from the whole
+  // DEVICE's ledger, so a brand-new chat opened showing every dollar other chats had
+  // spent on that machine. Now `hydrate` carries only this session, and the device /
+  // ticket lifetime figure rides alongside as `window_*` for billing.
+  const meter = makeCostMeter({
+    send: () => {}, log: () => {}, visible: true, key: "k", sessionId: "s-new",
+    ledger: () => {}, context: {},
+  });
+
+  // A fresh chat has no ledger rows of its own, so there is nothing to restock.
+  assert.equal(meter.snapshot().session_cost, 0, "a new conversation starts at zero");
+  meter.setWindowBaseline({ scope: "agent", cost_total: 431.5, turns: 900 });
+  const fresh = meter.snapshot();
+  assert.equal(fresh.session_cost, 0, "device spend must not leak into the chat total");
+  assert.equal(fresh.window_cost, 431.5, "device lifetime spend is still reported");
+  assert.equal(fresh.window_turns, 900);
+  assert.equal(fresh.window_scope, "agent");
+
+  meter.record(INCIDENT_MSG);
+  const after = meter.snapshot();
+  assert.equal(after.session_cost, 7.51763, "the chat meters its own turn");
+  assert.equal(Number(after.window_cost.toFixed(5)), 439.01763, "and grows the device total too");
+  assert.equal(after.window_turns, 901);
+  ok("a new chat starts at $0.00 while still reporting the device lifetime total");
+}
+
+{
+  // RESUME. hydrate() restocks THIS conversation; the wider baseline already contains
+  // those same dollars, so they must not be counted twice as the chat continues.
+  const rows = [];
+  const meter = makeCostMeter({
+    send: () => {}, log: () => {}, visible: true, key: "k", sessionId: "s-resumed",
+    ledger: (e) => rows.push(e), context: {},
+  });
+  meter.hydrate({ turns: 3, cost_total: 2, max_turn_index: 57, tokens: {}, spend: {} });
+  meter.setWindowBaseline({ scope: "ticket", cost_total: 20, turns: 30 });
+  const s = meter.snapshot();
+  assert.equal(s.session_cost, 2, "the chat's own prior spend comes back after a refresh");
+  assert.equal(s.window_cost, 20, "the ticket total is not double-counted at open");
+  assert.equal(s.window_turns, 30);
+
+  meter.record(INCIDENT_MSG);
+  const s2 = meter.snapshot();
+  assert.equal(Number(s2.session_cost.toFixed(5)), 9.51763);
+  assert.equal(Number(s2.window_cost.toFixed(5)), 27.51763, "only the NEW turn is added on top");
+  // Rows are unique on (session_id, turn_index). This session already has a row numbered
+  // 57 - written when the counter was restocked device-wide - so continuing at turn 4
+  // would silently DROP the charge, because get_or_create returns the existing row.
+  assert.equal(rows.at(-1).turn_index, 58, "ledger continues past the highest existing index");
+  ok("a resumed chat restocks only its own spend and cannot collide with its old ledger rows");
+}
+
 console.log(`\n${pass} assertions passed.\n`);

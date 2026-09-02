@@ -453,12 +453,42 @@ function compactSummarizerHooks(session, rt, groupState) {
   };
 }
 
-async function hydrateWindowCost(costMeter, query, { ws, visible, log, key }) {
+// The meter is PER CONVERSATION. It used to be restocked from the whole device's (or
+// whole ticket's) ledger, so a brand-new chat opened showing hundreds of dollars spent
+// by other chats on that machine, and "what is this conversation costing me" was not
+// answerable anywhere. Now:
+//
+//   * `session_id`  -> restocks THIS chat only. A new session has no ledger rows, so it
+//                      starts at $0.00; a resumed one gets its own spend back after a
+//                      refresh or reconnect, which is the behaviour that was worth keeping.
+//   * `scope query` -> the device/ticket lifetime total, carried alongside as
+//                      `window_cost` for the people who need the billing view.
+//
+// Both reads are best-effort: bookkeeping must never stop a technician from working.
+async function hydrateWindowCost(costMeter, query, { ws, visible, log, key, sessionId }) {
+  if (sessionId) {
+    try {
+      const mine = await trmm.getSpendWindow({ session_id: sessionId }, { timeoutMs: 8000 });
+      if (mine && (mine.turns || mine.cost_total)) {
+        costMeter.hydrate(mine);
+        log?.("cost_hydrated", key, `session ${sessionId}: ${mine.turns || 0} turns $${Number(mine.cost_total || 0).toFixed(2)}`);
+      }
+    } catch (e) {
+      log?.("cost_hydrate_error", key, String(e?.message || e).slice(0, 200));
+    }
+  }
   try {
     const prior = await trmm.getSpendWindow(query, { timeoutMs: 8000 });
-    if (prior && (prior.turns || prior.cost_total)) {
-      costMeter.hydrate(prior);
-      log?.("cost_hydrated", key, `${prior.turns || 0} turns $${Number(prior.cost_total || 0).toFixed(2)}`);
+    if (prior) {
+      // No sessionId (older call site): behave exactly as before and restock from the
+      // wider window, otherwise the wider figure is display-only.
+      if (!sessionId && (prior.turns || prior.cost_total)) costMeter.hydrate(prior);
+      costMeter.setWindowBaseline?.({
+        scope: prior.scope || (query?.ticket_ref ? "ticket" : "agent"),
+        cost_total: prior.cost_total,
+        turns: prior.turns,
+      });
+      log?.("cost_window", key, `${prior.scope || "agent"}: ${prior.turns || 0} turns $${Number(prior.cost_total || 0).toFixed(2)}`);
     }
   } catch (e) {
     log?.("cost_hydrate_error", key, String(e?.message || e).slice(0, 200));
@@ -1192,7 +1222,7 @@ async function startChat(ws, blob) {
     }),
   );
   await hydrateWindowCost(costMeter, { agent_id: agentId }, {
-    ws, visible: !!blob.cost_visible, log, key: agentId,
+    ws, visible: !!blob.cost_visible, log, key: agentId, sessionId,
   });
 
   // Idle disposal
@@ -2010,7 +2040,7 @@ async function startDecisionChat(ws, blob) {
     ],
   }));
   await hydrateWindowCost(costMeter, { ticket_ref: ticketRef }, {
-    ws, visible: !!blob.cost_visible, log, key: histKey,
+    ws, visible: !!blob.cost_visible, log, key: histKey, sessionId,
   });
 
   // As soon as the tech actually STARTS TALKING to this chat (first prompt), assign
