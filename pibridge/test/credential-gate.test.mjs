@@ -93,24 +93,21 @@ function gateHarness({ on, allowed, said = [], answer = true }) {
 }
 
 // Mirror of server.js makeCredentialGate.
-function makeGate({ isOn, allowed, techSaid, prompt, log, key, sessionId }) {
+function makeGate({ isOn, allowed, prompt, log, key, sessionId }) {
   const sid = () => (typeof sessionId === "function" ? sessionId() : sessionId);
   return async function credentialGate(summary, opts = {}) {
-    if (isOn() && allowed && !opts.privileged) {
-      log("credential read auto-permitted (Auto-credential)", key, sid(), String(summary).slice(0, 160));
-      return { ok: true };
-    }
-    if (opts.privileged && isOn() && allowed) {
-      const auth = privilegedCredentialAuthorisation(techSaid);
-      if (auth) {
-        log("privileged credential read authorised by tech", key, sid(), `"${auth.text.slice(0, 120)}"`);
-        return { ok: true, authorised_by: auth };
-      }
+    if (isOn() && allowed) {
+      log(opts.privileged
+            ? "PRIVILEGED credential read auto-permitted (Auto-credential)"
+            : "credential read auto-permitted (Auto-credential)",
+          key, sid(), String(summary).slice(0, 160));
+      return { ok: true, privileged: !!opts.privileged };
     }
     const ok = await prompt(summary);
     if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
-    log("credential read permitted by tech", key, sid(), String(summary).slice(0, 160));
-    return { ok: true };
+    log(opts.privileged ? "PRIVILEGED credential read permitted by tech" : "credential read permitted by tech",
+        key, sid(), String(summary).slice(0, 160));
+    return { ok: true, privileged: !!opts.privileged };
   };
 }
 
@@ -122,20 +119,22 @@ test("Auto-credential ON: an ordinary read does not prompt", async () => {
   assert.ok(h.log.some((l) => l.includes("auto-permitted")), "silent is not the same as unrecorded");
 });
 
-test("Auto-credential ON: a self-directed privileged read still prompts", async () => {
+test("Auto-credential ON: a privileged read does not prompt either (owner decision 2026-09-03)", async () => {
   const h = gateHarness({ on: true, allowed: true, said: ["fix the printer please"] });
   const r = await h.gate("… PRIVILEGED ROWS …", { privileged: true });
   assert.equal(r.ok, true);
-  assert.equal(h.prompts.length, 1, "the model escalating on its own must reach a human");
+  assert.equal(h.prompts.length, 0, "the switch means what it says");
+  assert.equal(r.privileged, true);
+  assert.ok(h.log.some((l) => l.includes("PRIVILEGED credential read auto-permitted")),
+    "but the audit line says which class was released");
 });
 
-test("Auto-credential ON: a privileged read the technician asked for does not prompt", async () => {
-  const h = gateHarness({ on: true, allowed: true, said: ["get me the domain admin password"] });
+test("switch OFF: a privileged read prompts and is logged as privileged", async () => {
+  const h = gateHarness({ on: false, allowed: true });
   const r = await h.gate("… PRIVILEGED ROWS …", { privileged: true });
-  assert.equal(r.ok, true);
-  assert.equal(h.prompts.length, 0, "a prompt confirming what they just typed protects nobody");
-  assert.ok(r.authorised_by, "and the authorising sentence is carried for the record");
-  assert.ok(h.log.some((l) => l.includes("authorised by tech")));
+  assert.equal(h.prompts.length, 1);
+  assert.equal(r.privileged, true);
+  assert.ok(h.log.some((l) => l.includes("PRIVILEGED credential read permitted by tech")));
 });
 
 test("the role permission outranks the switch", async () => {

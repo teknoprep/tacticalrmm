@@ -19,7 +19,7 @@ import * as history from "./history.js";
 import { makeCostMeter, silentStopMessage } from "./cost-meter.js";
 import { makeLlmRecovery } from "./llm-recovery.js";
 import { makeTurnWatchdog } from "./turn-watchdog.js";
-import { notebookWriteAuthorisation, privilegedCredentialAuthorisation } from "./authorisation.js";
+import { notebookWriteAuthorisation } from "./authorisation.js";
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
 import {
@@ -677,46 +677,32 @@ function uiTranscript(sessionManager, session) {
 //
 // Auto-APPROVE never appears here. It governs device changes; it has never covered
 // credentials and must not start by accident.
-function makeCredentialGate({ isOn, allowed, techSaid, prompt, log, key, sessionId }) {
+function makeCredentialGate({ isOn, allowed, prompt, log, key, sessionId }) {
   // `sessionId` may be a getter: the session does not exist yet where this is built.
   const sid = () => (typeof sessionId === "function" ? sessionId() : sessionId);
   return async function credentialGate(summary, opts = {}) {
-    if (isOn() && allowed && !opts.privileged) {
-      log("credential read auto-permitted (Auto-credential)", key, sid(), String(summary).slice(0, 160));
-      return { ok: true };
-    }
-    if (opts.privileged && isOn() && allowed) {
-      const auth = privilegedCredentialAuthorisation(techSaid);
-      if (auth) {
-        log("privileged credential read authorised by tech", key, sid(), `"${auth.text.slice(0, 120)}"`);
-        return { ok: true, authorised_by: auth };
-      }
-    }
-    // SAY WHY THE SWITCH DID NOT APPLY (reported 2026-08-19, and again 2026-08-25).
+    // AUTO-CREDENTIAL COVERS EVERY ROW, PRIVILEGED INCLUDED (decided 2026-09-03).
     //
-    // The first report was a session where every prompt was a privileged-row request, which
-    // no toggle covers - the gate was right and the prompt never said so, so the reasonable
-    // conclusion was that the feature was broken. The second was the same symptom with a
-    // different cause: the model was escalating to privileged rows on its own initiative
-    // after every ordinary read, because the tool result told it to. Rule 2 above and the
-    // rewritten helpdesk.js text handle that; this message handles the rest.
-    //
-    // A safeguard that looks like a malfunction gets worked around, so explaining it is
-    // part of enforcing it.
-    const privBlocked = opts.privileged && isOn() && allowed;
-    const ask = privBlocked
-      ? `${summary}\n\nAuto-credential is ON, but you have not asked for the privileged rows ` +
-        `in this chat, and the AI has requested them on its own initiative. Approving here ` +
-        `releases them once. If you do want them, say so in the chat and it will not ask again.`
-      : summary;
-    if (privBlocked) {
-      log("credential prompt (privileged, self-directed - not covered by Auto-credential)",
+    // Until today privileged rows were carved out: with the switch on they still prompted
+    // unless the technician had asked for them in their own words in that chat. The
+    // reasoning was sound - the model escalates to admin logins on its own initiative -
+    // but in practice the prompt landed on the person who had just turned the switch on
+    // precisely so they would not be asked, mid-task, on a queued run they were not
+    // watching. The owner's call: the switch means what it says. The role permission
+    // still decides whether the switch may be honoured at all, and every release is
+    // logged with its class so the audit trail still distinguishes the two.
+    if (isOn() && allowed) {
+      log(opts.privileged
+            ? "PRIVILEGED credential read auto-permitted (Auto-credential)"
+            : "credential read auto-permitted (Auto-credential)",
           key, sid(), String(summary).slice(0, 160));
+      return { ok: true, privileged: !!opts.privileged };
     }
-    const ok = await prompt(ask);
+    const ok = await prompt(summary);
     if (!ok) return { ok: false, reason: "the technician did not permit reading the stored credentials." };
-    log("credential read permitted by tech", key, sid(), String(summary).slice(0, 160));
-    return { ok: true };
+    log(opts.privileged ? "PRIVILEGED credential read permitted by tech" : "credential read permitted by tech",
+        key, sid(), String(summary).slice(0, 160));
+    return { ok: true, privileged: !!opts.privileged };
   };
 }
 
