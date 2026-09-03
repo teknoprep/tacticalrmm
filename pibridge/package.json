@@ -7,10 +7,10 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/cost-meter.test.mjs && node test/tool-caps.test.mjs && node test/transcript.test.mjs && node test/device-hardware.test.mjs && node --test test/llm-recovery.test.mjs && node --test test/turn-watchdog.test.mjs && node --test test/stream-liveness.test.mjs && node --test test/notebook-write.test.mjs && node --test test/compaction.test.mjs && node --test test/remote-room.test.mjs && node --test test/credential-gate.test.mjs && node --test test/caps-secret.test.mjs && node --test test/chat-commands.test.mjs && node --test test/window-memory.test.mjs && node --test test/gui-driving-guard.test.mjs && node --test test/transcript-bound.test.mjs"
+    "test": "node test/cost-meter.test.mjs && node test/tool-caps.test.mjs && node test/transcript.test.mjs && node test/device-hardware.test.mjs && node --test test/llm-recovery.test.mjs && node --test test/turn-watchdog.test.mjs && node --test test/stream-liveness.test.mjs && node --test test/notebook-write.test.mjs && node --test test/compaction.test.mjs && node --test test/remote-room.test.mjs && node --test test/credential-gate.test.mjs && node --test test/caps-secret.test.mjs && node --test test/chat-commands.test.mjs && node --test test/window-memory.test.mjs && node --test test/gui-driving-guard.test.mjs && node --test test/transcript-bound.test.mjs && node --test test/queue.test.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
     "ioredis": "^5.4.1",
     "remote-pi": "0.7.0",
     "typebox": "^1.1.38",

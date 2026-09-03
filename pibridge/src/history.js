@@ -59,4 +59,6 @@ export function deleteSession(agentId, sessionId) {
   }
   delete idx[sessionId];
   writeIndex(agentId, idx);
+  // The conversation's prompt queue (queue.js) goes with it.
+  try { fs.unlinkSync(path.join(agentDir(agentId), "queue", `${sessionId}.json`)); } catch {}
 }

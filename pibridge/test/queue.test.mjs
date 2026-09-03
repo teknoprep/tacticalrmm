@@ -1,0 +1,264 @@
+// Prompt queue (queue.js): a per-conversation to-do list that drives the chat.
+// Run: node --test test/queue.test.mjs
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { makePromptQueue } from "../src/queue.js";
+
+const tick = () => new Promise((r) => setImmediate(r));
+const settle = async (n = 6) => { for (let i = 0; i < n; i++) await tick(); };
+
+function harness({ prompt, compact } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-queue-"));
+  const frames = [];
+  const ran = [];
+  const compacts = [];
+  let streaming = false;
+  const q = makePromptQueue({
+    scopeKey: "AGENT1",
+    root,
+    send: (f) => frames.push(f),
+    log: () => {},
+    isStreaming: () => streaming,
+    runPrompt: async (text) => {
+      streaming = true;
+      ran.push(text);
+      try { if (prompt) await prompt(text, q); }
+      finally { streaming = false; }
+    },
+    compact: async (reason) => { compacts.push(reason); if (compact) await compact(reason); },
+  });
+  q.attach("sess-1");
+  const state = () => q.state();
+  const last = (type) => frames.filter((f) => f.type === type).at(-1);
+  return { q, root, frames, ran, compacts, state, last, setStreaming: (v) => { streaming = v; } };
+}
+
+test("a new conversation has an empty queue with Auto-Next off", () => {
+  const h = harness();
+  const s = h.state();
+  assert.equal(s.items.length, 0);
+  assert.equal(s.auto_next, false);
+  assert.equal(s.paused, null);
+  assert.equal(h.last("queue_state").pending, 0);
+});
+
+test("adding items records them; nothing runs while Auto-Next is off", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "check disk space" });
+  await h.q.handle({ type: "queue_add", text: "restart spooler", compact_first: true });
+  await settle();
+  assert.equal(h.state().items.length, 2);
+  assert.equal(h.state().items[1].compact_first, true);
+  assert.deepEqual(h.ran, [], "queued prompts are notes until Auto-Next is on");
+});
+
+test("Auto-Next on: items run in order, one per turn, until the queue is empty", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "one" });
+  await h.q.handle({ type: "queue_add", text: "two" });
+  await h.q.handle({ type: "queue_add", text: "three" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(20);
+  assert.deepEqual(h.ran, ["one", "two", "three"]);
+  assert.deepEqual(h.state().items.map((i) => i.status), ["done", "done", "done"]);
+  assert.equal(h.state().paused, null);
+  // Each start is announced so the window can show the prompt bubble.
+  assert.deepEqual(h.frames.filter((f) => f.type === "queue_started").map((f) => f.text), ["one", "two", "three"]);
+});
+
+test("compact & clear first runs the compaction BEFORE the prompt", async () => {
+  const order = [];
+  const h = harness({
+    prompt: async (t) => order.push(`prompt:${t}`),
+    compact: async () => order.push("compact"),
+  });
+  await h.q.handle({ type: "queue_add", text: "fresh start", compact_first: true });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle();
+  assert.deepEqual(order, ["compact", "prompt:fresh start"]);
+});
+
+test("the model calling pause_queue stops the queue; the operator's reply resumes it", async () => {
+  const h = harness({
+    prompt: async (text, q) => {
+      if (text === "pick a plan") q.pauseByModel("Option A (fast, risky) or B (slow, safe)?");
+    },
+  });
+  await h.q.handle({ type: "queue_add", text: "pick a plan" });
+  await h.q.handle({ type: "queue_add", text: "then apply it" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  assert.deepEqual(h.ran, ["pick a plan"], "the next item must NOT be sent while a question is open");
+  const s = h.state();
+  assert.equal(s.paused.by, "assistant");
+  assert.match(s.paused.reason, /Option A/);
+  assert.equal(s.items[0].status, "done");
+  assert.equal(s.items[1].status, "pending");
+  assert.equal(s.auto_next, true, "pausing is not the same as turning Auto-Next off");
+
+  // The technician types their answer (the bridge calls this before prompting), and the
+  // turn settles (the bridge calls advance after runPrompt) -> the queue continues.
+  h.q.noteOperatorReply();
+  assert.equal(h.state().paused, null);
+  await h.q.advance("turn settled");
+  await settle(10);
+  assert.deepEqual(h.ran, ["pick a plan", "then apply it"]);
+});
+
+test("pause_queue with nothing queued does not leave the conversation 'paused'", () => {
+  const h = harness();
+  const reply = h.q.pauseByModel("anything?");
+  assert.match(reply, /No prompt queue/);
+  assert.equal(h.state().paused, null);
+});
+
+test("Stop pauses the queue and marks the running item failed", async () => {
+  let release;
+  const h = harness({ prompt: () => new Promise((r) => { release = r; }) });
+  await h.q.handle({ type: "queue_add", text: "long job" });
+  await h.q.handle({ type: "queue_add", text: "next" });
+  // Not awaited: the handler resolves only when the (held) prompt does - like the bridge,
+  // where the ws handler awaits the turn while Stop arrives on another frame.
+  const running = h.q.handle({ type: "queue_set_auto", value: true });
+  await settle();
+  assert.equal(h.state().running_id, h.state().items[0].id);
+  h.q.noteAbort();            // operator pressed Stop
+  release();                  // session.abort() resolves the prompt
+  await running;
+  await settle(10);
+  const s = h.state();
+  assert.equal(s.items[0].status, "failed");
+  assert.equal(s.items[0].note, "stopped by operator");
+  assert.equal(s.items[1].status, "pending", "the rest waits");
+  assert.equal(s.paused.by, "operator");
+  assert.deepEqual(h.ran, ["long job"]);
+});
+
+test("a provider error pauses the queue with the reason", async () => {
+  const h = harness({ prompt: async (t, q) => { if (t === "bad") q.noteError("401 invalid api key"); } });
+  await h.q.handle({ type: "queue_add", text: "bad" });
+  await h.q.handle({ type: "queue_add", text: "after" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  assert.equal(h.state().items[0].status, "failed");
+  assert.match(h.state().paused.reason, /401/);
+  assert.deepEqual(h.ran, ["bad"]);
+});
+
+test("a thrown runPrompt is a failed item, not a crashed queue", async () => {
+  const h = harness({ prompt: async (t) => { if (t === "boom") throw new Error("socket hung up"); } });
+  await h.q.handle({ type: "queue_add", text: "boom" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  assert.equal(h.state().items[0].status, "failed");
+  assert.equal(h.state().items[0].note, "socket hung up");
+  assert.match(h.state().paused.reason, /failed/);
+});
+
+test("Resume clears a pause and continues; Pause holds it", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "a" });
+  await h.q.handle({ type: "queue_add", text: "b" });
+  await h.q.handle({ type: "queue_pause" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle();
+  assert.deepEqual(h.ran, [], "paused wins over Auto-Next");
+  await h.q.handle({ type: "queue_resume" });
+  await settle(10);
+  assert.deepEqual(h.ran, ["a", "b"]);
+});
+
+test("Run next sends the head item once even with Auto-Next off", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "a" });
+  await h.q.handle({ type: "queue_add", text: "b" });
+  await h.q.handle({ type: "queue_run_next" });
+  await settle(10);
+  assert.deepEqual(h.ran, ["a"]);
+  assert.equal(h.state().items[1].status, "pending");
+});
+
+test("nothing is sent while the assistant is still streaming", async () => {
+  const h = harness();
+  h.setStreaming(true);
+  await h.q.handle({ type: "queue_add", text: "a" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle();
+  assert.deepEqual(h.ran, []);
+  h.setStreaming(false);
+  await h.q.advance("turn settled");
+  await settle();
+  assert.deepEqual(h.ran, ["a"]);
+});
+
+test("edit, reorder, skip, re-queue, remove, clear done", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "a" });
+  await h.q.handle({ type: "queue_add", text: "b" });
+  await h.q.handle({ type: "queue_add", text: "c" });
+  const [a, b, c] = h.state().items.map((i) => i.id);
+  await h.q.handle({ type: "queue_update", id: b, text: "B edited", compact_first: true });
+  assert.equal(h.state().items[1].text, "B edited");
+  assert.equal(h.state().items[1].compact_first, true);
+  await h.q.handle({ type: "queue_reorder", ids: [c, a] });   // b left out -> keeps place at end
+  assert.deepEqual(h.state().items.map((i) => i.id), [c, a, b]);
+  await h.q.handle({ type: "queue_update", id: a, status: "skipped" });
+  assert.equal(h.state().items[1].status, "skipped");
+  await h.q.handle({ type: "queue_update", id: a, status: "pending" });
+  assert.equal(h.state().items[1].status, "pending");
+  await h.q.handle({ type: "queue_remove", id: c });
+  assert.deepEqual(h.state().items.map((i) => i.id), [a, b]);
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  assert.deepEqual(h.state().items.map((i) => i.status), ["done", "done"]);
+  await h.q.handle({ type: "queue_clear_done" });
+  assert.equal(h.state().items.length, 0);
+});
+
+test("the queue is persisted per conversation and comes back PAUSED on reopen", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "a" });
+  await h.q.handle({ type: "queue_add", text: "b" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  // Simulate the window closing while "a" is mid-run: detach before it settles.
+  h.q.detach();
+  const file = path.join(h.root, "AGENT1", "queue", "sess-1.json");
+  assert.ok(fs.existsSync(file), "one file per session id");
+
+  // Same conversation reopened (Continue / refresh).
+  const frames = [];
+  const ran = [];
+  const q2 = makePromptQueue({
+    scopeKey: "AGENT1", root: h.root, send: (f) => frames.push(f), log: () => {},
+    isStreaming: () => false, runPrompt: async (t) => ran.push(t), compact: async () => {},
+  });
+  q2.attach("sess-1");
+  await settle();
+  const s = q2.state();
+  assert.equal(s.items.length, 2, "the list survived");
+  assert.equal(s.auto_next, true, "the preference survived");
+  assert.ok(s.items.every((i) => i.status !== "running"), "no item is stuck 'running'");
+  assert.match(s.paused.reason, /reopened/i, "but it does not fire on its own");
+  assert.deepEqual(ran, []);
+
+  // A DIFFERENT conversation on the same device starts empty.
+  const q3 = makePromptQueue({
+    scopeKey: "AGENT1", root: h.root, send: () => {}, log: () => {},
+    isStreaming: () => false, runPrompt: async () => {}, compact: async () => {},
+  });
+  q3.attach("sess-2");
+  assert.equal(q3.state().items.length, 0);
+});
+
+test("a detached (closed) window never sends another prompt", async () => {
+  const h = harness();
+  await h.q.handle({ type: "queue_add", text: "a" });
+  h.q.detach();
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle();
+  assert.deepEqual(h.ran, []);
+});

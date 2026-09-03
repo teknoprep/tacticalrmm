@@ -34,6 +34,7 @@ import {
 import { makeRemoteBinding } from "./remote-room.js";
 import * as windowMemory from "./window-memory.js";
 import { makeChatCommands } from "./chat-commands.js";
+import { makePromptQueue, queuePromptSection } from "./queue.js";
 import { boundTranscript } from "./transcript-bound.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
@@ -877,6 +878,20 @@ async function startChat(ws, blob) {
       ticketNotice;
   }
 
+  // PROMPT QUEUE (see queue.js). Built before the session so its pause_queue tool is in
+  // the tool belt; attached to the session id right after createAgentSession(). The
+  // closures below are late-bound on purpose: runPrompt/compactCmd/session are declared
+  // further down this function and only ever called once a turn can run.
+  const queue = makePromptQueue({
+    scopeKey: agentId,
+    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    log,
+    runPrompt: (text) => runPrompt(text, [], "queue"),
+    compact: (reason) => compactCmd.run("", { reason, clear: true }),
+    isStreaming: () => !!session?.isStreaming,
+  });
+  tools.push(queue.tool);
+
   // Resource loader for system prompt override
   const loader = new DefaultResourceLoader(attachGroupToLoader({
     agentDir: CONFIG.sessionsRoot,
@@ -885,7 +900,8 @@ async function startChat(ws, blob) {
       (multi ? systemPromptMulti(toolMachines) : systemPrompt(facts)) +
       roNotice +
       helpdeskSection(blob, facts?.client) +
-      operatorPromptSection(blob.operator),
+      operatorPromptSection(blob.operator) +
+      queuePromptSection(),
   }, groupState));
   await loader.reload();
 
@@ -918,6 +934,7 @@ async function startChat(ws, blob) {
   });
 
   const sessionId = session.sessionId;
+  queue.attach(sessionId);
   const chatTitle = multi
     ? `Multi: ${toolMachines.map((m) => m.label).join(" + ")}`
     : `Chat about ${facts.hostname}`;
@@ -1048,6 +1065,7 @@ async function startChat(ws, blob) {
               || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
           }));
         } catch {}
+        queue.noteError(why);
       }
     } else if (event.type === "message_end" && recovery.isOwnStallAbort(event.message)) {
       // The stall watchdog below killed this turn. Downstream that is indistinguishable
@@ -1071,6 +1089,7 @@ async function startChat(ws, blob) {
                  `aborted. Please resend your message.`,
           }));
         } catch {}
+        queue.noteError(why);
       }
     }
     // Fold usage into the meter and surface any non-answering stop (e.g. "length").
@@ -1224,6 +1243,7 @@ async function startChat(ws, blob) {
   await hydrateWindowCost(costMeter, { agent_id: agentId }, {
     ws, visible: !!blob.cost_visible, log, key: agentId, sessionId,
   });
+  queue.publish();
 
   // Idle disposal
   let idleTimer;
@@ -1308,7 +1328,9 @@ async function startChat(ws, blob) {
     // Mirror a browser-typed turn onto the phone, so someone following on mobile sees
     // what the person at the desk just asked rather than an answer to nothing. (A phone
     // turn already carries its own id, which the app uses to thread the reply.)
-    if (origin === "browser") remote?.beginBrowserTurn(text);
+    // A queued prompt is the technician's own words too, so the phone mirrors it the
+    // same way as one they typed just now.
+    if (origin !== "phone") remote?.beginBrowserTurn(text);
     // A typed switch ("/write on"). Handled before the model sees it: it is an
     // instruction to the WINDOW, and the phone has no toolbar to reach it any other way.
     const typed = chatCmds.parse(text);
@@ -1323,6 +1345,8 @@ async function startChat(ws, blob) {
       await compactCmd.run(text);
       return;
     }
+    // A real prompt from a human while the queue is waiting on them IS the answer.
+    if (origin !== "queue") queue.noteOperatorReply();
     techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
     recovery.beginTurn();
     // A new request earns a fresh, tight watchdog budget: the widened one exists
@@ -1363,8 +1387,9 @@ async function startChat(ws, blob) {
     label: () => sessionLabel.trim() || `${facts?.hostname || agentId} \u2014 ${BRAND.name || "RMM"}`,
     log,
     toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
-    submitPrompt: (text, images) => runPrompt(text, images, "phone"),
-    abort: () => session.abort(),
+    // After a phone turn settles the queue may continue, same as a browser turn.
+    submitPrompt: (text, images) => runPrompt(text, images, "phone").finally(() => queue.advance("phone turn settled")),
+    abort: () => { queue.noteAbort(); return session.abort(); },
     resolveApproval: (id, ok) => {
       const resolve = pendingApprovals.get(id);
       if (resolve) { pendingApprovals.delete(id); resolve(!!ok); }
@@ -1389,6 +1414,7 @@ async function startChat(ws, blob) {
     }
     try {
       if (await remote?.handleBrowser(msg)) return;
+      if (await queue.handle(msg)) return;
       switch (msg.type) {
         case "compact":
           await compactCmd.run(String(msg.message || ""), {
@@ -1399,12 +1425,16 @@ async function startChat(ws, blob) {
           break;
         case "prompt":
           await runPrompt(msg.message);
+          // The turn has settled (prompt() resolves only then). If Auto-Next is on and
+          // nothing paused the queue, the next queued prompt goes now.
+          await queue.advance("turn settled");
           break;
         case "steer":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           await inTurn(() => session.steer(msg.message));
           break;
         case "abort":
+          queue.noteAbort();
           await session.abort();
           break;
         // A toolbar click and a typed command are the same event with a different input
@@ -1519,6 +1549,8 @@ async function startChat(ws, blob) {
     // The window is the room's owner. Closing it closes the relay connection - that is
     // the promise the feature is sold on, so it lives on the same line as the dispose.
     remote?.close("window closed");
+    // Stop the queue engine: prompts must not keep firing with nobody to approve them.
+    queue.detach();
     try { session.dispose(); } catch {}
     log("chat closed", agentId, sessionId);
   });
@@ -1792,9 +1824,21 @@ async function startDecisionChat(ws, blob) {
       // pull the data we already had the tools to pull. Same policy, every reply surface.
       helpdeskSection(blob, ctx.client) +
       procedureSection(blob) +
-      operatorPromptSection(blob.operator),
+      operatorPromptSection(blob.operator) +
+      queuePromptSection(),
   }, groupState));
   await loader.reload();
+
+  // PROMPT QUEUE - same engine as the device chat; see the note there.
+  const queue = makePromptQueue({
+    scopeKey: histKey,
+    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    log,
+    runPrompt: (text) => runPrompt(text, [], "queue"),
+    compact: (reason) => compactCmd.run("", { reason, clear: true }),
+    isStreaming: () => !!session?.isStreaming,
+  });
+  tools.push(queue.tool);
 
   // Persist per ticket: resume the latest session for this ticket if one exists.
   let sessionManager;
@@ -1811,6 +1855,7 @@ async function startDecisionChat(ws, blob) {
     sessionManager, agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
   });
   const sessionId = session.sessionId;
+  queue.attach(sessionId);
   // Same technician-set label as the device chat (see the note there).
   let sessionLabel = String(history.readIndex(histKey)[sessionId]?.label || "");
   history.recordSession(histKey, sessionId, {
@@ -1878,6 +1923,7 @@ async function startDecisionChat(ws, blob) {
               || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
           }));
         } catch {}
+        queue.noteError(why);
       }
     } else if (event.type === "agent_end") {
       log("agent_end", histKey, sessionId);
@@ -2042,6 +2088,7 @@ async function startDecisionChat(ws, blob) {
   await hydrateWindowCost(costMeter, { ticket_ref: ticketRef }, {
     ws, visible: !!blob.cost_visible, log, key: histKey, sessionId,
   });
+  queue.publish();
 
   // As soon as the tech actually STARTS TALKING to this chat (first prompt), assign
   // the ticket to them (matched by their RMM email/login to an Odoo user). Only takes
@@ -2072,7 +2119,7 @@ async function startDecisionChat(ws, blob) {
   }
 
   async function runPrompt(text, images = [], origin = "browser") {
-    if (origin === "browser") remote?.beginBrowserTurn(text);
+    if (origin !== "phone") remote?.beginBrowserTurn(text);
     // A typed switch ("/email off"). See the device chat.
     const typed = chatCmds.parse(text);
     if (typed) {
@@ -2084,6 +2131,7 @@ async function startDecisionChat(ws, blob) {
       await compactCmd.run(text);
       return;
     }
+    if (origin !== "queue") queue.noteOperatorReply();
     // Keep the tech's own words for the close-authorisation test above.
     techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
     work.humanTurn();
@@ -2110,8 +2158,8 @@ async function startDecisionChat(ws, blob) {
     label: () => sessionLabel.trim() || `Ticket ${ticketRef}`,
     log,
     toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
-    submitPrompt: (text, images) => runPrompt(text, images, "phone"),
-    abort: () => session.abort(),
+    submitPrompt: (text, images) => runPrompt(text, images, "phone").finally(() => queue.advance("phone turn settled")),
+    abort: () => { queue.noteAbort(); return session.abort(); },
     resolveApproval: (id, ok) => {
       const resolve = pendingApprovals.get(id);
       if (resolve) { pendingApprovals.delete(id); resolve(!!ok); }
@@ -2134,6 +2182,7 @@ async function startDecisionChat(ws, blob) {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     try {
       if (await remote?.handleBrowser(msg)) return;
+      if (await queue.handle(msg)) return;
       switch (msg.type) {
         case "compact":
           await compactCmd.run(String(msg.message || ""), {
@@ -2144,13 +2193,14 @@ async function startDecisionChat(ws, blob) {
           break;
         case "prompt":
           await runPrompt(msg.message);
+          await queue.advance("turn settled");
           break;
         case "steer":
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           work.humanTurn();
           await session.steer(msg.message);
           break;
-        case "abort": await session.abort(); break;
+        case "abort": queue.noteAbort(); await session.abort(); break;
         case "set_group":
           await applySetGroup({ ws, session, rt, blob, groupState, msg, costMeter, log, key: histKey });
           break;
@@ -2213,6 +2263,7 @@ async function startDecisionChat(ws, blob) {
     pendingApprovals.clear();
     // The window owns the room; closing one closes the other.
     remote?.close("window closed");
+    queue.detach();
     try { session.dispose(); } catch {}
     // Flush whatever burst was open, so a chat closed mid-thought still records its time.
     try { work.close("socket closed"); } catch {}
