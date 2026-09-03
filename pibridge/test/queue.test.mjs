@@ -98,6 +98,8 @@ test("the model calling pause_queue stops the queue; the operator's reply resume
   assert.match(s.paused.reason, /Option A/);
   assert.equal(s.items[0].status, "waiting", "a question is a state of the task, not its end");
   assert.deepEqual(s.items[0].thread.map((t) => [t.role, t.text]), [["assistant", "Option A (fast, risky) or B (slow, safe)?"]]);
+  assert.equal(s.questions.length, 1, "the question sits at the top of the panel");
+  assert.equal(s.questions[0].item_id, s.items[0].id);
   assert.equal(s.items[1].status, "pending");
   assert.equal(s.auto_next, true, "pausing is not the same as turning Auto-Next off");
 
@@ -106,6 +108,7 @@ test("the model calling pause_queue stops the queue; the operator's reply resume
   // answer is recorded on the item, the item is done, the queue continues.
   h.q.noteOperatorReply("B please");
   assert.equal(h.state().paused, null);
+  assert.equal(h.state().questions.length, 0, "answered in chat clears the card too");
   assert.equal(h.state().items[0].status, "done");
   assert.deepEqual(h.state().items[0].thread.at(-1), { ...h.state().items[0].thread.at(-1), role: "operator", text: "B please", via: "chat" });
   await h.q.advance("turn settled");
@@ -129,8 +132,9 @@ test("answering IN THE QUEUE runs the reply as that item and tracks the exchange
   const id = h.state().items[0].id;
   assert.equal(h.state().items[0].status, "waiting");
   assert.deepEqual(h.ran, ["set up the share"], "nothing else runs while the question is open");
+  assert.equal(h.state().questions[0].item_id, id);
 
-  await h.q.handle({ type: "queue_reply", id, text: "use Z:" });
+  await h.q.handle({ type: "queue_answer", id: h.state().questions[0].id, text: "use Z:" });
   await settle(10);
   let it = h.state().items[0];
   assert.equal(it.status, "waiting", "the assistant asked again on the same item");
@@ -142,7 +146,8 @@ test("answering IN THE QUEUE runs the reply as that item and tracks the exchange
   assert.deepEqual(h.ran, ["set up the share", "use Z:"]);
   assert.equal(h.state().items[1].status, "pending", "the second item is still waiting its turn");
 
-  await h.q.handle({ type: "queue_reply", id, text: "read-write" });
+  assert.equal(h.state().questions.length, 1, "the follow-up replaced the first card");
+  await h.q.handle({ type: "queue_answer", id: h.state().questions[0].id, text: "read-write" });
   await settle(15);
   it = h.state().items[0];
   assert.equal(it.status, "done");
@@ -169,11 +174,43 @@ test("Auto-clear never removes a waiting item, and keeps a done item that carrie
   assert.equal(h.state().items.length, 0);
 });
 
-test("pause_queue with nothing queued does not leave the conversation 'paused'", () => {
+test("a question asked in ordinary chat (nothing queued) becomes a standalone card", async () => {
   const h = harness();
-  const reply = h.q.pauseByModel("anything?");
-  assert.match(reply, /No prompt queue/);
+  const reply = h.q.pauseByModel("Which site is this for?");
+  assert.match(reply, /Queue panel/);
+  const s = h.state();
+  assert.equal(s.questions.length, 1);
+  assert.equal(s.questions[0].item_id, null);
+  assert.equal(s.questions[0].text, "Which site is this for?");
+  assert.equal(s.paused.by, "assistant");
+  // Asking the same thing twice is one card.
+  h.q.pauseByModel("Which site is this for?");
+  assert.equal(h.state().questions.length, 1);
+
+  // Answered in the panel: runs as the next thing said, card gone, pause gone.
+  await h.q.handle({ type: "queue_answer", id: s.questions[0].id, text: "Exeter" });
+  await settle(5);
+  assert.deepEqual(h.ran, ["Exeter"]);
+  assert.equal(h.state().questions.length, 0);
   assert.equal(h.state().paused, null);
+  const started = h.frames.filter((f) => f.type === "queue_started").at(-1);
+  assert.deepEqual([started.id, started.reply, started.text], [null, true, "Exeter"]);
+});
+
+test("a question can be dismissed; its item is then finished", async () => {
+  const h = harness({ prompt: async (t, q) => { if (t === "ask") q.pauseByModel("Sure?"); } });
+  await h.q.handle({ type: "queue_add", text: "ask" });
+  await h.q.handle({ type: "queue_add", text: "after" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  assert.equal(h.state().items[0].status, "waiting");
+  const qid = h.state().questions[0].id;
+  await h.q.handle({ type: "queue_dismiss_question", id: qid });
+  await settle(10);
+  assert.equal(h.state().questions.length, 0);
+  assert.equal(h.state().items[0].status, "done");
+  assert.equal(h.state().items[0].note, "question dismissed");
+  assert.deepEqual(h.ran, ["ask", "after"], "dismissing lets the queue carry on");
 });
 
 test("Stop pauses the queue and marks the running item failed", async () => {
@@ -335,6 +372,42 @@ test("Auto-clear done removes finished items by itself, but keeps failed ones", 
   assert.equal(h2.state().items[0].status, "done");
   await h2.q.handle({ type: "queue_set_auto_clear", value: true });
   assert.equal(h2.state().items.length, 0);
+});
+
+test("history records what was done and how, for the human - and is not context for the model", async () => {
+  const h = harness({ prompt: async (t, q) => { if (t === "ask") q.pauseByModel("Which one?"); } });
+  await h.q.handle({ type: "queue_add", text: "plain" });
+  await h.q.handle({ type: "queue_add", text: "ask" });
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  await h.q.handle({ type: "queue_answer", id: h.state().questions[0].id, text: "the second" });
+  await settle(10);
+  await h.q.handle({ type: "queue_clear_done" });
+  const ev = h.state().history.map((e) => e.event);
+  assert.deepEqual(ev, [
+    "added", "added", "auto_next",
+    "started", "done",            // plain
+    "started", "asked",           // ask -> question
+    "answered", "answer_sent", "done",
+    "cleared_finished",
+  ]);
+  const answered = h.state().history.find((e) => e.event === "answered");
+  assert.equal(answered.text, "Which one?");
+  assert.equal(answered.detail, "the second");
+  // The answer itself reached the model (it is the operator's reply); the HISTORY did not:
+  // nothing but the prompts the operator wrote ever went through runPrompt.
+  assert.deepEqual(h.ran, ["plain", "ask", "the second"]);
+  // Cleared items are still in the history, and the history survives a reopen.
+  assert.equal(h.state().items.length, 0);
+  h.q.detach();
+  const q2 = makePromptQueue({
+    scopeKey: "AGENT1", root: h.root, send: () => {}, log: () => {},
+    isStreaming: () => false, runPrompt: async () => {}, compact: async () => {},
+  });
+  q2.attach("sess-1");
+  assert.equal(q2.state().history.length, ev.length);
+  await q2.handle({ type: "queue_clear_history" });
+  assert.equal(q2.state().history.length, 0);
 });
 
 test("a detached (closed) window never sends another prompt", async () => {

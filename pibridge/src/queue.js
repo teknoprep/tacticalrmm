@@ -32,6 +32,7 @@ import { CONFIG } from "./config.js";
 
 export const QUEUE_MAX_ITEMS = Number(process.env.PI_QUEUE_MAX_ITEMS || 100);
 export const QUEUE_MAX_TEXT = Number(process.env.PI_QUEUE_MAX_TEXT || 8000);
+export const QUEUE_MAX_HISTORY = Number(process.env.PI_QUEUE_MAX_HISTORY || 500);
 
 // "waiting" = the assistant asked a question on this item and is waiting for the answer.
 // It is the one state auto-clear never touches: the question IS the work in progress.
@@ -44,7 +45,7 @@ function queuePath(root, scopeKey, sessionId) {
 }
 
 function emptyState() {
-  return { version: 1, auto_next: false, auto_clear_done: false, paused: null, items: [] };
+  return { version: 1, auto_next: false, auto_clear_done: false, paused: null, items: [], questions: [], history: [] };
 }
 
 function sanitize(raw) {
@@ -75,17 +76,43 @@ function sanitize(raw) {
         : [],
     });
   }
+  // OPEN QUESTIONS - what the assistant is waiting on. Shown at the top of the queue
+  // panel, each with its own answer box. `item_id` ties it to a queued item when the
+  // question came up while that item ran; null when it came up in ordinary chat.
+  for (const q of Array.isArray(raw.questions) ? raw.questions : []) {
+    if (!q || typeof q !== "object" || !q.id || typeof q.text !== "string") continue;
+    st.questions.push({
+      id: String(q.id),
+      item_id: q.item_id ? String(q.item_id) : null,
+      text: q.text.slice(0, 4000),
+      at: q.at || null,
+    });
+  }
+  // HISTORY - everything the queue did, for the human. Never reaches the model: it is
+  // only ever in this file and in queue_state frames to the window.
+  for (const h of Array.isArray(raw.history) ? raw.history : []) {
+    if (!h || typeof h !== "object" || typeof h.event !== "string") continue;
+    st.history.push({
+      at: h.at || null,
+      event: h.event.slice(0, 40),
+      text: typeof h.text === "string" ? h.text.slice(0, 4000) : "",
+      detail: typeof h.detail === "string" ? h.detail.slice(0, 4000) : "",
+      item_id: h.item_id ? String(h.item_id) : null,
+    });
+  }
+  if (st.history.length > QUEUE_MAX_HISTORY) st.history = st.history.slice(-QUEUE_MAX_HISTORY);
   return st;
 }
 
 /** Prompt paragraph that tells the model the queue exists and how to stop it. */
 export function queuePromptSection() {
   return (
-    "\n\nPROMPT QUEUE: the operator may have queued follow-up prompts that are sent to you " +
-    "automatically, one per turn, as soon as you finish. If you cannot complete the current " +
-    "task without a decision or information from the operator, call pause_queue with the " +
-    "exact question - do NOT just ask in prose and stop, because the next queued prompt " +
-    "would arrive before anyone answers. When you have simply finished, do not call it."
+    "\n\nQUESTIONS FOR THE OPERATOR: whenever you cannot continue without a decision or a piece " +
+    "of information from the operator, call pause_queue with the exact question (one call per " +
+    "question). It posts the question to the operator's Queue panel, where they answer it in a " +
+    "form, and it holds any queued follow-up prompts until they do. Still state the question " +
+    "in your reply as well. Do not call it when you have simply finished; do not call it for " +
+    "rhetorical or optional offers (\"want me to also...\")."
   );
 }
 
@@ -126,6 +153,8 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       running_id: runningId,
       pending,
       items: st.items.map(({ pending_question, ...i }) => ({ ...i })),
+      questions: st.questions.map((q) => ({ ...q })),
+      history: st.history.map((h) => ({ ...h })),
     };
   }
 
@@ -134,10 +163,27 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     try { send(snapshot()); } catch { /* socket gone */ }
   }
 
+  /**
+   * Append to the human-facing history. `text` is what it was about (the prompt or the
+   * question), `detail` how it went (the answer, the failure, who did it). Capped so a
+   * long-lived conversation cannot grow the file without bound.
+   */
+  function record(event, { text = "", detail = "", item = null } = {}) {
+    st.history.push({
+      at: now(),
+      event,
+      text: String(text || "").slice(0, 4000),
+      detail: String(detail || "").slice(0, 4000),
+      item_id: item ? item.id : null,
+    });
+    if (st.history.length > QUEUE_MAX_HISTORY) st.history.splice(0, st.history.length - QUEUE_MAX_HISTORY);
+  }
+
   function pause(reason, by = "system") {
-    if (st.paused) return;
+    if (st.paused && !(by === "assistant" && st.paused.by === "assistant")) return;
     st.paused = { reason: String(reason || "paused").slice(0, 1000), at: now(), by };
     log?.("queue_paused", key(), `${by}: ${st.paused.reason.slice(0, 200)}`);
+    if (by !== "assistant") record("paused", { text: st.paused.reason, detail: `by ${by}` });
   }
 
   function nextPending() {
@@ -158,6 +204,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     item.pending_question = null;
     const position = st.items.indexOf(item) + 1;
     log?.("queue_run", key(), `${position}/${st.items.length}${isReply ? " (reply)" : ""}: ${text.slice(0, 120)}`);
+    record(isReply ? "answer_sent" : "started", { text, detail: isReply ? `continuing: ${item.text.slice(0, 200)}` : (item.compact_first ? "compact & clear first" : ""), item });
     publish();
     try {
       if (item.compact_first && !isReply) {
@@ -171,19 +218,20 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       await runPrompt(text);
       if (item.status === "failed") {
         // noteError() already marked it and paused the queue.
-      } else if (item.pending_question) {
-        // The assistant asked. The item is not finished - it is waiting for the answer,
-        // and the question goes on its thread so the list shows where things stand.
+      } else if (st.questions.some((q) => q.item_id === item.id)) {
+        // The assistant asked. The item is not finished - it is waiting for the answer
+        // (the question itself sits at the top of the panel, with its answer box).
         item.status = "waiting";
-        item.thread.push({ role: "assistant", text: item.pending_question, at: now() });
         item.note = "";
       } else {
         item.status = "done";
+        record("done", { text: item.text, item });
       }
     } catch (e) {
       const why = String(e?.message || e).slice(0, 300);
       item.status = "failed";
       item.note = why;
+      record("failed", { text: item.text, detail: why, item });
       pause(`"${item.text.slice(0, 60)}" failed: ${why}`);
     } finally {
       item.pending_question = null;
@@ -195,6 +243,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       // carried a question-and-answer keeps its trail visible until "Clear done".
       if (st.auto_clear_done && item.status === "done" && !item.thread.length) {
         st.items = st.items.filter((i) => i.id !== item.id);
+        record("auto_cleared", { text: item.text, item });
       }
       publish();
     }
@@ -242,18 +291,21 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     /** The operator typed something (not a window command). If we were waiting on
      *  them, that is the answer: clear the pause so the queue continues after this turn. */
     noteOperatorReply(text = "") {
-      if (!st.paused) return;
+      if (!st.paused && !st.questions.length) return;
       st.paused = null;
-      // If the question belonged to a queued item, the answer typed in the chat still
-      // belongs to that item: record it there and count the item as done, so the trail
-      // is complete wherever the technician chose to type.
-      const waiting = st.items.find((i) => i.status === "waiting");
-      if (waiting && st.paused === null) {
-        waiting.thread.push({ role: "operator", text: String(text || "").slice(0, 4000), at: now(), via: "chat" });
-        waiting.status = "done";
-        waiting.ended_at = now();
+      // A reply typed in the chat answers whatever was open. If a question belonged to a
+      // queued item, the answer is recorded on that item and it counts as done, so the
+      // trail is complete wherever the technician chose to type.
+      for (const q of st.questions) {
+        const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
+        if (it) {
+          it.thread.push({ role: "operator", text: String(text || "").slice(0, 4000), at: now(), via: "chat" });
+          if (it.status === "waiting") { it.status = "done"; it.ended_at = now(); }
+        }
+        record("answered_in_chat", { text: q.text, detail: String(text || ""), item: it });
       }
-      log?.("queue_resumed", key(), "operator replied");
+      st.questions = [];
+      log?.("queue_resumed", key(), "operator replied in chat");
       publish();
     },
 
@@ -261,7 +313,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     noteAbort() {
       if (!st.auto_next && !runningId) return;
       const it = st.items.find((i) => i.id === runningId);
-      if (it) { it.status = "failed"; it.note = "stopped by operator"; }
+      if (it) { it.status = "failed"; it.note = "stopped by operator"; record("stopped", { text: it.text, detail: "by operator", item: it }); }
       pause("Stopped by the operator", "operator");
       publish();
     },
@@ -270,25 +322,25 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     noteError(why) {
       if (!st.auto_next && !runningId) return;
       const it = st.items.find((i) => i.id === runningId);
-      if (it) { it.status = "failed"; it.note = String(why || "error").slice(0, 300); }
+      if (it) { it.status = "failed"; it.note = String(why || "error").slice(0, 300); record("failed", { text: it.text, detail: String(why || "error"), item: it }); }
       pause(`Provider error: ${String(why || "unknown").slice(0, 300)}`, "system");
       publish();
     },
 
     /** Model asked to stop (pause_queue tool). Returns the tool's reply text. */
     pauseByModel(raw) {
-      const q = String(raw || "").trim().slice(0, 1000);
-      // A queued item is running, or Auto-Next is on with work pending: the question is
-      // real queue business. Otherwise there is nothing to pause.
-      if (!runningId && !st.auto_next && !nextPending()) {
-        return "No prompt queue is running. Ask the operator directly in your reply.";
+      const question = String(raw || "").trim().slice(0, 4000) || "The assistant needs a decision before continuing";
+      const it = st.items.find((i) => i.id === runningId) || null;
+      // One card per question. A repeat of an open question is not a second card.
+      if (!st.questions.some((q) => q.text === question && q.item_id === (it ? it.id : null))) {
+        st.questions.push({ id: randomUUID(), item_id: it ? it.id : null, text: question, at: now() });
+        if (it) it.thread.push({ role: "assistant", text: question, at: now() });
+        record("asked", { text: question, detail: it ? `while running: ${it.text.slice(0, 200)}` : "in chat", item: it });
       }
-      const question = q || "The assistant needs a decision before continuing";
-      const it = st.items.find((i) => i.id === runningId);
-      if (it) it.pending_question = question;
       pause(question, "assistant");
+      log?.("queue_question", key(), `${it ? "on item" : "standalone"}: ${question.slice(0, 160)}`);
       publish();
-      return "Queue paused. The operator will see your question and answer before the next queued prompt is sent. Finish your reply with the question stated plainly.";
+      return "Question posted to the operator's Queue panel. Queued prompts are held until they answer there or in the chat. State the question plainly in your reply too.";
     },
 
     /** Tool the model calls when it needs a human decision. */
@@ -296,10 +348,10 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       name: "pause_queue",
       label: "Pause the prompt queue",
       description:
-        "Stop the operator's queued follow-up prompts from being sent automatically because " +
-        "you need a decision or information from them before you can continue. Call this " +
-        "INSTEAD of only asking in prose, whenever your reply ends with a question the next " +
-        "step depends on. Do not call it when you have simply finished the task.",
+        "Ask the operator a question you need answered before you can continue: it is posted " +
+        "to their Queue panel as a form to fill in, and any queued follow-up prompts are held " +
+        "until they answer. One call per question. Also state the question in your reply. Do " +
+        "not call it when you have simply finished, or for optional offers.",
       parameters: Type.Object({
         question: Type.String({ description: "The exact question or decision you need from the operator." }),
       }),
@@ -322,10 +374,12 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
             send({ type: "error", message: `The queue is full (${QUEUE_MAX_ITEMS} items). Clear finished items first.` });
             break;
           }
-          st.items.push({
+          const added = {
             id: randomUUID(), text, compact_first: !!msg.compact_first, status: "pending",
             added_at: now(), started_at: null, ended_at: null, note: "", thread: [],
-          });
+          };
+          st.items.push(added);
+          record("added", { text, detail: added.compact_first ? "compact & clear first" : "", item: added });
           publish();
           await advance("added");
           break;
@@ -333,36 +387,77 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
         case "queue_update": {
           const it = st.items.find((i) => i.id === msg.id);
           if (!it || it.status === "running") break;
-          if (typeof msg.text === "string" && msg.text.trim()) it.text = msg.text.trim().slice(0, QUEUE_MAX_TEXT);
+          if (typeof msg.text === "string" && msg.text.trim() && msg.text.trim() !== it.text) {
+            record("edited", { text: msg.text.trim(), detail: `was: ${it.text.slice(0, 500)}`, item: it });
+            it.text = msg.text.trim().slice(0, QUEUE_MAX_TEXT);
+          }
           if (msg.compact_first !== undefined) it.compact_first = !!msg.compact_first;
           // Re-queue a finished/failed/skipped item ("run it again").
           if (msg.status === "pending" && it.status !== "pending") {
             it.status = "pending"; it.note = ""; it.started_at = null; it.ended_at = null;
+            record("requeued", { text: it.text, item: it });
           }
-          if (msg.status === "skipped" && it.status === "pending") it.status = "skipped";
+          if (msg.status === "skipped" && it.status === "pending") { it.status = "skipped"; record("skipped", { text: it.text, item: it }); }
           publish();
           await advance("updated");
           break;
         }
+        case "queue_answer":
         case "queue_reply": {
-          // The operator answers a waiting item's question right in the queue. The answer
-          // runs as that item's continuation, so the item tracks the whole exchange.
-          const it = st.items.find((i) => i.id === msg.id);
+          // The operator answers a question in the panel. If the question belongs to a
+          // queued item the answer runs as that item's continuation (and is recorded on
+          // it); otherwise it is simply the next thing said in the chat.
           const text = String(msg.text || "").trim().slice(0, QUEUE_MAX_TEXT);
-          if (!it || it.status !== "waiting" || !text) break;
+          if (!text) break;
+          const q = msg.type === "queue_answer"
+            ? st.questions.find((x) => x.id === msg.id)
+            : st.questions.find((x) => x.item_id === msg.id);   // legacy: by item id
+          if (!q) break;
           if (engineBusy || (typeof isStreaming === "function" && isStreaming())) {
             send({ type: "error", message: "The assistant is still working - wait for it to finish, then answer." });
             break;
           }
-          it.thread.push({ role: "operator", text, at: now() });
-          st.paused = null;          // the answer is what the pause was waiting for
-          await runItem(it, text, { isReply: true });
+          st.questions = st.questions.filter((x) => x.id !== q.id);
+          if (!st.questions.length) st.paused = null;   // the answer is what the pause was waiting for
+          const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
+          record("answered", { text: q.text, detail: text, item: it });
+          if (it) {
+            it.thread.push({ role: "operator", text, at: now() });
+            await runItem(it, text, { isReply: true });
+          } else {
+            engineBusy = true;
+            publish();
+            try {
+              send({ type: "queue_started", id: null, text, reply: true });
+              await runPrompt(text);
+            } catch (e) {
+              pause(`answer failed: ${String(e?.message || e).slice(0, 200)}`);
+            } finally {
+              engineBusy = false;
+              publish();
+            }
+          }
           setImmediate(() => { advance("chain").catch(() => {}); });
+          break;
+        }
+        case "queue_dismiss_question": {
+          // Drop a question without answering it. Its item, if any, is finished as far as
+          // the queue is concerned; the assistant's own reply still carries the question.
+          const q = st.questions.find((x) => x.id === msg.id);
+          if (!q) break;
+          st.questions = st.questions.filter((x) => x.id !== q.id);
+          const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
+          record("dismissed", { text: q.text, item: it });
+          if (it && it.status === "waiting") { it.status = "done"; it.note = "question dismissed"; it.ended_at = now(); }
+          if (!st.questions.length && st.paused?.by === "assistant") st.paused = null;
+          publish();
+          await advance("question dismissed");
           break;
         }
         case "queue_remove": {
           const i = st.items.findIndex((x) => x.id === msg.id);
           if (i < 0 || st.items[i].status === "running") break;
+          record("removed", { text: st.items[i].text, detail: `was ${st.items[i].status}`, item: st.items[i] });
           st.items.splice(i, 1);
           publish();
           break;
@@ -382,6 +477,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
         case "queue_set_auto": {
           st.auto_next = !!msg.value;
           log?.("queue_auto", key(), st.auto_next ? "on" : "off");
+          record("auto_next", { detail: st.auto_next ? "on" : "off" });
           publish();
           if (st.auto_next) await advance("auto on");
           break;
@@ -398,6 +494,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           publish();
           break;
         case "queue_resume":
+          if (st.paused) record("resumed", { text: st.paused.reason });
           st.paused = null;
           publish();
           await advance("resume");
@@ -415,12 +512,21 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           setImmediate(() => { advance("chain").catch(() => {}); });
           break;
         }
-        case "queue_clear_done":
+        case "queue_clear_done": {
+          const gone = st.items.filter((i) => i.status !== "pending" && i.status !== "running");
           st.items = st.items.filter((i) => i.status === "pending" || i.status === "running");
+          if (gone.length) record("cleared_finished", { detail: `${gone.length} item(s)` });
+          publish();
+          break;
+        }
+        case "queue_clear_history":
+          st.history = [];
           publish();
           break;
         case "queue_clear":
+          record("cleared_all", { detail: `${st.items.length} item(s), ${st.questions.length} question(s)` });
           st.items = st.items.filter((i) => i.status === "running");
+          st.questions = [];
           st.paused = null;
           publish();
           break;
