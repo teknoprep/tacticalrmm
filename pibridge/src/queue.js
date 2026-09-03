@@ -42,13 +42,14 @@ function queuePath(root, scopeKey, sessionId) {
 }
 
 function emptyState() {
-  return { version: 1, auto_next: false, paused: null, items: [] };
+  return { version: 1, auto_next: false, auto_clear_done: false, paused: null, items: [] };
 }
 
 function sanitize(raw) {
   const st = emptyState();
   if (!raw || typeof raw !== "object") return st;
   st.auto_next = !!raw.auto_next;
+  st.auto_clear_done = !!raw.auto_clear_done;
   st.paused = raw.paused && typeof raw.paused === "object" && raw.paused.reason
     ? { reason: String(raw.paused.reason).slice(0, 1000), at: raw.paused.at || null, by: raw.paused.by || "system" }
     : null;
@@ -111,6 +112,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     return {
       type: "queue_state",
       auto_next: st.auto_next,
+      auto_clear_done: st.auto_clear_done,
       paused: st.paused,
       running_id: runningId,
       pending,
@@ -167,6 +169,11 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       item.ended_at = now();
       runningId = null;
       engineBusy = false;
+      // Auto-clear: a finished item leaves the list on its own. Only "done" - a failed
+      // or skipped one is something the technician still has to look at.
+      if (st.auto_clear_done && item.status === "done") {
+        st.items = st.items.filter((i) => i.id !== item.id);
+      }
       publish();
     }
   }
@@ -325,6 +332,13 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           log?.("queue_auto", key(), st.auto_next ? "on" : "off");
           publish();
           if (st.auto_next) await advance("auto on");
+          break;
+        }
+        case "queue_set_auto_clear": {
+          st.auto_clear_done = !!msg.value;
+          // Turning it on also sweeps what is already done, so the list matches the switch.
+          if (st.auto_clear_done) st.items = st.items.filter((i) => i.status !== "done");
+          publish();
           break;
         }
         case "queue_pause":

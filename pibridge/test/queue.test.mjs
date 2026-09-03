@@ -254,6 +254,29 @@ test("the queue is persisted per conversation and comes back PAUSED on reopen", 
   assert.equal(q3.state().items.length, 0);
 });
 
+test("Auto-clear done removes finished items by itself, but keeps failed ones", async () => {
+  const h = harness({ prompt: async (t, q) => { if (t === "bad") q.noteError("boom"); } });
+  await h.q.handle({ type: "queue_add", text: "a" });
+  await h.q.handle({ type: "queue_add", text: "bad" });
+  await h.q.handle({ type: "queue_add", text: "c" });
+  await h.q.handle({ type: "queue_set_auto_clear", value: true });
+  assert.equal(h.state().auto_clear_done, true);
+  await h.q.handle({ type: "queue_set_auto", value: true });
+  await settle(10);
+  // "a" ran and vanished; "bad" failed and stays (queue paused on it); "c" waits.
+  assert.deepEqual(h.ran, ["a", "bad"]);
+  assert.deepEqual(h.state().items.map((i) => [i.text, i.status]), [["bad", "failed"], ["c", "pending"]]);
+
+  // Turning the switch on later sweeps what is already done.
+  const h2 = harness();
+  await h2.q.handle({ type: "queue_add", text: "x" });
+  await h2.q.handle({ type: "queue_run_next" });
+  await settle(5);
+  assert.equal(h2.state().items[0].status, "done");
+  await h2.q.handle({ type: "queue_set_auto_clear", value: true });
+  assert.equal(h2.state().items.length, 0);
+});
+
 test("a detached (closed) window never sends another prompt", async () => {
   const h = harness();
   await h.q.handle({ type: "queue_add", text: "a" });
