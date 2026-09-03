@@ -200,6 +200,27 @@ export async function pruneShadowedModels(isBuiltin) {
  * Guard: only ids the provider itself just confirmed are written. We never invent a
  * model id, and we never touch an entry pi already knows.
  */
+/**
+ * Per-provider wire settings a registered stub needs to be USABLE, not just listed.
+ *
+ * Anthropic: every Claude released since 4.6 accepts only adaptive thinking. Without
+ * `compat.forceAdaptiveThinking` pi-ai sends the older `thinking: {type: "enabled",
+ * budget_tokens}` and the API answers 400 `"thinking.type.enabled" is not supported for
+ * this model` - which is exactly what happened on 2026-09-03 when a technician switched
+ * a ticket chat to claude-fable-5-1 (registered here as a bare stub because pi 0.84.4
+ * predates it). A model this flow registers is by definition newer than the installed
+ * pi, so it is newer than 4.6.
+ */
+function providerCompat(provider, id) {
+  if (provider === "anthropic" && /^claude-/.test(id)) {
+    return {
+      thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" },
+      compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
+    };
+  }
+  return {};
+}
+
 export async function registerModels(providers, registry, wanted) {
   const byProv = new Map();
   for (const w of wanted || []) {
@@ -246,6 +267,7 @@ export async function registerModels(providers, registry, wanted) {
         input: ["text", "image"],
         contextWindow: w.context_window || 200000,
         maxTokens: w.max_tokens || 64000,
+        ...providerCompat(pname, id),
       });
       registered.push({ provider: pname, model_id: id, display_name: w.display_name || offered.get(id) || id });
     }
