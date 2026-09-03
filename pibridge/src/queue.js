@@ -33,7 +33,9 @@ import { CONFIG } from "./config.js";
 export const QUEUE_MAX_ITEMS = Number(process.env.PI_QUEUE_MAX_ITEMS || 100);
 export const QUEUE_MAX_TEXT = Number(process.env.PI_QUEUE_MAX_TEXT || 8000);
 
-const STATUSES = new Set(["pending", "running", "done", "failed", "skipped"]);
+// "waiting" = the assistant asked a question on this item and is waiting for the answer.
+// It is the one state auto-clear never touches: the question IS the work in progress.
+const STATUSES = new Set(["pending", "running", "waiting", "done", "failed", "skipped"]);
 
 function queuePath(root, scopeKey, sessionId) {
   const dir = path.join(root, scopeKey, "queue");
@@ -64,6 +66,13 @@ function sanitize(raw) {
       started_at: it.started_at || null,
       ended_at: it.ended_at || null,
       note: typeof it.note === "string" ? it.note.slice(0, 500) : "",
+      // The conversation ON this item: the assistant's questions and the operator's
+      // answers, in order, so "where are we with this one" is answered in the list.
+      thread: Array.isArray(it.thread)
+        ? it.thread
+            .filter((t) => t && typeof t.text === "string" && (t.role === "assistant" || t.role === "operator"))
+            .map((t) => ({ role: t.role, text: t.text.slice(0, 4000), at: t.at || null, via: t.via || undefined }))
+        : [],
     });
   }
   return st;
@@ -116,7 +125,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       paused: st.paused,
       running_id: runningId,
       pending,
-      items: st.items.map((i) => ({ ...i })),
+      items: st.items.map(({ pending_question, ...i }) => ({ ...i })),
     };
   }
 
@@ -135,30 +144,41 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     return st.items.find((i) => i.status === "pending") || null;
   }
 
-  async function runItem(item) {
+  /**
+   * Send one prompt on behalf of an item and settle its status afterwards. `text` is the
+   * item's own prompt the first time, and the operator's answer when the item was
+   * waiting on a question.
+   */
+  async function runItem(item, text = item.text, { isReply = false } = {}) {
     engineBusy = true;
     runningId = item.id;
     item.status = "running";
-    item.started_at = now();
+    if (!isReply) item.started_at = now();
     item.note = "";
-    const position = st.items.filter((i) => i.status !== "pending" || i.id === item.id).length;
-    log?.("queue_run", key(), `${position}/${st.items.length}: ${item.text.slice(0, 120)}`);
+    item.pending_question = null;
+    const position = st.items.indexOf(item) + 1;
+    log?.("queue_run", key(), `${position}/${st.items.length}${isReply ? " (reply)" : ""}: ${text.slice(0, 120)}`);
     publish();
     try {
-      if (item.compact_first) {
+      if (item.compact_first && !isReply) {
         // "Compact & clear first": the technician wants this item to start from a
         // summary, not from the whole transcript. compact() reports its own outcome to
         // the window; "nothing to compact" is not a failure for us.
         await compact(`queue: ${item.text.slice(0, 80)}`);
       }
       if (detached) throw new Error("window closed");
-      send({ type: "queue_started", id: item.id, text: item.text });
-      await runPrompt(item.text);
+      send({ type: "queue_started", id: item.id, text, reply: isReply });
+      await runPrompt(text);
       if (item.status === "failed") {
         // noteError() already marked it and paused the queue.
+      } else if (item.pending_question) {
+        // The assistant asked. The item is not finished - it is waiting for the answer,
+        // and the question goes on its thread so the list shows where things stand.
+        item.status = "waiting";
+        item.thread.push({ role: "assistant", text: item.pending_question, at: now() });
+        item.note = "";
       } else {
         item.status = "done";
-        if (st.paused && st.paused.by === "assistant") item.note = "asked a question - see the chat";
       }
     } catch (e) {
       const why = String(e?.message || e).slice(0, 300);
@@ -166,12 +186,14 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       item.note = why;
       pause(`"${item.text.slice(0, 60)}" failed: ${why}`);
     } finally {
+      item.pending_question = null;
       item.ended_at = now();
       runningId = null;
       engineBusy = false;
-      // Auto-clear: a finished item leaves the list on its own. Only "done" - a failed
-      // or skipped one is something the technician still has to look at.
-      if (st.auto_clear_done && item.status === "done") {
+      // Auto-clear: a finished item leaves the list on its own. Only a plain "done" -
+      // failed, skipped and waiting ones still need the technician, and a done item that
+      // carried a question-and-answer keeps its trail visible until "Clear done".
+      if (st.auto_clear_done && item.status === "done" && !item.thread.length) {
         st.items = st.items.filter((i) => i.id !== item.id);
       }
       publish();
@@ -219,9 +241,18 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
 
     /** The operator typed something (not a window command). If we were waiting on
      *  them, that is the answer: clear the pause so the queue continues after this turn. */
-    noteOperatorReply() {
+    noteOperatorReply(text = "") {
       if (!st.paused) return;
       st.paused = null;
+      // If the question belonged to a queued item, the answer typed in the chat still
+      // belongs to that item: record it there and count the item as done, so the trail
+      // is complete wherever the technician chose to type.
+      const waiting = st.items.find((i) => i.status === "waiting");
+      if (waiting && st.paused === null) {
+        waiting.thread.push({ role: "operator", text: String(text || "").slice(0, 4000), at: now(), via: "chat" });
+        waiting.status = "done";
+        waiting.ended_at = now();
+      }
       log?.("queue_resumed", key(), "operator replied");
       publish();
     },
@@ -245,12 +276,17 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     },
 
     /** Model asked to stop (pause_queue tool). Returns the tool's reply text. */
-    pauseByModel(question) {
-      const q = String(question || "").trim().slice(0, 1000);
-      if (!st.auto_next && !nextPending()) {
+    pauseByModel(raw) {
+      const q = String(raw || "").trim().slice(0, 1000);
+      // A queued item is running, or Auto-Next is on with work pending: the question is
+      // real queue business. Otherwise there is nothing to pause.
+      if (!runningId && !st.auto_next && !nextPending()) {
         return "No prompt queue is running. Ask the operator directly in your reply.";
       }
-      pause(q || "The assistant needs a decision before continuing", "assistant");
+      const question = q || "The assistant needs a decision before continuing";
+      const it = st.items.find((i) => i.id === runningId);
+      if (it) it.pending_question = question;
+      pause(question, "assistant");
       publish();
       return "Queue paused. The operator will see your question and answer before the next queued prompt is sent. Finish your reply with the question stated plainly.";
     },
@@ -288,7 +324,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           }
           st.items.push({
             id: randomUUID(), text, compact_first: !!msg.compact_first, status: "pending",
-            added_at: now(), started_at: null, ended_at: null, note: "",
+            added_at: now(), started_at: null, ended_at: null, note: "", thread: [],
           });
           publish();
           await advance("added");
@@ -306,6 +342,22 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           if (msg.status === "skipped" && it.status === "pending") it.status = "skipped";
           publish();
           await advance("updated");
+          break;
+        }
+        case "queue_reply": {
+          // The operator answers a waiting item's question right in the queue. The answer
+          // runs as that item's continuation, so the item tracks the whole exchange.
+          const it = st.items.find((i) => i.id === msg.id);
+          const text = String(msg.text || "").trim().slice(0, QUEUE_MAX_TEXT);
+          if (!it || it.status !== "waiting" || !text) break;
+          if (engineBusy || (typeof isStreaming === "function" && isStreaming())) {
+            send({ type: "error", message: "The assistant is still working - wait for it to finish, then answer." });
+            break;
+          }
+          it.thread.push({ role: "operator", text, at: now() });
+          st.paused = null;          // the answer is what the pause was waiting for
+          await runItem(it, text, { isReply: true });
+          setImmediate(() => { advance("chain").catch(() => {}); });
           break;
         }
         case "queue_remove": {

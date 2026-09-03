@@ -1346,7 +1346,7 @@ async function startChat(ws, blob) {
       return;
     }
     // A real prompt from a human while the queue is waiting on them IS the answer.
-    if (origin !== "queue") queue.noteOperatorReply();
+    if (origin !== "queue") queue.noteOperatorReply(text);
     techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
     recovery.beginTurn();
     // A new request earns a fresh, tight watchdog budget: the widened one exists
@@ -2131,7 +2131,7 @@ async function startDecisionChat(ws, blob) {
       await compactCmd.run(text);
       return;
     }
-    if (origin !== "queue") queue.noteOperatorReply();
+    if (origin !== "queue") queue.noteOperatorReply(text);
     // Keep the tech's own words for the close-authorisation test above.
     techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
     work.humanTurn();
