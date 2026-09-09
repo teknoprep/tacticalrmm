@@ -1231,13 +1231,30 @@ async function startChat(ws, blob) {
   });
   queue.publish();
 
-  // Idle disposal
+  // Idle disposal. "Idle" means NEITHER side has done anything for idleTimeoutMs: the
+  // technician has not typed, AND the assistant has not streamed, called a tool or
+  // otherwise emitted a session event. It used to count browser messages only, so a
+  // technician WATCHING a long autonomous turn was closed 30 minutes after their last
+  // keystroke while the assistant was visibly still working - the window went
+  // "disconnected" and needed a refresh (logged as code=1005, the bare ws.close()).
+  // Now the timer is a check, not a verdict: when it fires it looks at the most recent
+  // activity from either side and, if that is recent, simply reschedules itself.
   let idleTimer;
+  let lastBrowserMsgAt = Date.now();
+  const idleCheck = () => {
+    const lastSeen = Math.max(lastBrowserMsgAt, lastActivity);
+    const quiet = Date.now() - lastSeen;
+    if (session.isStreaming || quiet < CONFIG.idleTimeoutMs) {
+      idleTimer = setTimeout(idleCheck, Math.max(1000, CONFIG.idleTimeoutMs - quiet));
+      return;
+    }
+    log("ws idle close", `${agentId} ${sessionId} quiet ${Math.round(quiet / 1000)}s (browser ${Math.round((Date.now() - lastBrowserMsgAt) / 1000)}s, assistant ${Math.round((Date.now() - lastActivity) / 1000)}s)`);
+    try { ws.close(1000, "idle"); } catch {}
+  };
   const resetIdle = () => {
+    lastBrowserMsgAt = Date.now();
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      try { ws.close(); } catch {}
-    }, CONFIG.idleTimeoutMs);
+    idleTimer = setTimeout(idleCheck, CONFIG.idleTimeoutMs);
   };
   resetIdle();
 
@@ -1581,6 +1598,11 @@ async function startDecisionChat(ws, blob) {
   // every single time (see gate("secret") below).
   const autocredentialAllowed = !!blob.autocredential_allowed;
   let autoCredential = switches.autoCredential;
+  // SALES/ERP permission (role: can_use_ai_sales), decided by the API when it minted this
+  // session - not a switch the window can flip. Absent means an older token from before
+  // the permission existed; those are honoured as-is rather than silently losing the
+  // tool mid-shift, since the API only ever shipped sales_code when the ERP was enabled.
+  const salesAllowed = blob.sales_allowed !== false;
 
   const keys = { [blob.provider]: blob.api_key };
   for (const m of blob.allowed_models || []) if (m.api_key) keys[m.provider] = m.api_key;
@@ -1736,7 +1758,29 @@ async function startDecisionChat(ws, blob) {
       return { ok: true };
     }
     if (kind === "sales") {
-      // Creating/linking ERP quotations always needs an explicit Approve click.
+      // SALES / ERP. The authority to touch the quotation book at all is the ROLE
+      // permission can_use_ai_sales, decided by an admin long before this chat opened -
+      // without it the tool is never built (see salesEnabled below), so reaching here
+      // already means the technician is allowed to work in the ERP.
+      //
+      // What is left to decide is only whether to interrupt them per call, and that is
+      // what the ordinary window switches are for - the same ones that govern device
+      // changes. A quotation is a DRAFT: reversible, invisible to the customer until a
+      // human sends it. It is not the irreversible customer email or the ticket close
+      // that MANDATE 4.8 reserves for a human, so it does not inherit their
+      // "Auto-approve can never skip this" rule. It used to, and the result was a prompt
+      // on every dry-run and every re-word, which trained people to click Approve
+      // without reading - a safeguard that costs attention and buys nothing.
+      if (!salesAllowed) {
+        return { ok: false, reason: "this role is not permitted to use the Sales/ERP quotation tools." };
+      }
+      if (readonly) {
+        return { ok: false, reason: "the chat is in READ-ONLY mode - switch on Write mode to change the quotation." };
+      }
+      if (autoApprove) {
+        log("sales action auto-approved", histKey, sessionId, String(summary).slice(0, 160));
+        return { ok: true };
+      }
       const ok = await requestApproval(summary);
       if (!ok) return { ok: false, reason: "the technician did not approve this Sales/ERP action." };
       log("sales action permitted by tech", histKey, sessionId, String(summary).slice(0, 160));
@@ -1778,7 +1822,7 @@ async function startDecisionChat(ws, blob) {
     operatorActor: blob.username || "",
     actorEmail: blob.user_email || "",
     actorName: blob.user_display || blob.username || "",
-    salesEnabled: !!(blob.sales_enabled && blob.sales_code),
+    salesEnabled: !!(salesAllowed && blob.sales_enabled && blob.sales_code),
     salesCode: blob.sales_code || "",
     salesApi: blob.sales_api || blob.helpdesk_api || null,
   });
@@ -2159,8 +2203,27 @@ async function startDecisionChat(ws, blob) {
     currentModel: () => session.model || model,
   });
 
+  // Idle disposal - same rule as the device chat (see the comment there): close only when
+  // neither the technician nor the assistant has done anything for idleTimeoutMs. A
+  // decision window is exactly where a tech sits and watches a long GUI-driving turn
+  // without typing, which is what used to get cut off at the 30-minute mark.
   let idleTimer;
-  const resetIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => { try { ws.close(); } catch {} }, CONFIG.idleTimeoutMs); };
+  let lastBrowserMsgAt = Date.now();
+  const idleCheck = () => {
+    const lastSeen = Math.max(lastBrowserMsgAt, lastActivity);
+    const quiet = Date.now() - lastSeen;
+    if (session.isStreaming || quiet < CONFIG.idleTimeoutMs) {
+      idleTimer = setTimeout(idleCheck, Math.max(1000, CONFIG.idleTimeoutMs - quiet));
+      return;
+    }
+    log("ws idle close", `${histKey} ${sessionId} quiet ${Math.round(quiet / 1000)}s (browser ${Math.round((Date.now() - lastBrowserMsgAt) / 1000)}s, assistant ${Math.round((Date.now() - lastActivity) / 1000)}s)`);
+    try { ws.close(1000, "idle"); } catch {}
+  };
+  const resetIdle = () => {
+    lastBrowserMsgAt = Date.now();
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(idleCheck, CONFIG.idleTimeoutMs);
+  };
   resetIdle();
 
   ws.on("message", async (raw) => {

@@ -2653,8 +2653,15 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         const cap = gateOp({ surface: surface || "decision_chat", op: p.operation, opClasses: sales.opClasses, mutating: sales.mutating, ref: ticketRef });
         if (!cap.allowed && cap.enforced)
           return text(`'${p.operation}' is NOT allowed here: ${cap.reason}`);
-        // Mutating sales ops ALWAYS require human approval (Auto-approve cannot skip).
-        if (sales.mutating.has(p.operation)) {
+        // A dry run writes NOTHING - it asks the ERP what the change would look like and
+        // hands the diff back to the chat. Gating it produced two prompts for one edit
+        // (preview, then apply) and taught people to click Approve on sight, so the
+        // preview is treated as the read it actually is. The apply that follows is a real
+        // mutation and still goes through gate("sales") below.
+        const dryRun = p?.args?.dry_run === true || p?.dry_run === true;
+        // Mutating sales ops need the Sales/ERP role permission; whether the technician is
+        // ALSO prompted per call is decided by Write mode + Auto-approve in gate("sales").
+        if (sales.mutating.has(p.operation) && !dryRun) {
           const summary = `Sales ERP: ${p.operation} on ${ticketRef || "(no ticket)"}\n` +
             JSON.stringify({ lines: p.lines, partner_id: p.partner_id, order_id: p.order_id, args: p.args }, null, 0).slice(0, 600);
           const g = gate
