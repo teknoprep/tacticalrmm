@@ -227,3 +227,34 @@ branches pushed. Everything on the host is now committed, pushed, and tracking a
 `/tmp/pr-backend/.git/config` and `/tmp/pr-web/.git/config` (scope `repo, workflow,
 read:org`) — the `UPGRADE-RUNBOOK.md` gap list already flagged it. It was the only push
 credential on the box. **Rotate it and move these clones to SSH.**
+
+## 2026-09-09 — A window that reopens continues its conversation
+
+**Decision: for a device chat, "no session named" means CONTINUE, not START.** A refresh, a
+socket the bridge closed as idle, and a model or agent-group switch all reopen the window
+with no session id. Each used to mint a new session, so the transcript came back empty and
+the model came back with an empty context — while the window still looked like the same
+conversation. That is the worse failure of the two available: the technician cannot see that
+the assistant has forgotten. The ticket chat has always resumed the latest session for its
+ticket; the device chat now does the same, keyed on the agent.
+
+**What may be picked up unasked is narrow, because guessing wrong here shows one technician
+another's work.** `history.latestResumable()` requires: the caller's own last session, the
+same window shape (a multi-machine chat is not a single-machine chat), a transcript file that
+still exists, and activity newer than `AUTO_RESUME_MAX_AGE_MS` — 12h by default, chosen so an
+interrupted working day continues and next week's job about the same server starts clean.
+Nothing about this widens access: the session blob is still minted per caller by Django, and
+the conversation resumed is one that same person was already in.
+
+**Starting fresh stays a click, and it is explicit on the wire.** "New chat" and AI Resolve
+send `new_session`; the API passes it through, and the bridge skips resumption when it is set.
+Making a fresh start the *default* is what caused this, so the default moved and the deliberate
+case became the flag — not the other way round.
+
+**The window says so, once.** History appearing unannounced is as confusing as history that
+vanished, and the note names New chat as the way out. While adding it: the existing
+"opened like this" notes (`Resumed on <model>`, restored switches, Operator availability) were
+being pushed into the transcript array *before* history hydration replaced that array — built,
+discarded, and never seen by anyone since they shipped. They are appended after hydration now.
+
+Issue record: `pi-ai-helpdesk/ISSUES.md` **I38**. Tests: `test/history-resume.test.mjs`.
