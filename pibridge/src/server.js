@@ -39,6 +39,8 @@ import { boundTranscript } from "./transcript-bound.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
+// Nothing the technician sends may be dropped because the window was still building.
+import { bufferEarlyFrames } from "./early-frames.js";
 
 const redis = new Redis(CONFIG.redisUrl);
 
@@ -708,6 +710,7 @@ function makeCredentialGate({ isOn, allowed, prompt, log, key, sessionId }) {
 
 // ---- WebSocket session lifecycle -------------------------------------------
 async function startChat(ws, blob) {
+  const handOff = bufferEarlyFrames(ws);
   const facts = blob.device_facts;
   const agentId = blob.agent_id;
   // Multi-machine sessions carry blob.machines; single sessions keep the
@@ -1452,7 +1455,7 @@ async function startChat(ws, blob) {
     currentModel: () => session.model || model,
   });
 
-  ws.on("message", async (raw) => {
+  const onBrowserFrame = async (raw) => {
     resetIdle();
     let msg;
     try {
@@ -1584,7 +1587,10 @@ async function startChat(ws, blob) {
     } catch (e) {
       ws.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) }));
     }
-  });
+  };
+  // Live from here - and anything the technician sent while the window was still being
+  // built runs now, in the order they sent it.
+  handOff(onBrowserFrame);
 
   ws.on("close", () => {
     clearTimeout(idleTimer);
@@ -1612,6 +1618,7 @@ async function startChat(ws, blob) {
 // live activity, and gates disruptive device commands / customer replies through
 // the same approval UX. Session is persisted per TICKET so reconnects resume it.
 async function startDecisionChat(ws, blob) {
+  const handOff = bufferEarlyFrames(ws);
   const ticketRef = blob.ticket_ref || "";
   const histKey = `decision:${ticketRef}`;
   const ctx = blob.context || {};
@@ -2271,7 +2278,7 @@ async function startDecisionChat(ws, blob) {
   };
   resetIdle();
 
-  ws.on("message", async (raw) => {
+  const onBrowserFrame = async (raw) => {
     resetIdle();
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     try {
@@ -2348,7 +2355,8 @@ async function startDecisionChat(ws, blob) {
         default: break;
       }
     } catch (e) { ws.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) })); }
-  });
+  };
+  handOff(onBrowserFrame);
 
   ws.on("close", () => {
     clearTimeout(idleTimer);
