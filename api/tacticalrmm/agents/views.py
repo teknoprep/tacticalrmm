@@ -1945,6 +1945,10 @@ class PiMultiSession(APIView):
             ),
             "persist_history": bool(core.ai_persist_history),
             "resume_session": request.data.get("resume_session") or None,
+            # Asked for a FRESH conversation (New chat / AI Resolve). Absent, the
+            # bridge carries on the last conversation about this machine, so a
+            # refresh or a model switch does not silently drop the context.
+            "new_session": bool(request.data.get("new_session")),
             "helpdesk_prompt": core.ai_helpdesk_prompt or "",
             "helpdesk_api": {
                 "base_url": core.ai_helpdesk_api_base_url or "",
@@ -2136,6 +2140,10 @@ class AgentPiSession(APIView):
             ),
             "persist_history": bool(core.ai_persist_history),
             "resume_session": request.data.get("resume_session") or None,
+            # Asked for a FRESH conversation (New chat / AI Resolve). Absent, the
+            # bridge carries on the last conversation about this machine, so a
+            # refresh or a model switch does not silently drop the context.
+            "new_session": bool(request.data.get("new_session")),
             "helpdesk_prompt": core.ai_helpdesk_prompt or "",
             "helpdesk_api": {
                 "base_url": core.ai_helpdesk_api_base_url or "",

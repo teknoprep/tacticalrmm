@@ -891,8 +891,24 @@ async function startChat(ws, blob) {
   }, groupState));
   await loader.reload();
 
-  // Session persistence (resume or new)
+  // SESSION PERSISTENCE. Three cases: a named session (AI History → Continue), an
+  // explicitly fresh one (New chat), or - the default - carry on the conversation this
+  // window was last having about this machine.
+  //
+  // WHY "CARRY ON" IS THE DEFAULT. F5, a socket the bridge closed as idle, and switching
+  // model or agent group all reopen the window with no session id, and each used to mint a
+  // brand-new session. The transcript came back empty AND the model came back with no
+  // context, so the next question was answered by an assistant that had forgotten the last
+  // hour of work - while the window still looked like the same conversation. The ticket
+  // chat has always resumed the latest session for its ticket (see the decision handler
+  // below); the device chat now does the same, keyed on the agent.
+  //
+  // The rules for what may be picked up unasked live in history.latestResumable(): own
+  // session, matching window shape, file still present, recent. If none qualifies this is
+  // a new conversation, exactly as before.
   let sessionManager;
+  let resumedFrom = "";                    // "" | "continue" | "auto"
+  let resumedSessionId = "";
   const resumeId = blob.resume_session;
   if (resumeId) {
     const idx = history.readIndex(agentId);
@@ -900,8 +916,31 @@ async function startChat(ws, blob) {
     if (info?.file) {
       try {
         sessionManager = SessionManager.open(info.file);
+        resumedFrom = "continue";
+        resumedSessionId = resumeId;
       } catch {
-        sessionManager = SessionManager.create(CONFIG.sessionsRoot);
+        sessionManager = null;
+      }
+    }
+  }
+  if (!sessionManager && !blob.new_session && blob.persist_history) {
+    const prior = history.latestResumable(agentId, {
+      username: blob.username,
+      multi,
+      maxAgeMs: CONFIG.autoResumeMaxAgeMs,
+    });
+    if (prior) {
+      try {
+        sessionManager = SessionManager.open(prior.file);
+        resumedFrom = "auto";
+        resumedSessionId = prior.session_id;
+        log("chat resumed", agentId, prior.session_id,
+          `last active ${prior.last_activity || "?"} (${prior.label || prior.name || "unlabelled"})`);
+      } catch (e) {
+        // A readable index pointing at an unreadable file is not worth failing over:
+        // say so and open a fresh conversation.
+        log("chat resume failed", agentId, prior.session_id, String(e?.message || e));
+        sessionManager = null;
       }
     }
   }
@@ -1224,6 +1263,12 @@ async function startChat(ws, blob) {
       operator_machines: (blob.operator && blob.operator.machines) || [],
       label: sessionLabel,
       history: uiTranscript(sessionManager, session),
+      // Did this window pick up an existing conversation, and was that its own idea? The
+      // UI says so once, because history appearing unannounced is as confusing as history
+      // vanishing - and it is the difference between "where did my chat go" and "why is it
+      // talking about another machine".
+      resumed: resumedFrom,
+      resumed_session: resumedSessionId,
     }),
   );
   await hydrateWindowCost(costMeter, { agent_id: agentId }, {

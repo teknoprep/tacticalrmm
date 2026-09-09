@@ -49,6 +49,41 @@ export function listSessions(agentId) {
     .sort((a, b) => (b.last_activity || "").localeCompare(a.last_activity || ""));
 }
 
+/**
+ * The most recent session for this conversation key that may be reopened WITHOUT anyone
+ * naming it - i.e. what a browser refresh, a dropped socket or a model switch should land
+ * back in, instead of a blank conversation.
+ *
+ * Deliberately narrow, because guessing wrong here means showing one technician another's
+ * work, or dragging a forgotten conversation into a new job:
+ *   - the transcript file must still exist (a deleted session is not resumable),
+ *   - the window shape must match (a multi-machine chat is not a single-machine chat),
+ *   - it must belong to the person opening it - sessions recorded before `user` existed
+ *     are allowed through, since there is nothing to contradict,
+ *   - and it must be recent, so "chat about this server" on Friday does not silently
+ *     continue Tuesday's conversation. 0 disables the age check.
+ *
+ * @returns {{session_id:string}&Record<string,any>|null}
+ */
+export function latestResumable(agentId, { username = "", multi = false, maxAgeMs = 0 } = {}) {
+  const now = Date.now();
+  for (const s of listSessions(agentId)) {   // already newest-first
+    if (!s.file) continue;
+    try {
+      if (!fs.existsSync(s.file)) continue;
+    } catch {
+      continue;
+    }
+    if (!!s.multi !== !!multi) continue;
+    if (s.user && username && s.user !== username) continue;
+    const stamp = Date.parse(s.last_activity || s.started || "");
+    if (!Number.isFinite(stamp)) continue;
+    if (maxAgeMs > 0 && now - stamp > maxAgeMs) continue;
+    return s;
+  }
+  return null;
+}
+
 export function deleteSession(agentId, sessionId) {
   const idx = readIndex(agentId);
   const info = idx[sessionId];

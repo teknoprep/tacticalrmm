@@ -9,6 +9,12 @@ export const CONFIG = {
   // where pi session .jsonl files live (per agent_id)
   sessionsRoot: process.env.PI_SESSIONS_ROOT || "/opt/pi-trmm-bridge/sessions",
   idleTimeoutMs: parseInt(process.env.IDLE_TIMEOUT_MS || String(30 * 60 * 1000), 10),
+  // How stale the last conversation about a machine may be and still be picked up
+  // automatically when a window reopens with no session named (refresh, reconnect, model
+  // switch). Long enough to cover a working day's interruptions - lunch, a meeting, a
+  // laptop lid - and short enough that next week's job starts clean. "New chat" ignores
+  // it entirely. 0 disables the age check; see history.latestResumable().
+  autoResumeMaxAgeMs: parseInt(process.env.AUTO_RESUME_MAX_AGE_MS || String(12 * 60 * 60 * 1000), 10),
   // Liveness is MEASURED off the provider socket (see stream-liveness.js), not inferred
   // from agent-event gaps. Providers heartbeat their SSE streams - xAI sends
   // `: keepalive` every 15s - so real wire silence this long means several missed
