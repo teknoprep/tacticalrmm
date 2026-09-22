@@ -12,6 +12,7 @@ from .models import (
     AIModel,
     AIProvider,
     AITask,
+    AITicketAutomationSubject,
     AITaskRun,
     BulkAICommand,
     CodeSignToken,
@@ -463,6 +464,17 @@ class AITaskSerializer(serializers.ModelSerializer):
     # second round-trip. Missing/renamed agents degrade to hostname="" rather than
     # erroring - a task must keep working even if a secondary machine was deleted.
     machines_detail = serializers.SerializerMethodField()
+    # The clock this task's wall-clock schedule is actually read on, resolved server-side
+    # (explicit schedule_timezone, else the device's own). The UI must never work this out
+    # for itself: a displayed zone that disagrees with the scheduler is worse than none.
+    effective_timezone = serializers.CharField(read_only=True)
+    # The device's timezone on its own, so the UI can default its viewer to "the client's
+    # timezone" and can say when a task has been pinned somewhere else.
+    agent_timezone = serializers.SerializerMethodField()
+    # Where the device's timezone came from: the machine itself, or the global default
+    # nobody set per-device. "The client's timezone" that is really "whatever Global
+    # Settings says" is worth saying out loud - it is usually wrong for at least one site.
+    agent_timezone_source = serializers.SerializerMethodField()
 
     class Meta:
         model = AITask
@@ -470,6 +482,18 @@ class AITaskSerializer(serializers.ModelSerializer):
 
     def get_model_display(self, obj) -> str:
         return obj.model.display_name if obj.model else "(default)"
+
+    def get_agent_timezone(self, obj) -> str:
+        try:
+            return obj.agent.timezone
+        except Exception:
+            return ""
+
+    def get_agent_timezone_source(self, obj) -> str:
+        try:
+            return "agent" if obj.agent.time_zone else "global"
+        except Exception:
+            return ""
 
     def get_machines_detail(self, obj) -> list:
         from agents.models import Agent
@@ -583,3 +607,16 @@ class AIReportScheduleSerializer(serializers.ModelSerializer):
 
     def get_window_hours_effective(self, obj):
         return obj.effective_window_hours
+
+
+class AITicketAutomationSubjectSerializer(serializers.ModelSerializer):
+    procedure_titles = serializers.SerializerMethodField()
+    mode_display = serializers.CharField(source="get_mode_display", read_only=True)
+
+    class Meta:
+        model = AITicketAutomationSubject
+        exclude = ("approve_token", "reject_token")
+
+    def get_procedure_titles(self, obj) -> list:
+        return [f"{p.pk} {p.title}" for p in obj.procedures.all()]
+

@@ -11,6 +11,7 @@ from django.db import IntegrityError
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as djangotime
+from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from redis import from_url
 from rest_framework import serializers
@@ -1208,7 +1209,15 @@ def _apply_once_schedule(task):
 
     if task.schedule_type == AITask.SCHEDULE_ONCE:
         if task.run_time:
-            now = _tz.localtime()
+            # Same clock as every other wall-clock schedule (AITask.effective_timezone):
+            # a one-time 03:00 must mean the same 03:00 the daily version would.
+            try:
+                from zoneinfo import ZoneInfo
+
+                zone = ZoneInfo(task.effective_timezone)
+            except Exception:
+                zone = None
+            now = _tz.now().astimezone(zone) if zone else _tz.localtime()
             target = now.replace(
                 hour=task.run_time.hour,
                 minute=task.run_time.minute,
@@ -1345,8 +1354,50 @@ class AIHistoryScope(APIView):
             data = r.json()
         except Exception:
             data = {"sessions": []}
-        for s in data.get("sessions", []):
+        # Same rule as the per-device tab (AgentPiHistory): cost comes from the ledger,
+        # and a conversation whose transcript was deleted still shows what it spent.
+        from core.models import AISpendEntry, session_spend_map
+
+        spend = session_spend_map(AISpendEntry.objects.filter(agent__agent_id__in=amap))
+        sessions = data.get("sessions") or []
+        for s in sessions:
             s["hostname"] = amap.get(s.get("agent_id"), "")
+            row = spend.pop(s.get("session_id") or "", None)
+            s["cost"] = round(row["cost"], 6) if row else 0.0
+            s["cost_turns"] = row["turns"] if row else 0
+            if row:
+                s["cost_models"] = row["models"]
+                s["cost_recovered"] = row["backfilled"]
+        if spend:
+            # Rows we could not match to a live session: attribute them by agent so the
+            # money still appears against the right machine.
+            by_agent = {
+                r["session_id"]: r["agent__agent_id"]
+                for r in AISpendEntry.objects.filter(agent__agent_id__in=amap)
+                .values("session_id", "agent__agent_id")
+                .distinct()
+            }
+            for sid, row in spend.items():
+                aid = by_agent.get(sid, "")
+                sessions.append({
+                    "session_id": sid,
+                    "agent_id": aid,
+                    "hostname": amap.get(aid, ""),
+                    "name": "(transcript deleted)",
+                    "label": "",
+                    "user": row["actor"],
+                    "model": (row["models"] or [""])[0],
+                    "started": row["first"].isoformat() if row["first"] else "",
+                    "last_activity": row["last"].isoformat() if row["last"] else "",
+                    "last_message": "",
+                    "multi": False,
+                    "transcript_deleted": True,
+                    "cost": round(row["cost"], 6),
+                    "cost_turns": row["turns"],
+                    "cost_models": row["models"],
+                    "cost_recovered": row["backfilled"],
+                })
+        data["sessions"] = sessions
         return Response(data)
 
 
@@ -1910,37 +1961,27 @@ class AIReportScheduleDetail(APIView):
         return Response("ok")
 
     def post(self, request, pk):
-        """Send it now, without disturbing its schedule state."""
-        from django.utils import timezone as djangotime
+        """Send it now, without disturbing its schedule state.
 
+        Handed to Celery rather than run here. These reports take four to six minutes, and
+        uwsgi's harakiri is 300s, so running one inline gets the worker killed part-way and
+        the email never goes out while the UI shows a 502. The task owns stamping last_run
+        and last_result, so the result still lands on the schedule row either way.
+        """
         from core.models import AIReportSchedule
-        from core.tasks import (send_daily_ticket_report, send_open_ticket_review,
-                                send_tech_productivity_report,
-                                send_ai_spend_report)
+        from core.tasks import run_ai_report_now
 
         sch = get_object_or_404(AIReportSchedule, pk=pk)
         rcpt = sch.recipients or ""
-        opts = sch.options if isinstance(sch.options, dict) else {}
         to = [x.strip() for x in rcpt.replace(";", ",").split(",") if x.strip()]
         if not to:
             return notify_error("This report has no recipients yet.")
-        if sch.kind == "tech_productivity":
-            res = send_tech_productivity_report(hours=sch.effective_window_hours,
-                                               recipients_override=rcpt, options=opts)
-        elif sch.kind == "ai_spend":
-            res = send_ai_spend_report(hours=sch.effective_window_hours,
-                                      recipients_override=rcpt, options=opts)
-        elif sch.kind == "open_tickets":
-            res = send_open_ticket_review(force=True, recipients_override=to,
-                                         hours=sch.effective_window_hours,
-                                         stamp_core=False, options=opts)
-        else:
-            res = send_daily_ticket_report(force=True, hours=sch.effective_window_hours,
-                                          recipients_override=rcpt, stamp_core=False, options=opts)
-        sch.last_run = djangotime.now()
-        sch.last_result = f"manual: {res}"[:1000]
-        sch.save(update_fields=["last_run", "last_result"])
-        return Response(str(res))
+
+        run_ai_report_now.delay(sch.pk)
+        return Response(
+            f"Started - {sch.name} is generating now and will be emailed to "
+            f"{', '.join(to)} in a few minutes. The result appears on this row when it finishes."
+        )
 
 
 class AISpendEntryView(APIView):
@@ -1971,13 +2012,13 @@ class AISpendEntryView(APIView):
         from django.db.models import Count, DecimalField, Max, Sum, Value
         from django.db.models.functions import Coalesce
 
-        from core.models import AISpendEntry
+        from core.models import AISpendEntry, session_scope_q
 
         session_id = str(request.query_params.get("session_id") or "").strip()
         ticket = str(request.query_params.get("ticket_ref") or "").strip()
         agent_id = str(request.query_params.get("agent_id") or "").strip()
         if session_id:
-            rows = AISpendEntry.objects.filter(session_id=session_id)
+            rows = AISpendEntry.objects.filter(session_scope_q(session_id))
         elif ticket:
             rows = AISpendEntry.objects.filter(ticket_ref=ticket)
         elif agent_id:
@@ -2417,6 +2458,328 @@ class AIProcedureDetail(APIView):
         return Response({"deleted": True})
 
 
+class AITicketAutomationSubjects(APIView):
+    """Ticket Automation Subjects: the kinds of ticket the AI may work alone.
+    GET lists; POST creates (approved immediately - a human made it)."""
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def get(self, request):
+        from core.models import AITicketAutomationSubject
+        from core.serializers import AITicketAutomationSubjectSerializer
+
+        qs = AITicketAutomationSubject.objects.prefetch_related("procedures").all()
+        st = (request.query_params.get("status") or "").strip()
+        if st:
+            qs = qs.filter(status=st)
+        return Response({
+            "subjects": AITicketAutomationSubjectSerializer(qs, many=True).data,
+            "modes": AITicketAutomationSubject.MODE,
+        })
+
+    def post(self, request):
+        from django.utils import timezone as _tz
+
+        from core.serializers import AITicketAutomationSubjectSerializer
+
+        data = dict(request.data)
+        data.setdefault("status", "approved")
+        ser = AITicketAutomationSubjectSerializer(data=data)
+        ser.is_valid(raise_exception=True)
+        obj = ser.save(approved_at=_tz.now(), approved_by=request.user.username)
+        return Response(AITicketAutomationSubjectSerializer(obj).data)
+
+
+class AITicketAutomationSubjectDetail(APIView):
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def _obj(self, pk):
+        from core.models import AITicketAutomationSubject
+
+        return get_object_or_404(AITicketAutomationSubject, pk=pk)
+
+    def put(self, request, pk):
+        from django.utils import timezone as _tz
+
+        from core.serializers import AITicketAutomationSubjectSerializer
+
+        obj = self._obj(pk)
+        was = obj.status
+        ser = AITicketAutomationSubjectSerializer(obj, data=dict(request.data), partial=True)
+        ser.is_valid(raise_exception=True)
+        obj = ser.save()
+        if obj.status == "approved" and was != "approved":
+            obj.approved_at = _tz.now()
+            obj.approved_by = request.user.username
+            obj.save(update_fields=["approved_at", "approved_by"])
+        return Response(AITicketAutomationSubjectSerializer(obj).data)
+
+    def delete(self, request, pk):
+        self._obj(pk).delete()
+        return Response({"deleted": True})
+
+
+class AutomationSubjectDecide(APIView):
+    """One-click approve/reject from the daily report email. No login: the 40-character
+    single-use token IS the credential, and the only thing it can do is flip ONE proposal
+    to approved or rejected. It cannot edit rules or widen a mode. Consumed on use."""
+
+    permission_classes = []
+    authentication_classes = []
+
+    def get(self, request, action, token):
+        from django.http import HttpResponse
+        from django.utils import timezone as _tz
+        from html import escape
+
+        from core.models import AITicketAutomationSubject
+
+        token = str(token or "")[:64]
+        field = "approve_token" if action == "approve" else "reject_token"
+        if action not in ("approve", "reject") or not token:
+            return HttpResponse("Bad request", status=400)
+        subj = AITicketAutomationSubject.objects.filter(**{field: token}).first()
+        page = lambda title, body, color: HttpResponse(  # noqa: E731
+            "<!doctype html><html><head><meta charset='utf-8'><title>%s</title></head>"
+            "<body style='font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:60px auto;color:#1f2937'>"
+            "<div style='border-left:6px solid %s;padding:16px 20px;background:#f9fafb'>"
+            "<h2 style='margin:0 0 8px'>%s</h2><div>%s</div></div></body></html>"
+            % (escape(title), color, escape(title), body)
+        )
+        if not subj:
+            return page("Link already used or invalid",
+                        "This approval link has been used, or does not match a pending proposal. "
+                        "Nothing was changed. Open the Procedures page to manage subjects.", "#6b7280")
+        if subj.status != "proposed":
+            return page(f"Already {subj.status}",
+                        f"<b>{escape(subj.name)}</b> is already <b>{escape(subj.status)}</b>. Nothing was changed.",
+                        "#6b7280")
+        if action == "approve":
+            subj.status = "approved"
+            subj.enabled = True
+            subj.approved_at = _tz.now()
+            subj.approved_by = "email-link"
+            subj.approve_token = ""
+            subj.reject_token = ""
+            subj.save()
+            return page("Approved - live",
+                        f"<b>{escape(subj.name)}</b> is now live in <b>{escape(subj.get_mode_display())}</b> mode. "
+                        "Matching tickets that arrive from now on will be worked automatically. "
+                        "The AI never closes a ticket under a subject and replies only on a confident verdict. "
+                        "Edit, narrow or switch it off any time on the Procedures page &rarr; Ticket Automation Subjects.",
+                        "#166534")
+        subj.status = "rejected"
+        subj.enabled = False
+        subj.approve_token = ""
+        subj.reject_token = ""
+        subj.save()
+        return page("Rejected",
+                    f"<b>{escape(subj.name)}</b> was rejected and will not be proposed again under that name.",
+                    "#991b1b")
+
+
+class AIMobileInbox(APIView):
+    """Everything this user may work on from the phone app: every AI Decision (ticket chat)
+    and every Pi device chat on the agents their role can see, with which of them are LIVE
+    on the bridge right now and who is driving. One call; the app renders a list."""
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def get(self, request):
+        import requests as _requests
+
+        from agents.models import Agent
+        from core.models import AIDecisionRequest, AITicketState
+
+        bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+        live = {}
+        try:
+            for row in _requests.get(f"{bridge}/pi/live", timeout=5).json().get("live", []):
+                live[(row["scope"], row["session_id"])] = row
+        except Exception:
+            live = {}
+        live_by_scope = {}
+        for (scope, sid), row in live.items():
+            live_by_scope.setdefault(scope, []).append({**row, "session_id": sid})
+
+        # WHO AM I, to the helpdesk and to the bridge? "My tickets" = assigned to me in the
+        # helpdesk (Odoo user id, resolved once via the read-only find_staff_user op and
+        # cached), OR being driven by me right now, OR the last person to work its chat.
+        from django.core.cache import cache
+
+        from core.ai_autowork import hd_op
+
+        me = request.user
+        my_names = {x.strip().lower() for x in (me.username, me.first_name, me.last_name,
+                    f"{me.first_name} {me.last_name}".strip(), (me.email or "").split("@")[0],
+                    me.username.split("@")[0]) if x and x.strip()}
+        ck = f"pi_staff_odoo_id:{me.pk}"
+        my_odoo_id = cache.get(ck)
+        if my_odoo_id is None:
+            try:
+                core = get_core_settings()
+                found = hd_op(core, "find_staff_user", {
+                    "email": me.email or me.username, "name": f"{me.first_name} {me.last_name}".strip()}) or {}
+                my_odoo_id = int(found.get("id") or 0) if found.get("found") else 0
+            except Exception:
+                my_odoo_id = 0
+            cache.set(ck, my_odoo_id, 3600)
+
+        def is_me(name) -> bool:
+            n = str(name or "").strip().lower()
+            return bool(n) and (n in my_names or any(x and (x in n or n in x) for x in my_names if len(x) > 3))
+
+        # Assignee per OPEN ticket, from the helpdesk itself (one call). The state table only
+        # records an assignee when the bot claims a ticket, so it cannot answer "assigned to
+        # me"; the helpdesk can, for every open ticket including those a technician owns.
+        assignee_by_ref = {}
+        open_rows = []
+        try:
+            core_s = get_core_settings()
+            open_rows = hd_op(core_s, "list_open_tickets", {"all_assignees": True}) or []
+            for row in open_rows:
+                if row.get("ref"):
+                    assignee_by_ref[row["ref"]] = {"id": row.get("assignee_id") or 0, "name": row.get("assignee") or ""}
+        except Exception:
+            assignee_by_ref = {}
+            open_rows = []
+
+        # WHICH THREADS DOES THIS PERSON NEED TO SEE?
+        #
+        # Recency alone was wrong. Triage updates hundreds of rows a day, so a window of
+        # "the newest N by updated" is churned by automation - and the tickets a human has
+        # ESCALATED are old by definition (they have been waiting). Every Tier - 3 ticket
+        # fell off the list: 8 of them, all with threads, none visible. So the rule is now
+        # STATE first, recency second: every OPEN ticket is always listed, and recent
+        # activity fills the rest.
+        open_refs = [r["ref"] for r in (open_rows or []) if r.get("ref")]
+        recent_qs = AIDecisionRequest.objects.order_by("-updated")[:300]
+        by_ref = {}
+        for d in recent_qs:
+            by_ref.setdefault(d.ticket_ref, d)
+        if open_refs:
+            missing = [r for r in open_refs if r not in by_ref]
+            for d in AIDecisionRequest.objects.filter(ticket_ref__in=missing).order_by("-updated"):
+                by_ref.setdefault(d.ticket_ref, d)
+        # CRM discovery threads are never "open tickets"; list them on their own merit.
+        for d in AIDecisionRequest.objects.filter(subject_kind="crm").order_by("-updated")[:50]:
+            by_ref.setdefault(d.subject_ref or d.ticket_ref, d)
+        dec_rows = sorted(by_ref.values(), key=lambda x: x.updated, reverse=True)
+
+        # Last person to work each ticket's chat, from the bridge's history index.
+        last_worked = {}
+        refs = [d.ticket_ref for d in dec_rows]
+        # CURRENT STAGE + assignee for EVERY listed ticket, open or closed, in one helpdesk
+        # call. A closed ticket you last worked is still yours - it is shown, with its stage,
+        # not hidden; and this covers assignment on closed tickets that list_open_tickets
+        # cannot see.
+        stages = {}
+        try:
+            stages = hd_op(get_core_settings(), "get_ticket_stages",
+                           {"refs": [r for r in refs if not r.startswith("LEAD/")]}) or {}
+        except Exception:
+            stages = {}
+        # CRM discovery threads live in a different table, so their stage comes from the
+        # opportunity. There are only ever a handful, so one call each is fine.
+        for d in dec_rows:
+            if d.subject_kind != "crm":
+                continue
+            try:
+                o = hd_op(get_core_settings(), "get_opportunity",
+                          {"lead": d.subject_key, "messages": 0}) or {}
+                if not o.get("error"):
+                    stages[d.ticket_ref] = {"stage": o.get("stage") or "", "stage_id": o.get("stage_id") or 0,
+                                            # An opportunity is "closed" when it is won or lost; neither
+                                            # should be hidden from the engineer who scoped it.
+                                            "closed": False, "assignee": o.get("salesperson") or ""}
+            except Exception:
+                pass
+        try:
+            r = _requests.post(f"{bridge}/pi/history_bulk",
+                               json={"agent_ids": [f"decision:{ref}" for ref in refs]}, timeout=20)
+            for srow in r.json().get("sessions", []):
+                ref = str(srow.get("agent_id") or "").replace("decision:", "", 1)
+                prev = last_worked.get(ref)
+                if not prev or str(srow.get("last_activity") or "") > str(prev.get("last_activity") or ""):
+                    last_worked[ref] = srow
+        except Exception:
+            last_worked = {}
+
+        # Ticket chats: newest first, open ones first.
+        states = {t.ticket_ref: t for t in AITicketState.objects.order_by("-created")[:900]}
+        subj_by_ref = {r.get("ref"): r for r in (open_rows or []) if r.get("ref")}
+        decisions = []
+        for d in dec_rows:
+            st = states.get(d.ticket_ref)
+            ctx = d.context if isinstance(d.context, dict) else {}
+            lv = live_by_scope.get(f"decision:{d.ticket_ref}") or []
+            lw = last_worked.get(d.ticket_ref) or {}
+            hd_as = assignee_by_ref.get(d.ticket_ref) or {}
+            stg = stages.get(d.ticket_ref) or {}
+            assignee_id = int(hd_as.get("id") or 0) or (int(st.assignee_seen) if (st and str(st.assignee_seen or "").isdigit()) else 0)
+            assignee_name = hd_as.get("name") or (stg.get("assignee") if not stg.get("assignee_is_bot") else "") or ""
+            driver = lv[0]["driver"] if lv else None
+            mine = bool((my_odoo_id and assignee_id == my_odoo_id) or is_me(assignee_name)
+                        or is_me(driver) or is_me(lw.get("user")))
+            decisions.append({
+                "kind": "decision", "ticket_ref": d.ticket_ref, "token": d.token,
+                "status": d.status, "updated": d.updated.isoformat(),
+                "subject": ((st.subject if st else "") or ctx.get("subject")
+                            or (subj_by_ref.get(d.ticket_ref) or {}).get("subject") or ""),
+                "client": ctx.get("client") or "", "summary": (ctx.get("summary") or d.question or "")[:240],
+                "requester": (st.requester if st else "") or ctx.get("requester") or "",
+                "assignee_id": assignee_id, "assignee": assignee_name,
+                "assigned_to_me": bool((my_odoo_id and assignee_id == my_odoo_id) or is_me(assignee_name)),
+                "open": (not stg.get("closed")) if stg else (d.ticket_ref in assignee_by_ref),
+                "stage": stg.get("stage") or "",
+                "stage_id": stg.get("stage_id") or 0,
+                # Authoritative, by stage id from the helpdesk - never guessed from the
+                # stage's name (see get_ticket_stages).
+                "closed": bool(stg.get("closed")) if stg else False,
+                "subject_kind": d.subject_kind,
+                "last_worked_by": lw.get("user") or "", "last_worked_at": lw.get("last_activity") or "",
+                "mine": mine,
+                "ticket_status": st.status if st else "", "classification": st.classification if st else "",
+                "live": bool(lv), "driver": driver,
+                "streaming": bool(lv and lv[0].get("streaming")),
+                "url": f"/ai-decision/{d.token}",
+            })
+
+        # Device chats on permitted agents.
+        permitted = Agent.objects.filter_by_role(request.user).select_related("site__client")  # type: ignore
+        amap = {a.agent_id: a for a in permitted}
+        chats = []
+        if amap:
+            try:
+                r = _requests.post(f"{bridge}/pi/history_bulk",
+                                   json={"agent_ids": list(amap.keys())}, timeout=30)
+                sessions = r.json().get("sessions", [])
+            except Exception:
+                sessions = []
+            for s in sessions:
+                a = amap.get(s.get("agent_id"))
+                lv = live.get((s.get("agent_id"), s.get("session_id")))
+                chats.append({
+                    "mine": bool(is_me(s.get("user")) or (lv and is_me(lv.get("driver")))),
+                    "kind": "chat", "agent_id": s.get("agent_id"), "hostname": a.hostname if a else "",
+                    "client": a.site.client.name if a else "", "session_id": s.get("session_id"),
+                    "label": s.get("label") or "", "name": s.get("name") or "",
+                    "summary": (s.get("last_message") or "")[:240], "user": s.get("user") or "",
+                    "updated": s.get("last_activity") or s.get("started") or "",
+                    "live": bool(lv), "driver": (lv["driver"] if lv else None), "streaming": bool(lv and lv.get("streaming")),
+                    "url": f"/pichat/{s.get('agent_id')}?resume={s.get('session_id')}",
+                })
+            chats.sort(key=lambda c: (not c["live"], c["updated"]), reverse=False)
+            chats.sort(key=lambda c: c["updated"], reverse=True)
+            chats.sort(key=lambda c: not c["live"])
+        agents = [{"agent_id": a.agent_id, "hostname": a.hostname, "client": a.site.client.name, "online": a.status == "online"}
+                  for a in sorted(amap.values(), key=lambda x: x.hostname.lower())]
+        return Response({"decisions": decisions, "chats": chats[:300], "agents": agents,
+                         "me": {"username": request.user.username, "odoo_user_id": my_odoo_id,
+                                "display": f"{me.first_name} {me.last_name}".strip() or me.username,
+                                "can_take_over": bool(request.user.is_superuser or (request.user.role and getattr(request.user.role, "can_take_over_ai_session", False)))}})
+
+
 class AIProceduresMineNow(APIView):
     """Manually trigger a procedure-mining run now (respects the backfill/incremental
     window). Handy for a first backfill without waiting for the schedule."""
@@ -2495,6 +2858,10 @@ class AIDecisionSession(APIView):
         # Auto-credential is its OWN grant, not a side effect of Auto-approve: approving a
         # device change and handing over a live password are different decisions.
         ac = bool(is_super or (user.role and user.role.can_use_ai_autocredential))
+        # Sales/ERP is its own grant too. When the role does not have it the quotation
+        # tool is not shipped to the bridge at all (blank sales_code below), so it cannot
+        # be called, listed or hinted at - a permission, not a prompt.
+        sales_ok = bool(is_super or (user.role and user.role.can_use_ai_sales))
         enabled = AIModel.objects.filter(enabled=True, provider__enabled=True).select_related("provider")
         if is_super:
             allowed = list(enabled)
@@ -2532,11 +2899,65 @@ class AIDecisionSession(APIView):
             dj_settings.CORS_ORIGIN_WHITELIST[0]
             if getattr(dj_settings, "CORS_ORIGIN_WHITELIST", None) else ""
         )
+        # WHAT IS THIS THREAD ABOUT? A helpdesk ticket, or (2026-09-16) a CRM opportunity
+        # being scoped before a quote. The opportunity is read here rather than in the
+        # bridge so the window opens with the brief, the chatter and any existing
+        # quotations already in context - discovery starts from what is known.
+        from core.ai_autowork import hd_op as _hdop2
+
+        _is_crm = d.subject_kind == "crm"
+        _opp = {}
+        _stages_now = {}
+        if _is_crm:
+            try:
+                _opp = _hdop2(core, "get_opportunity", {"lead": d.subject_key}) or {}
+            except Exception:
+                _opp = {}
+            if _opp.get("error"):
+                return notify_error(f"Cannot read {d.subject_key}: {_opp['error']}")
+        else:
+            try:
+                _stages_now = _hdop2(core, "get_ticket_stages", {"refs": [d.ticket_ref]}) or {}
+            except Exception:
+                _stages_now = {}
+        # Owner's rule: any agent checks first whether this thing is already being worked.
+        _already = None
+        try:
+            if _is_crm:
+                raise RuntimeError("not applicable to a CRM subject")
+            from core.ai_workclaims import already_being_worked
+
+            _ctx = d.context if isinstance(d.context, dict) else {}
+            _already = already_being_worked(
+                subject_line=str(_ctx.get("summary") or _ctx.get("subject") or ""),
+                requester_email=str(_ctx.get("requester") or ""),
+                customer=str(_ctx.get("client") or ""),
+                exclude_ticket=d.ticket_ref,
+            )
+            if _already:
+                _already = {"ticket_ref": _already["ticket_ref"], "worker": _already["worker"],
+                            "what": _already["what"]}
+        except Exception:
+            _already = None
         blob = {
             "kind": "decision",
             "ticket_ref": d.ticket_ref,
+            "already_worked": _already,
+            "ticket_stage": (_opp.get("stage") or "") if _is_crm
+            else ((_stages_now.get(d.ticket_ref) or {}).get("stage") or ""),
+            # Subject of the thread. The bridge builds a different tool belt and a
+            # different ceiling from these two fields (see startDecisionChat).
+            "subject_kind": d.subject_kind,
+            "subject_ref": d.subject_key,
+            "discovery_prompt": (getattr(core, "ai_discovery_prompt", "") or "") if _is_crm else "",
             "decision_url": f"{base_url}/ai-decision/{token}" if base_url else "",
             # Controls shown in the window (mirror the device chat).
+            # Write mode on a discovery session follows the SAME role permission as
+            # everywhere else (can_use_ai_mutate). It starts OFF, as it does on a ticket,
+            # because surveying an estate to price work rarely needs to change it - but a
+            # technician who is allowed to make changes is allowed to make them here too:
+            # discovery routinely turns into "while I'm in here, fix it". What stays
+            # refused regardless is customer contact (the rep owns that) and pricing.
             "mutate_allowed": mut,
             "allow_mutating": False,  # Write mode OFF by default - tech must enable it (needs can_use_ai_mutate)
             "autoapprove_allowed": aa,
@@ -2548,10 +2969,17 @@ class AIDecisionSession(APIView):
             "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             # May this ticket window be paired to a phone? See core/ai_remote.py.
             **remote_blob_fields(core, user, is_super),
-            "allow_email": True,      # Allow customer email ON by default
+            # Discovery starts with CUSTOMER email off - a stray message here goes to a
+            # prospect, and that conversation is the sales rep's. The technician can switch
+            # it on in the window when they mean to; internal email (our own domain) does
+            # not need it, only Write mode or an approval click. See send_email in tools.js.
+            "allow_email": False if _is_crm else True,
             "require_approval": True,
             "question": d.question,
-            "context": d.context,
+            "context": ({**(d.context if isinstance(d.context, dict) else {}),
+                         "opportunity": _opp,
+                         "client": (d.context or {}).get("client") or _opp.get("partner") or ""}
+                        if _is_crm else d.context),
             "username": user.username,
             # Identity of the tech working this chat, so the bridge can assign the
             # ticket to them (matched to an Odoo user) as soon as they start talking.
@@ -2599,9 +3027,12 @@ class AIDecisionSession(APIView):
                 "api_key": core.ai_helpdesk_api_key or "",
             },
             "helpdesk_code": core.ai_helpdesk_code or "",
-            "sales_enabled": bool(getattr(core, "ai_sales_enabled", False)),
-            "sales_prompt": getattr(core, "ai_sales_prompt", "") or "",
-            "sales_code": (getattr(core, "ai_sales_code", "") or "") if getattr(core, "ai_sales_enabled", False) else "",
+            # Two locks, both must be open: the global switch (is the ERP wired up at all)
+            # and this technician's role permission (may THEY work in it).
+            "sales_enabled": bool(getattr(core, "ai_sales_enabled", False) and sales_ok),
+            "sales_allowed": sales_ok,
+            "sales_prompt": (getattr(core, "ai_sales_prompt", "") or "") if sales_ok else "",
+            "sales_code": (getattr(core, "ai_sales_code", "") or "") if (getattr(core, "ai_sales_enabled", False) and sales_ok) else "",
             # Same Odoo credentials as helpdesk
             "sales_api": {
                 "base_url": core.ai_helpdesk_api_base_url or "",
@@ -2614,9 +3045,11 @@ class AIDecisionSession(APIView):
         return Response({
             "token": pi_token,
             "ticket_ref": d.ticket_ref,
-            "hostname": f"Ticket {d.ticket_ref}",
-            "client": (d.context or {}).get("client") or "",
-            "site": (d.context or {}).get("affected_device") or "",
+            "subject_kind": d.subject_kind,
+            "subject_ref": d.subject_key,
+            "hostname": (f"Opportunity {d.subject_key}" if _is_crm else f"Ticket {d.ticket_ref}"),
+            "client": (d.context or {}).get("client") or _opp.get("partner") or _opp.get("email_domain") or "",
+            "site": (_opp.get("name") or "") if _is_crm else ((d.context or {}).get("affected_device") or ""),
             "model_id": chosen.model_id,
             "model_display": chosen.display_name,
             "allowed_models": [mdict(m) for m in allowed],
@@ -2633,6 +3066,202 @@ class AIDecisionSession(APIView):
                 {"agent_id": m["agent_id"], "hostname": m["hostname"]}
                 for m in operator_policy["machines"]
             ],
+        })
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AutoworkDuplicates(APIView):
+    """Which tickets are held behind the one the automation is working RIGHT NOW.
+
+    Asked by the unattended session itself (tool: list_duplicate_tickets), because a
+    duplicate usually arrives WHILE the first ticket is being worked - TICKET/61475 landed
+    three minutes into TICKET/61474. Passing the list at session start would miss exactly
+    the case this exists for, so the session re-reads it before it finishes and answers
+    every ticket about the incident in one go.
+
+    Localhost only: the bridge calls it over the loopback with the TRMM API key, the same
+    way it reads agents and runs commands.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, ticket_ref):
+        from core.models import AITicketState
+
+        held = list(
+            AITicketState.objects.filter(duplicate_of=ticket_ref, status="on_hold")
+            .values("ticket_ref", "subject", "requester", "created")
+        )
+        return Response({
+            "primary": ticket_ref,
+            "duplicates": [
+                {"ticket_ref": h["ticket_ref"], "subject": h["subject"],
+                 "requester": h["requester"], "arrived": h["created"].isoformat()}
+                for h in held
+            ],
+        })
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class HelpdeskTriageHook(APIView):
+    """The helpdesk tells US the moment a ticket lands in New - no waiting for the poll.
+
+    Odoo 19 can send an outbound webhook from an automation rule (trigger "on_stage_set",
+    action state "webhook"), so this needs no Odoo module and no custom code on that side.
+    What it cannot do is set a header, so the shared secret travels in the PATH over HTTPS
+    and this view is otherwise deliberately dumb:
+
+      * it authenticates ONLY by constant-time comparison of that secret;
+      * it accepts nothing but ticket references - no state, no instructions, nothing that
+        could steer a decision. Everything about HOW a ticket is handled still comes from
+        our own side, so the worst a forged call can do is make us re-read a ticket;
+      * it does no work in-request: it hands the refs to the ORDINARY poller, scoped to
+        those tickets, so the ingest rules have exactly one implementation.
+
+    POST /core/ai/hooks/helpdesk/<secret>/   {"name": "TICKET/61470"}  (or a list, or _id)
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, secret):
+        import hmac
+
+        from django.conf import settings as dj_settings
+
+        want = str(getattr(dj_settings, "ODOO_AI_SHARED_SECRET", "") or "")
+        if not want or not hmac.compare_digest(str(secret or ""), want):
+            # Same answer for "no secret configured" and "wrong secret": a prober learns nothing.
+            return Response({"detail": "not found"}, status=404)
+
+        payload = request.data if isinstance(request.data, (dict, list)) else {}
+        rows = payload if isinstance(payload, list) else [payload]
+        refs = []
+        for row in rows[:50]:
+            if not isinstance(row, dict):
+                continue
+            for key in ("name", "ref", "ticket_ref", "display_name"):
+                v = str(row.get(key) or "").strip()
+                if v.upper().startswith("TICKET/"):
+                    refs.append(v)
+                    break
+        refs = list(dict.fromkeys(refs))[:20]
+        if not refs:
+            # An id alone is not enough: resolving it would need another Odoo round-trip,
+            # and the poller will pick the ticket up within two minutes anyway. Say so.
+            return Response({"queued": [], "detail": "no ticket reference in the payload - "
+                                                     "add the 'name' field to the webhook's fields"}, status=202)
+
+        from core.tasks import poll_helpdesk_tickets
+
+        poll_helpdesk_tickets.delay(only_refs=refs)
+        logger.info("helpdesk webhook: instant triage requested for %s", ", ".join(refs))
+        return Response({"queued": refs})
+
+
+class AIDiscoveryStart(APIView):
+    """Open (or re-open) a PRE-SALES DISCOVERY thread for a CRM opportunity.
+
+    An IT technician is assigned an opportunity and needs to find out what the customer
+    actually has before anyone can quote it. This mints ONE durable thread per
+    opportunity - the same rule the ticket path uses, for the same reason: two threads
+    for one subject means two half-conversations and two AIs that disagree.
+
+    The link is posted into the opportunity's chatter, so the sales rep (who may have no
+    RMM access at all) can see that discovery is happening and read the outcome in the
+    place they already work.
+
+    POST {"lead": "LEAD/837" | 837 | the Odoo URL}
+    """
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def post(self, request):
+        from django.conf import settings as dj_settings
+        from django.utils.crypto import get_random_string
+
+        from core.ai_autowork import hd_op
+        from core.models import AIDecisionRequest
+
+        core = get_core_settings()
+        raw = str(request.data.get("lead") or "").strip()
+        if not raw:
+            return notify_error("Which opportunity? Paste its Odoo link, or its id.")
+
+        opp = hd_op(core, "get_opportunity", {"lead": raw, "messages": 0}) or {}
+        if opp.get("error"):
+            return notify_error(f"Could not read that opportunity: {opp['error']}")
+        ref = opp.get("ref") or ""
+        if not ref:
+            return notify_error(f"That does not look like a CRM opportunity: {raw}")
+
+        # Which RMM client is this? Resolved from the opportunity's partner, else the
+        # sender's email domain - and left EMPTY rather than guessed, because a discovery
+        # session pointed at the wrong customer's devices is worse than one that asks.
+        client_name = opp.get("partner") or ""
+        if not client_name and opp.get("email_domain"):
+            try:
+                r = hd_op(core, "resolve_client_by_domain", {"domain": opp["email_domain"]}) or {}
+                client_name = r.get("client") or r.get("name") or ""
+            except Exception:
+                client_name = ""
+
+        existing = (
+            AIDecisionRequest.objects.filter(subject_kind="crm", subject_ref=ref)
+            .order_by("-updated")
+            .first()
+        )
+        created = False
+        if existing:
+            d = existing
+        else:
+            d = AIDecisionRequest.objects.create(
+                token=get_random_string(32),
+                # ticket_ref carries the subject too, so every existing consumer that
+                # keys off it (AI History, the mobile inbox, the bridge's session
+                # directory) finds this thread without being taught a new field.
+                ticket_ref=ref,
+                subject_kind="crm",
+                subject_ref=ref,
+                question="",
+                context={
+                    "subject": opp.get("name") or "",
+                    "client": client_name,
+                    "summary": (opp.get("description") or "")[:2000],
+                    "requester": opp.get("email") or "",
+                    "opportunity_url": opp.get("url") or "",
+                    "stage_at_open": opp.get("stage") or "",
+                },
+                status="open",
+            )
+            created = True
+
+        base = (
+            dj_settings.CORS_ORIGIN_WHITELIST[0]
+            if getattr(dj_settings, "CORS_ORIGIN_WHITELIST", None) else ""
+        )
+        url = f"{base}/ai-decision/{d.token}" if base else ""
+
+        # Tell the chatter, once, when the thread is first opened. Not on every resume:
+        # the rep does not need a notification each time an engineer reconnects.
+        if created and url:
+            who = (request.user.get_full_name() or request.user.username).strip()
+            try:
+                hd_op(core, "add_opportunity_note", {"lead": ref, "message":
+                      f"<p><b>Pi.dev AI - pre-sales discovery started</b> by {who}.</p>"
+                      f"<p>An engineer is surveying what the customer has so this can be quoted from fact. "
+                      f"Findings will be posted here as a scope document (current state, in/out of scope, "
+                      f"phases in engineering hours, assumptions, and what still needs confirming).</p>"
+                      f'<p><a href="{url}">Open the discovery session</a> (BlueCloud AI - RMM login required)</p>'})
+            except Exception:
+                pass   # the thread is the point; the courtesy note is not worth failing for
+
+        return Response({
+            "token": d.token, "url": url, "created": created,
+            "subject_ref": ref, "opportunity": opp.get("name") or "",
+            "stage": opp.get("stage") or "", "client": client_name,
+            "odoo_url": opp.get("url") or "",
+            "quotations": opp.get("quotations") or [],
         })
 
 

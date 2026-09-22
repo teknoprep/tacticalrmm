@@ -669,3 +669,4 @@ class TestCoreUtils(TacticalTestCase):
             r,
             "http://127.0.0.1:8653/meshagents?id=4&meshid=abc123&installflags=0",
         )
+

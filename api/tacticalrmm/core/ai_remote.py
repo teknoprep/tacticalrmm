@@ -30,13 +30,17 @@ def remote_blob_fields(core, user, is_super=False):
     browser's bridge session, so it should carry the address only when this window is
     genuinely allowed to dial it.
     """
-    relay = (getattr(core, "ai_remote_relay_url", "") or "").strip()
-    allowed = bool(
-        relay
-        and getattr(core, "ai_remote_enabled", False)
-        and (is_super or (user.role and user.role.can_use_ai_remote))
-    )
+    # RETIRED 2026-09-15. The phone-relay "remote" feature is gone: the mobile app is a
+    # viewer of the server-resident session like any browser (see pibridge/src/live-hub.js).
+    # This helper now carries the fields that replaced it, so every session blob - device
+    # chat, multi-machine chat, decision chat - gets them from one place.
+    role = getattr(user, "role", None)
     return {
-        "remote_allowed": allowed,
-        "remote_relay_url": relay if allowed else "",
+        "remote_allowed": False,
+        "remote_relay_url": "",
+        # How long the session survives with nobody watching (Global Setting; 0 = forever).
+        "detach_grace_minutes": int(getattr(core, "ai_chat_detach_grace_minutes", 5) or 0),
+        # Seat rules (live-presence.js): superusers are admins; the role grants take-over.
+        "is_superuser": bool(is_super),
+        "can_take_over_ai_session": bool(is_super or (role and getattr(role, "can_take_over_ai_session", False))),
     }

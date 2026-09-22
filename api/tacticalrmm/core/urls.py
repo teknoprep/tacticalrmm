@@ -16,6 +16,14 @@ urlpatterns = [
     path("ai/odoo/ui-config/", odoo_ai.ui_config),
     path("ai/odoo/brand/", odoo_ai.brand),
     path("ai/odoo/decision/", odoo_ai.decision),
+    # Pre-sales discovery on a CRM opportunity (one durable thread per opportunity).
+    path("ai/discovery/start/", views.AIDiscoveryStart.as_view()),
+    # The helpdesk's own automation rule calls this the moment a ticket enters New, so
+    # triage starts in seconds instead of waiting for the 2-minute poll. Secret in the
+    # path because an Odoo webhook cannot send a header - see HelpdeskTriageHook.
+    path("ai/hooks/helpdesk/<str:secret>/", views.HelpdeskTriageHook.as_view()),
+    # Asked by an unattended session: which tickets are held behind the one I am working?
+    path("ai/autowork/duplicates/<path:ticket_ref>/", views.AutoworkDuplicates.as_view()),
     path("ai/odoo/work/", odoo_ai.work),
     path("settings/", views.GetEditCoreSettings.as_view()),
     path("version/", views.version),
@@ -77,6 +85,11 @@ urlpatterns = [
     path("ai/procedures/mining-status/", views.AIProceduresMiningStatus.as_view()),
     path("ai/procedures/mining-stop/", views.AIProceduresMiningStop.as_view()),
     path("ai/procedures/<int:pk>/", views.AIProcedureDetail.as_view()),
+    path("ai/mobile/inbox/", views.AIMobileInbox.as_view()),
+    path("ai/automation-subjects/", views.AITicketAutomationSubjects.as_view()),
+    path("ai/automation-subjects/<int:pk>/", views.AITicketAutomationSubjectDetail.as_view()),
+    # Unauthenticated by design: tokenised one-click decision from the report email.
+    path("ai/automation-subjects/decide/<str:action>/<str:token>/", views.AutomationSubjectDecide.as_view()),
     path("ai/runs/", views.AITaskRuns.as_view()),
     path("ai/history-scope/", views.AIHistoryScope.as_view()),
     path("ai/runs/<str:run_id>/live/", views.AITaskRunLive.as_view()),

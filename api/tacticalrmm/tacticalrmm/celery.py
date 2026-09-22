@@ -86,9 +86,25 @@ app.conf.beat_schedule = {
         "schedule": crontab(),
     },
     # AI ticket automation poller (no-op unless enabled in Global Settings)
+    # Every 2 minutes (owner, 2026-09-17). This is the SAFETY NET: the helpdesk's own
+    # automation rule webhooks us the moment a ticket enters New, so normal arrivals are
+    # triaged in seconds. The poll still exists to catch what a webhook cannot - our own
+    # downtime, an Odoo automation someone disables, and the re-engage loop on tickets that
+    # get a customer reply.
+    # Ticks every minute; the TASK decides whether the poll is due, from
+    # CoreSettings.ai_ticket_poll_minutes (default 10). That keeps the interval editable in
+    # Global Settings instead of in this file, where changing it needs a deploy and a
+    # celerybeat restart - and a restart is exactly what we forget.
     "poll-helpdesk-tickets": {
         "task": "core.tasks.poll_helpdesk_tickets",
-        "schedule": timedelta(seconds=90.0),
+        "schedule": timedelta(seconds=60.0),
+    },
+    # Third line of defence for AI spend: the live POST, then the bridge's retry outbox,
+    # then this - a nightly transcript-vs-ledger reconciliation. See
+    # core.tasks.reconcile_ai_spend and `manage.py backfill_ai_spend`.
+    "reconcile-ai-spend": {
+        "task": "core.tasks.reconcile_ai_spend",
+        "schedule": crontab(minute=40, hour=3),
     },
     "refresh-ai-model-catalog": {
         "task": "core.tasks.refresh_ai_model_catalog",
@@ -109,6 +125,14 @@ app.conf.beat_schedule = {
     "ai-capability-health": {
         "task": "core.tasks.check_ai_capability_health",
         "schedule": crontab(minute=23),
+    },
+    # Every entry in THIS dict is a string the worker must be able to resolve. Nothing used
+    # to check that, so a lost @app.task decorator killed the ticket poller for 3 days with
+    # only a log line to show for it (2026-09-17). This task compares beat_schedule against
+    # the worker's registry and files an internal notice when a name is missing.
+    "beat-task-registry-health": {
+        "task": "core.tasks.check_beat_task_registry",
+        "schedule": crontab(minute=9),
     },
     # The other half of known-condition suppression: notice when a tracked condition stops
     # recurring and close its tracker with the evidence. Once a day is the right cadence -

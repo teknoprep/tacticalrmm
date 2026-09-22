@@ -186,6 +186,22 @@ class Role(BaseAuditModel):
     # setting. Superusers have it implicitly, like the other AI permissions - the switch
     # that actually decides whether ANY of this is reachable is the blank relay URL.
     can_use_ai_remote = models.BooleanField(default=False)
+    # Touch the Sales/ERP side at all: create, read or amend an Odoo quotation from an
+    # AI window (the sales_call tool). This is the ONLY thing standing between a role and
+    # the quotation book, which is why it is a permission and not a per-call prompt.
+    #
+    # Rationale (replaces the old "sales always prompts, Auto-approve cannot skip" rule):
+    # a quotation is a DRAFT commercial document, not an irreversible act like emailing a
+    # customer or closing a ticket - it can be edited or deleted, and nobody outside the
+    # company sees it until a human sends it. Asking a technician to click Approve for
+    # every dry-run and every re-word taught them to click Approve without reading, which
+    # is worse than the risk it was guarding. So the decision moves UP: the role either
+    # may work in the ERP or it may not, and inside a window the ordinary Write mode +
+    # Auto-approve switches govern the prompting, exactly as they do for device changes.
+    #
+    # Without this permission the sales tool is not merely gated - it is never built, so
+    # the model cannot see it or mention it. Superusers always have it.
+    can_use_ai_sales = models.BooleanField(default=False)
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )

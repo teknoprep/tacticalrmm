@@ -70,8 +70,20 @@ def evaluate_match(spec: Dict[str, Any], *, subject: str, body: str, sender: str
 
     br = spec.get("body_regex")
     if br:
-        rx = _rx(str(br))
-        if not rx or not rx.search(body):
+        # A string, or a LIST of alternatives (any one may match). The list form exists
+        # because one pattern is capped at MAX_PATTERN characters and a rule that says
+        # "the customer is asking about an email" legitimately needs a dozen phrasings -
+        # and a too-long pattern used to fail SILENTLY as "no match", which is the worst
+        # possible failure for a rule someone approved.
+        pats = br if isinstance(br, list) else [br]
+        hay_b = f"{subject}\n{body}"
+        hit = False
+        for one in pats:
+            rx = _rx(str(one))
+            if rx and rx.search(hay_b):
+                hit = True
+                break
+        if not hit:
             return False, {}
 
     sender_rx = spec.get("sender_regex")

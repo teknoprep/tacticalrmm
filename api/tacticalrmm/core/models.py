@@ -169,6 +169,17 @@ class CoreSettings(BaseAuditModel):
     # the helpdesk.js cancel_ticket op; actionable alerts are claimed (assigned to
     # the AI bot) and annotated, left open for work. When False = shadow only.
     ai_ticket_act_on_alerts = models.BooleanField(default=False)
+    # HOW OFTEN THE SAFETY-NET POLL RUNS, in minutes (owner, 2026-09-17).
+    #
+    # The helpdesk now webhooks us the moment a ticket enters New, so the poll is no longer
+    # how tickets get found - it is the net that catches what a webhook cannot: our own
+    # downtime, someone disabling the Odoo rule, and the re-engage loop when a customer
+    # replies to an existing ticket. 10 minutes is plenty for that.
+    #
+    # Beat still ticks every minute and the TASK decides whether it is due, so changing
+    # this takes effect immediately - no deploy, no service restart. 0 disables the poll
+    # entirely (webhook only), which is a choice an owner is allowed to make.
+    ai_ticket_poll_minutes = models.IntegerField(default=10)
     # Optional overrides for Odoo-company -> RMM-client linking when fuzzy name
     # matching isn't confident (acronyms, renames). JSON:
     #   {"by_domain": {"example.com": "RMM Client Name"},
@@ -184,6 +195,14 @@ class CoreSettings(BaseAuditModel):
     ai_procedures_backfill_days = models.PositiveIntegerField(default=120)
     ai_procedures_mining_prompt = models.TextField(blank=True, default="")
     ai_procedures_last_mined = models.DateTimeField(null=True, blank=True)
+    # AUTO-APPROVAL (owner, 2026-09-15): a procedure is approved without a human when BOTH
+    # its confidence score AND the number of times it has been seen exceed these. Two
+    # gates on purpose - a well-written fix seen once is a guess, and a fix seen fifty
+    # times that the reviewer rated 40 is fifty tickets of something we do not understand.
+    # Applied by the consolidation command and by the miner as it updates counts, so a
+    # procedure crosses the line the day the evidence does, not at the next clean-up.
+    ai_procedure_auto_approve_score = models.PositiveSmallIntegerField(default=95)
+    ai_procedure_auto_approve_seen = models.PositiveIntegerField(default=5)
 
     # ALERT VERIFIERS - deterministic "prove it before you act" layer for machine-
     # generated alert tickets. An admin-authored code box (like ai_helpdesk_code)
@@ -233,6 +252,12 @@ class CoreSettings(BaseAuditModel):
     # NO shipped default: `ai_remote_relay_url` is blank on a fresh install and the feature
     # cannot turn itself on. An operator has to type in a relay they trust - normally one
     # they host themselves - before any AI window can be reached from outside this server.
+    # SERVER-RESIDENT CHAT SESSIONS (owner, 2026-09-15): the AI runs on the bridge; a browser
+    # or the phone app is a view onto it. When the LAST viewer disconnects, the session keeps
+    # running for this many minutes, then stops. 0 = never stop on its own.
+    ai_chat_detach_grace_minutes = models.PositiveIntegerField(default=5)
+    # (ai_remote_* retained as columns for now; the phone-relay feature is retired and the
+    #  fields are no longer read - the mobile app attaches to the live session directly.)
     ai_remote_enabled = models.BooleanField(default=False)
     # Canonical form is http(s)://; the bridge converts to ws(s):// when it opens the
     # socket. Blank = feature unavailable, whatever the permission or the switch say.
@@ -335,6 +360,9 @@ class CoreSettings(BaseAuditModel):
     # API base/key (same Odoo). JS + prompt mirror the helpdesk pattern.
     ai_sales_enabled = models.BooleanField(default=False)
     ai_sales_prompt = models.TextField(blank=True, default="")
+    # Pre-sales DISCOVERY standard (CRM opportunities). Held in settings, like every other
+    # prompt, so the bar for a scope document is edited by the owner and not by a deploy.
+    ai_discovery_prompt = models.TextField(blank=True, default="")
     ai_sales_code = models.TextField(blank=True, default="")
 
     # ---- ERP AI integration (inbound) -------------------------------------
@@ -681,8 +709,11 @@ class CoreSettings(BaseAuditModel):
         except Exception as e:
             logger.error(traceback.format_exc())
             DebugLog.error(message=f"Sending email failed with error: {e}")
-            if test:
-                return str(e), False
+            # Report the failure to the caller whether or not this is a test. Previously only
+            # the test path returned False, so a real send that raised still answered
+            # ("ok", True) and callers went on to report success - which is how a report can
+            # say "sent to chris@blueuc.com" when nothing ever left the box.
+            return str(e), False
 
         if test:
             return "Email test ok!", True
@@ -1150,6 +1181,25 @@ class AITask(BaseAuditModel):
         default=list,
     )
     monthly_day = models.PositiveSmallIntegerField(null=True, blank=True)  # 1-31
+    # WHICH CLOCK `run_time` IS ON.
+    #
+    # "Daily at 03:00" is meaningless without saying whose 03:00. Until now the scheduler
+    # localised with Django's TIME_ZONE (UTC on this install), so a task authored as an
+    # overnight maintenance window fired at 03:00 UTC - 04:00 in London in summer, 22:00
+    # the previous evening in New York - while the UI showed a bare "03:00" and named no
+    # zone at all. That is the kind of quiet mismatch that puts a disruptive check in the
+    # middle of a customer's working day.
+    #
+    # Blank means "the device's own timezone" (agent.timezone, which itself falls back to
+    # CoreSettings.default_time_zone) - the right default for an MSP: a maintenance window
+    # belongs to the site it runs on, not to the server that dispatches it. An explicit
+    # value pins the task to one zone regardless of where the machine is, which is what
+    # you want for a task tied to a business process rather than to a device.
+    #
+    # Existing tasks were migrated to an explicit "UTC" so nothing changed the day this
+    # shipped: a task that had been running at 03:00 UTC still runs at 03:00 UTC, now
+    # visibly so. Only tasks created afterwards follow the device.
+    schedule_timezone = models.CharField(max_length=64, blank=True, default="")
     run_at = models.DateTimeField(null=True, blank=True)  # computed target for one-time
     next_run = models.DateTimeField(null=True, blank=True)  # computed for recurring
 
@@ -1170,6 +1220,22 @@ class AITask(BaseAuditModel):
     @property
     def is_multi(self) -> bool:
         return bool(self.machines)
+
+    @property
+    def effective_timezone(self) -> str:
+        """The zone `run_time` is actually interpreted in - never blank.
+
+        One resolver, used by the scheduler AND reported to the UI, so what the operator
+        reads is by construction the clock the task really runs on.
+        """
+        if self.schedule_timezone:
+            return self.schedule_timezone
+        try:
+            return self.agent.timezone
+        except Exception:
+            from core.utils import get_core_settings
+
+            return get_core_settings().default_time_zone
 
     def secondary_agent_ids(self):
         """agent_ids of the additional (non-primary) machines, in order, deduped."""
@@ -1362,6 +1428,15 @@ class AITicketState(models.Model):
     # message from a non-AI author (customer/tech) appears - the resume loop.
     last_message_id = models.PositiveBigIntegerField(default=0)
     assignee_seen = models.CharField(max_length=120, blank=True, default="")
+    # HELD BEHIND ANOTHER TICKET (owner, 2026-09-17): "if another ticket comes in at the
+    # same time for a triage that is already being worked on... it should be put on hold
+    # until the other ticket is done... once done they should all be auto ai closed."
+    #
+    # duplicate_of names the ticket doing the work; held_fingerprint is the THING being
+    # worked, so the sweep can find every ticket waiting on it without re-deriving the
+    # matching rules.
+    duplicate_of = models.CharField(max_length=100, blank=True, default="", db_index=True)
+    held_fingerprint = models.CharField(max_length=64, blank=True, default="", db_index=True)
     # Whether we've done the one-time company/contact correction on this ticket.
     # After the first check we leave the partner alone (respect manual edits).
     partner_checked = models.BooleanField(default=False)
@@ -1526,6 +1601,30 @@ class AIProcedure(models.Model):
     # disposition without that disposition being live.
     auto_enabled = models.BooleanField(default=False)
 
+    # ---- CONSOLIDATION (2026-09-15) --------------------------------------------
+    # 486 mined procedures had grown into five near-copies of the same fix and prose full
+    # of one customer's hostnames. The owner's rule: procedures are GLOBAL (how a kind of
+    # problem is fixed anywhere); a customer's specifics belong in their KB. So the library
+    # was consolidated - duplicates merged into one canonical procedure, customer-specific
+    # detail lifted out - and every procedure scored.
+    #
+    # `score` (0-100) is how sure we are the procedure is correct, complete and general.
+    # It is the model's rating of the merged text, CAPPED by evidence: a fix seen once
+    # cannot score above 70 however well it reads; twice 80; 3-4 times 90. >=95 is
+    # auto-approved - the owner's threshold - which by construction needs 5+ real tickets
+    # behind it AND a text the reviewer rated near-certain.
+    score = models.PositiveSmallIntegerField(default=0)
+    score_reason = models.CharField(max_length=400, blank=True, default="")
+    # A retired duplicate points at the procedure that absorbed it. Nothing is deleted:
+    # the original text, tickets and counts stay on the retired row for audit and undo.
+    merged_into = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="absorbed",
+    )
+    # Customer-specific detail lifted OUT of the global text so it is not lost:
+    # [{"company": "Omega Design", "detail": "SendPlot host is ENG1-DEV; scripts on Desktop"}]
+    # Belongs in that company's KB; kept here until someone moves it.
+    company_specifics = models.JSONField(default=list, blank=True)
+
     class Meta:
         indexes = [
             models.Index(fields=["category"]),
@@ -1536,6 +1635,26 @@ class AIProcedure(models.Model):
 
     def __str__(self) -> str:
         return f"{self.title} [{self.status}]"
+
+    def maybe_auto_approve(self, core=None) -> bool:
+        """Approve if BOTH global gates are cleared. Returns True if the status changed.
+
+        Never touches retired/rejected rows, and never demotes: a human's approval stands
+        even if a later re-score would not have earned it.
+        """
+        if self.status in ("retired", "rejected", "approved"):
+            return False
+        if core is None:
+            from core.utils import get_core_settings
+
+            core = get_core_settings()
+        need_score = int(getattr(core, "ai_procedure_auto_approve_score", 95) or 0)
+        need_seen = int(getattr(core, "ai_procedure_auto_approve_seen", 5) or 0)
+        if int(self.score or 0) >= need_score and int(self.occurrence_count or 0) >= need_seen:
+            self.status = "approved"
+            self.updated_by = (self.updated_by or "") if self.updated_by == "consolidation" else "auto-approve"
+            return True
+        return False
 
     @property
     def is_live_rule(self) -> bool:
@@ -1568,6 +1687,9 @@ class AIReportSchedule(models.Model):
         # procedure, and what is blocking it. Read-only by design -- it arms nothing and
         # touches no ticket, so it can run daily while trust is still being built.
         ("autowork_readiness", "AI Auto-work Readiness - would it work each ticket alone"),
+        # Proposes 2-3 Ticket Automation Subjects a day from the tickets that arrived, each
+        # approvable from a link in the email. See AITicketAutomationSubject.
+        ("automation_subjects", "Ticket Automation Subjects - what to automate next"),
     )
     CADENCE = (
         ("daily", "Every day"),
@@ -1864,6 +1986,15 @@ class AIDecisionRequest(models.Model):
 
     token = models.CharField(max_length=64, unique=True, db_index=True)
     ticket_ref = models.CharField(max_length=100)
+    # WHAT this thread is about. Defaulted to "helpdesk" so every existing row keeps its
+    # current meaning: ticket_ref stays the key for tickets, and nothing about the ticket
+    # path changes. "crm" threads are pre-sales DISCOVERY on a crm.lead - an IT tech
+    # surveys what the customer has so a sales rep can quote it, and subject_ref holds
+    # "LEAD/837". Kept as an explicit field rather than sniffing a prefix out of
+    # ticket_ref, because the capability surface and the tool belt differ by kind and that
+    # decision must be readable in code, not inferred from a string.
+    subject_kind = models.CharField(max_length=20, default="helpdesk")  # helpdesk | crm
+    subject_ref = models.CharField(max_length=100, blank=True, default="")
     question = models.TextField(blank=True, default="")
     # {client, affected_device, classification, summary, requester}
     context = models.JSONField(default=dict, blank=True)
@@ -1876,8 +2007,25 @@ class AIDecisionRequest(models.Model):
     class Meta:
         indexes = [models.Index(fields=["status"])]
 
+    class SubjectKind:
+        HELPDESK = "helpdesk"
+        CRM = "crm"
+
+    @property
+    def is_crm(self) -> bool:
+        return self.subject_kind == self.SubjectKind.CRM
+
+    @property
+    def subject_key(self) -> str:
+        """The reference that identifies the subject, whichever kind it is.
+
+        Ticket threads have always keyed off ticket_ref and continue to; CRM threads
+        carry their lead in subject_ref. One accessor so callers never branch.
+        """
+        return (self.subject_ref or self.ticket_ref or "").strip()
+
     def __str__(self) -> str:
-        return f"decision {self.ticket_ref} [{self.status}]"
+        return f"{self.subject_kind} {self.subject_key} [{self.status}]"
 
 
 class AIScheduledAction(models.Model):
@@ -1938,6 +2086,19 @@ class AISpendEntry(models.Model):
         ("decision_chat", "Ticket (AI-decision) chat"),
         ("unattended", "Unattended run (scheduled task / bulk / action)"),
         ("verifier", "Alert verifier"),
+        # 2026-09-14: every remaining model-running surface was found to be writing
+        # NOTHING to this ledger - 2,307 sessions holding $527 existed only inside the
+        # bridge's session files, and the agent-group specialists left no trace at all
+        # because they run in a temp directory that is deleted afterwards. Each now has
+        # its own label so a bill can say WHICH kind of automation spent the money.
+        ("report", "Scheduled report (compile)"),
+        ("analyze", "Scheduled report (executive summary)"),
+        ("triage", "Ticket triage"),
+        ("resolve", "Ticket auto-resolve"),
+        ("mining", "Procedure mining"),
+        ("assist", "Settings assistant (prompt / code helpers)"),
+        ("group", "Agent-group specialist (delegated inside a chat)"),
+        ("autowork", "Ticket worked automatically under an automation subject"),
         # The Odoo AI panel. Rows were already being written with this value and the
         # report grouped them correctly, because it groups by DATA rather than by
         # declared choices -- but with no choice declared the label rendered as the
@@ -1991,6 +2152,13 @@ class AISpendEntry(models.Model):
     # False when the runtime reported no cost object (model without pricing metadata).
     # Reports must show these turns as "unpriced" rather than as $0.00.
     priced = models.BooleanField(default=True)
+    # True when the row was RECOVERED from a bridge session transcript rather than posted
+    # live by the surface that spent it. Recovered rows are real money and belong in every
+    # total, but they are attributable only as well as the transcript allowed (no actor for
+    # unindexed sessions, surface inferred from where the index lived), so a report that
+    # cares about attribution quality can tell them apart. See
+    # `manage.py backfill_ai_spend`.
+    backfilled = models.BooleanField(default=False)
 
     # --- context / diagnostics ---------------------------------------------------
     context_tokens = models.PositiveBigIntegerField(default=0)
@@ -2012,3 +2180,234 @@ class AISpendEntry(models.Model):
 
     def __str__(self) -> str:
         return f"{self.at:%Y-%m-%d %H:%M} {self.model_id} ${self.cost_total} [{self.surface}]"
+
+
+def session_spend_map(rows) -> dict:
+    """{session_id -> {cost, turns, first, last, models, surface, actor}} for a queryset.
+
+    Folds delegated agent-group rows (`<parent>-g<n>`, see `session_scope_q`) back into
+    the conversation that paid for them, so a chat's cost is the whole cost.
+    """
+    import re
+    from collections import defaultdict
+
+    suffix = re.compile(r"-g[0-9a-z]+$")
+    out: dict = defaultdict(
+        lambda: {
+            "cost": 0.0,
+            "turns": 0,
+            "first": None,
+            "last": None,
+            "models": set(),
+            "surface": "",
+            "actor": "",
+            "ticket_ref": "",
+            "backfilled": True,
+        }
+    )
+    for r in rows.values(
+        "session_id", "cost_total", "at", "model_id", "provider", "surface",
+        "actor_username", "ticket_ref", "backfilled",
+    ):
+        key = suffix.sub("", r["session_id"])
+        e = out[key]
+        e["cost"] += float(r["cost_total"] or 0)
+        e["turns"] += 1
+        if e["first"] is None or (r["at"] and r["at"] < e["first"]):
+            e["first"] = r["at"]
+        if e["last"] is None or (r["at"] and r["at"] > e["last"]):
+            e["last"] = r["at"]
+        if r["model_id"]:
+            e["models"].add(f"{r['provider']}/{r['model_id']}".strip("/"))
+        # The delegated rows say "group"; the conversation's own surface is the one
+        # worth showing, so a non-group value always wins.
+        if not e["surface"] or (e["surface"] == "group" and r["surface"] != "group"):
+            e["surface"] = r["surface"]
+        if not e["actor"]:
+            e["actor"] = r["actor_username"]
+        if not e["ticket_ref"]:
+            e["ticket_ref"] = r["ticket_ref"]
+        # "Everything we hold for this chat was recovered from a transcript" is only
+        # true if EVERY row was.
+        if not r["backfilled"]:
+            e["backfilled"] = False
+    return {
+        k: {**v, "models": sorted(v["models"])} for k, v in out.items()
+    }
+
+
+def session_scope_q(session_id: str):
+    """Every ledger row belonging to ONE conversation, including work it delegated.
+
+    An agent-group specialist runs its own model session inside a chat (the `delegate`
+    tool). Its rows cannot carry the parent's session_id - the ledger is idempotent on
+    (session_id, turn_index) and a specialist counts its turns from 1, which would collide
+    with the parent's first turns and silently drop the charge as a duplicate. They are
+    written as `<parent>-g<n>` instead, and this is the ONE place that knows it: "what did
+    this chat cost" must include the specialists it paid for, or the figure understates
+    the bill exactly when an expensive model was delegated to.
+    """
+    from django.db.models import Q
+
+    sid = str(session_id or "").strip()
+    if not sid:
+        return Q(pk__in=[])
+    return Q(session_id=sid) | Q(session_id__startswith=f"{sid}-g")
+
+
+class AITicketAutomationSubject(models.Model):
+    """A KIND of ticket the AI is allowed to work on its own.
+
+    Why this exists (owner, 2026-09-15): procedures say HOW something is fixed; nothing said
+    WHICH tickets the AI may pick up unattended. Every human-filed ticket therefore ended in
+    a "shadow mode - no action taken" note, however well triage had understood it. A subject
+    is that permission: declarative rules that recognise the ticket, the procedures/KB that
+    say what to do, and HOW FAR the AI may go - stated by a person, in data, never inferred.
+
+    `mode` is the ceiling, enforced in code on both sides of the bridge:
+      advise           - read the ticket, reply to the customer, post notes. NO device
+                         toolbelt is built at all: nothing on any machine can be touched.
+      device_readonly  - as advise, plus read-only probes on the customer's devices (hard
+                         read-only: write tools are not constructed, run_command refuses
+                         anything mutating).
+      device_fix       - may run an ATTACHED, reviewed remediation script. Not enabled for
+                         any subject yet: it needs the script on the procedure first.
+
+    Subjects are proposed by the daily "Ticket Automation Subjects" report and become live
+    only when a human approves them (one click in the email, or the Procedures page).
+    """
+
+    MODE = (
+        ("advise", "Advise - reply to the customer; no device access at all"),
+        ("device_readonly", "Investigate - read-only probes on devices, then advise"),
+        ("device_fix", "Fix - run the attached remediation script (needs a script)"),
+    )
+    STATUS = (
+        ("proposed", "Proposed by the daily report - awaiting approval"),
+        ("approved", "Approved - live"),
+        ("rejected", "Rejected"),
+        ("retired", "Retired"),
+    )
+
+    name = models.CharField(max_length=160)
+    description = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=12, choices=STATUS, default="proposed")
+    enabled = models.BooleanField(default=True)
+    mode = models.CharField(max_length=20, choices=MODE, default="advise")
+
+    # Same declarative shape as AIProcedure.match, evaluated by core.ai_conditions.
+    match = models.JSONField(default=dict, blank=True)
+    # What the AI works from. Procedures (global how-to) and/or helpdesk KB article ids
+    # (customer specifics). At least one is required for the subject to be workable.
+    procedures = models.ManyToManyField("core.AIProcedure", blank=True, related_name="subjects")
+    kb_article_ids = models.JSONField(default=list, blank=True)
+    # Extra instructions for the worker, e.g. the reply template the owner approved.
+    instructions = models.TextField(blank=True, default="")
+
+    # Which customers. all_clients=True means everyone (e.g. spam verification is the same
+    # answer for every customer); otherwise only the named clients/domains.
+    all_clients = models.BooleanField(default=False)
+    clients = models.JSONField(default=list, blank=True)   # ["Omega Design", ...]
+    domains = models.JSONField(default=list, blank=True)   # ["omegadesign.com", ...]
+
+    # Human-authored baseline so time saved can be reported honestly.
+    baseline_minutes = models.FloatField(null=True, blank=True)
+    # REMEDIATION THE AI MAY PERFORM - data a human approved, never text the model wrote.
+    #
+    #   [{"name": "restart-web", "shell": "powershell", "command": "...", "wait": 5}, ...]
+    #
+    # In device_fix mode the model picks an action BY NAME from this list and can do
+    # nothing else: it cannot compose a command, so "restart SendPlot" can never become
+    # "delete the SendPlot folder" via a badly-worded ticket or a prompt injection. The
+    # ceiling is this list, and the list is reviewed by a person here.
+    fix_actions = models.JSONField(default=list, blank=True)
+    # WHICH MACHINE the reviewed actions run on: {"agent_id": "...", "hostname": "..."}.
+    # Pinned by a human, never chosen by the model - "restart the plot server" must mean
+    # one specific server, not whichever host the ticket text happens to name.
+    fix_target = models.JSONField(default=dict, blank=True)
+    # A service that keeps dying is a HUMAN's problem, not something to restart in a loop.
+    fix_cooldown_minutes = models.IntegerField(default=60)
+    last_fix_at = models.DateTimeField(null=True, blank=True)
+    fixes_applied = models.IntegerField(default=0)
+
+    # Approval by email link. One token each way; consumed on use.
+    approve_token = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    reject_token = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    proposed_by_report = models.DateTimeField(null=True, blank=True)
+    proposal_reason = models.TextField(blank=True, default="")
+    proposal_tickets = models.JSONField(default=list, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.CharField(max_length=150, blank=True, default="")
+
+    # Counters, for the report and the Procedures page.
+    tickets_matched = models.PositiveIntegerField(default=0)
+    tickets_worked = models.PositiveIntegerField(default=0)
+    tickets_deduped = models.PositiveIntegerField(default=0)
+    last_worked = models.DateTimeField(null=True, blank=True)
+
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated"]
+
+    def __str__(self) -> str:
+        return f"{self.name} [{self.status}/{self.mode}]"
+
+    @property
+    def is_live(self) -> bool:
+        return self.status == "approved" and self.enabled and isinstance(self.match, dict) and bool(self.match)
+
+    def allows_client(self, client_name: str = "", requester_email: str = "") -> bool:
+        if self.all_clients:
+            return True
+        c = (client_name or "").strip().lower()
+        d = ((requester_email or "").split("@")[-1] or "").strip().lower()
+        return bool(
+            (c and c in [str(x).strip().lower() for x in (self.clients or [])])
+            or (d and d in [str(x).strip().lower() for x in (self.domains or [])])
+        )
+
+
+class AITicketWorkClaim(models.Model):
+    """"Is anyone already on this?" - one row per thing being worked, keyed on WHAT it is.
+
+    Owner's rule (2026-09-15): if several tickets come in for the same exact thing, the AI
+    must not work it more than once, and any agent must check first. A fingerprint names
+    the thing (subject or condition + customer + normalised subject line); a claim on it is
+    exclusive while active. The database's own uniqueness is the lock, so two pollers or a
+    poller and a chat cannot both take it - there is no "check then act" gap.
+
+    Claims are released when the work settles and expire on their own (a crashed worker
+    must not hold a condition hostage). A ticket that arrives while a claim is active gets
+    a note pointing at the ticket being worked, and is counted as deduplicated.
+    """
+
+    fingerprint = models.CharField(max_length=64, db_index=True)
+    ticket_ref = models.CharField(max_length=100, db_index=True)
+    subject = models.ForeignKey(
+        "core.AITicketAutomationSubject", null=True, blank=True, on_delete=models.SET_NULL,
+    )
+    worker = models.CharField(max_length=120, blank=True, default="")   # "autowork" | "chat:<user>"
+    what = models.CharField(max_length=300, blank=True, default="")
+    active = models.BooleanField(default=True)
+    claimed_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    released_at = models.DateTimeField(null=True, blank=True)
+    outcome = models.CharField(max_length=40, blank=True, default="")
+    # Tickets that arrived for the same thing while this claim was active.
+    duplicates = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [
+            # ONE active claim per thing. This is the lock.
+            models.UniqueConstraint(
+                fields=["fingerprint"], condition=models.Q(active=True),
+                name="one_active_claim_per_fingerprint",
+            ),
+        ]
+        ordering = ["-claimed_at"]
+
+    def __str__(self) -> str:
+        return f"{self.fingerprint[:10]} {self.ticket_ref} [{'active' if self.active else self.outcome}]"
+

@@ -35,7 +35,9 @@ from core.mesh_utils import (
 from core.models import CoreSettings
 from core.utils import get_core_settings, get_mesh_ws_url, make_alpha_numeric
 from ee.reporting.tasks import prune_report_history_task
-from logs.models import PendingAction
+# DebugLog at module level: several except-branches in triage_ai_ticket referenced it
+# without importing it, so a rare failure there raised NameError instead of being logged.
+from logs.models import DebugLog, PendingAction
 from logs.tasks import prune_audit_log, prune_debug_log
 from tacticalrmm.celery import app
 from tacticalrmm.constants import (
@@ -1323,15 +1325,46 @@ def _resolve_bulk_targets(cmd):
 
 
 def _compute_schedule(
-    schedule_type, interval_seconds, run_time, weekly_days, monthly_day, from_time=None
+    schedule_type,
+    interval_seconds,
+    run_time,
+    weekly_days,
+    monthly_day,
+    from_time=None,
+    tz=None,
 ):
-    """Generic next-run computer shared by AI tasks and bulk AI commands."""
+    """Generic next-run computer shared by AI tasks and bulk AI commands.
+
+    `tz` is the zone the WALL CLOCK (`run_time`, weekday, day-of-month) is read in - an
+    IANA name such as "Europe/London". Without it this used Django's TIME_ZONE (UTC here),
+    so "daily 03:00" fired at 03:00 UTC no matter where the device was, and the UI showed
+    a bare "03:00" naming no zone. Interval schedules are unaffected: "every 60 minutes"
+    has no wall clock in it.
+
+    Returned datetimes are timezone-aware, so everything downstream (storage, comparison,
+    display in any zone) keeps working exactly as before.
+    """
     import calendar
     import datetime as _dt
 
     from django.utils import timezone as _tz
 
-    now = _tz.localtime(from_time) if from_time else _tz.localtime()
+    zone = None
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+
+            zone = ZoneInfo(str(tz))
+        except Exception:
+            # A bad/unknown zone must not stop a task from ever running again: fall back
+            # to the previous behaviour and let it be visible in the UI instead.
+            zone = None
+
+    if zone is not None:
+        base_now = from_time or _tz.now()
+        now = base_now.astimezone(zone)
+    else:
+        now = _tz.localtime(from_time) if from_time else _tz.localtime()
     if schedule_type == "interval":
         secs = interval_seconds if interval_seconds and interval_seconds > 0 else 3600
         return now + _dt.timedelta(seconds=secs)
@@ -1381,6 +1414,9 @@ def _compute_bulk_next_run(cmd, from_time=None):
 
 
 def _compute_task_next_run(task, from_time=None):
+    # The task's own clock: its explicit schedule_timezone, else the device's. One
+    # resolver (AITask.effective_timezone) is used both here and in what the UI shows, so
+    # the displayed zone cannot drift from the zone the scheduler actually used.
     return _compute_schedule(
         task.schedule_type,
         (task.interval_minutes or 60) * 60,
@@ -1388,8 +1424,8 @@ def _compute_task_next_run(task, from_time=None):
         task.weekly_days,
         task.monthly_day,
         from_time,
+        tz=task.effective_timezone,
     )
-    return None
 
 
 @app.task
@@ -1667,11 +1703,36 @@ def _ticket_in_scope(t, scope, is_alert):
 
 
 
+def _decision_url_for(ticket_ref: str) -> str:
+    """The existing AI Decision link for a ticket, so an escalation note points a technician
+    straight at the conversation the automation had. Empty when there is no thread.
+
+    Deliberately NOT an @app.task - it is called inline (see below). It once carried the
+    decorator that belongs to poll_helpdesk_tickets, having been inserted between that
+    decorator and its function, which silently unregistered the ticket poller for 3 days
+    (2026-09-17). Keep a blank line and no decorator here."""
+    from core.models import AIDecisionRequest
+
+    base = (
+        settings.CORS_ORIGIN_WHITELIST[0]
+        if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""
+    )
+    d = AIDecisionRequest.objects.filter(ticket_ref=ticket_ref).order_by("-updated").first()
+    return f"{base}/ai-decision/{d.token}" if (d and base) else ""
+
+
 @app.task
-def poll_helpdesk_tickets():
-    """Beat task (~90s): list open tickets via helpdesk.js, reconcile against
+def poll_helpdesk_tickets(only_refs=None):
+    """Beat task (every 2 min): list open tickets via helpdesk.js, reconcile against
     AITicketState, enqueue triage for new in-scope tickets. First-ever poll
-    baselines the existing backlog WITHOUT triaging it (no note spam)."""
+    baselines the existing backlog WITHOUT triaging it (no note spam).
+
+    `only_refs` narrows the SAME logic to named tickets. That is how the helpdesk's
+    own "ticket entered New" webhook gets an instant triage (core.views.HelpdeskTriageHook)
+    without a second implementation of the ingest rules - alerts, scope, internal notices,
+    the re-engage loop and the baseline are subtle enough that two copies would diverge
+    within a month, and the copy nobody watches would be the one making the decisions.
+    """
     import requests as _requests
 
     from core.models import AITicketState
@@ -1682,6 +1743,23 @@ def poll_helpdesk_tickets():
         return "disabled"
     if not ((core.ai_helpdesk_code or "").strip() and (core.ai_helpdesk_api_base_url or "").strip()):
         return "no helpdesk integration configured"
+    # IS THE SAFETY-NET POLL DUE? Beat ticks every minute; the interval lives in Global
+    # Settings (ai_ticket_poll_minutes) so it can be changed without a deploy or a restart.
+    # A webhook-driven run (only_refs) is never throttled - that is the point of it.
+    if not only_refs:
+        every = int(getattr(core, "ai_ticket_poll_minutes", 10) or 0)
+        if every <= 0:
+            return "poll disabled in settings (webhook only)"
+        from django.core.cache import cache
+        from django.utils import timezone as _tz
+
+        last = cache.get("ai_ticket_poll_last")
+        now_ts = _tz.now().timestamp()
+        if last and (now_ts - float(last)) < every * 60 - 5:
+            return f"not due ({every}m interval)"
+        # Marked BEFORE the work, so a long poll cannot stack up behind itself; the TTL is
+        # generous so a crash mid-poll cannot wedge the schedule for longer than one cycle.
+        cache.set("ai_ticket_poll_last", now_ts, every * 60 * 2)
 
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     try:
@@ -1705,6 +1783,14 @@ def poll_helpdesk_tickets():
         return f"poll error: {data['error']}"
 
     tickets = data.get("tickets") or []
+    if only_refs:
+        want = {str(r).strip() for r in only_refs if str(r or "").strip()}
+        tickets = [t for t in tickets if str(t.get("ref") or "").strip() in want]
+        if not tickets:
+            # The webhook fired but the ticket is not in the automation's view - assigned to
+            # a human already, closed, or in a team we do not work. Said plainly so a
+            # "nothing happened" is explainable rather than mysterious.
+            return f"webhook: none of {sorted(want)} are workable (assigned, closed or out of team scope)"
     scope = _ai_ticket_scope_conf(core)
     baseline = not AITicketState.objects.exists()
     seen, enqueued = 0, 0
@@ -1804,6 +1890,28 @@ def poll_helpdesk_tickets():
         st.is_alert = is_alert
         st.last_change_seen = new_lcs
         if new_activity and in_scope:
+            # A REPLY TO SOMETHING THE AUTOMATION RESOLVED (owner, 2026-09-17). Handled in
+            # code before any model call: "it is still down" fetches a human and the
+            # automation stands down for good on that ticket; "thank you" re-closes it.
+            # Anything else falls through to ordinary triage, which is where judgement
+            # belongs.
+            if st.status in ("auto_closed", "auto_replied", "auto_closed_duplicate"):
+                try:
+                    from core.ai_autowork import handle_reply_to_resolved
+
+                    _reply_body = "\n".join(
+                        str(m.get("text") or "") for m in (t.get("recent_messages") or [])
+                        if (m.get("kind") or "") != "Note" and not m.get("bot")
+                    )[:4000]
+                    outcome = handle_reply_to_resolved(
+                        st, body_text=_reply_body or str(t.get("body") or ""),
+                        core=core, decision_url=_decision_url_for(st.ticket_ref),
+                    )
+                    if outcome:
+                        st.save()
+                        continue
+                except Exception as e:
+                    DebugLog.error(message=f"reply-to-resolved handling failed for {ref}: {e}")
             st.status = "new"
             st.save()
             triage_ai_ticket.delay(st.pk, force=True)
@@ -1811,7 +1919,8 @@ def poll_helpdesk_tickets():
         elif changed:
             # bookkeeping only - do NOT bump the AI "last worked" (updated/last_triaged)
             st.save(update_fields=["last_message_id", "assignee_seen", "is_alert", "last_change_seen"])
-    return f"seen {seen}, enqueued {enqueued}{' (baseline)' if baseline else ''}"
+    return (f"{'webhook: ' if only_refs else ''}seen {seen}, enqueued {enqueued}"
+            f"{' (baseline)' if baseline else ''}")
 
 
 @app.task
@@ -2085,6 +2194,17 @@ def triage_ai_ticket(state_pk, force=False):
             _vf = f"[{vres.get('verifier')}] verdict={act} on {vres.get('host') or '?'} - {reason}"
             verified_fact = (condition_note + "\n\n" + _vf)[:6000] if condition_note else _vf[:4000]
 
+    # Owner's rule: check first whether the same thing is already in hand elsewhere.
+    _already_worked = None
+    try:
+        from core.ai_workclaims import already_being_worked
+
+        _aw = already_being_worked(subject_line=st.subject or "", requester_email=st.requester or "",
+                                   exclude_ticket=st.ticket_ref)
+        if _aw:
+            _already_worked = {"ticket_ref": _aw["ticket_ref"], "worker": _aw["worker"], "what": _aw["what"]}
+    except Exception:
+        _already_worked = None
     try:
         r = _requests.post(
             f"{bridge}/pi/ticket-triage",
@@ -2104,6 +2224,7 @@ def triage_ai_ticket(state_pk, force=False):
                 "correct_partner": not st.partner_checked,
                 "verified_fact": verified_fact,
                 "forbid_cancel": forbid_cancel,
+                "already_worked": _already_worked,
                 "helpdesk_api": {
                     "base_url": core.ai_helpdesk_api_base_url or "",
                     "api_key": core.ai_helpdesk_api_key or "",
@@ -2159,11 +2280,144 @@ def triage_ai_ticket(state_pk, force=False):
                     token=decision_token, ticket_ref=st.ticket_ref,
                     question=st.proposed_action, context=ctx, messages=[entry], status="open",
                 )
+    # ---- TICKET AUTOMATION SUBJECTS -------------------------------------------------
+    # A human-filed ticket that triage understood used to stop here with a shadow note,
+    # however clear the answer was. If the owner has approved a SUBJECT whose rules fire on
+    # this ticket, it is now worked - within that subject's mode - by core.ai_autowork.
+    # Alerts are not touched by this stage: they have the condition/verifier path.
+    if (not data.get("error") and st.status == "triaged"
+            and st.classification in ("regular", "unknown") and not st.is_alert):
+        try:
+            from core.ai_autowork import find_subject, hd_op, work_ticket
+
+            _g2 = hd_op(core, "get_ticket", {"ticket": st.ticket_ref}) or {}
+            _tk2 = _g2.get("ticket") or {}
+            _subj_line = str(_tk2.get("email_subject") or st.subject or "")
+            _body2 = "\n".join([str(_tk2.get("description") or "")]
+                                + [str(m.get("text") or "") for m in (_g2.get("messages") or [])
+                                   if (m.get("type") or "") != "Note"])
+            _client2 = str(_tk2.get("partner_company_name") or data.get("client") or "")
+            subj = find_subject(subject_line=_subj_line, body=_body2, sender=st.requester or "", client=_client2)
+            if subj:
+                work_ticket(st, subj=subj, body_text=_body2, client=_client2,
+                            decision_url=decision_url, core=core, model=model)
+        except Exception as e:
+            DebugLog.error(message=f"automation subject stage failed for {st.ticket_ref}: {e}")
+            # Same rule as inside the stage: a failure is stated on the ticket, never swallowed.
+            try:
+                from core.ai_autowork import hd_op as _hdop
+
+                _hdop(core, "add_note", {"ticket": st.ticket_ref, "message": (
+                    "\U0001F916 Pi.dev AI \u2014 Ticket automation\nCOULD NOT RUN on this ticket "
+                    f"(internal error: {str(e)[:300]}). Nothing was sent or changed. A technician needs to pick this up.")})
+            except Exception:
+                pass
+
     # Mark when the AI actually worked this ticket (drives the console's "Last worked").
     from django.utils import timezone as _tznow
     st.last_triaged = _tznow.now()
     st.save()
     return f"{st.ticket_ref}: {st.status} {st.classification}"
+
+
+@app.task
+def check_beat_task_registry():
+    """Warn - as a ticket - when a scheduled task name does not exist in the worker.
+
+    beat_schedule entries are STRINGS. Nothing checks them against the registry, so losing
+    an @app.task decorator (or renaming/moving a task) makes beat fire a name the worker
+    refuses: 'Received unregistered task of type ...'. Beat and the worker both stay green,
+    the log line is the only symptom, and the feature is simply gone.
+
+    That is not hypothetical. On 2026-09-17 a helper inserted between @app.task and
+    poll_helpdesk_tickets took the decorator with it; the ticket poller AND the helpdesk
+    webhook (which calls .delay) were dead for 3 days before anyone asked why the ERP's
+    tickets were not being worked. This check is the symptom that outage did not have.
+
+    Runs in the WORKER, so app.tasks is the registry beat's messages are actually resolved
+    against - the same view that matters at dispatch time.
+    """
+    import requests as _requests
+
+    from core.models import CoreSettings
+
+    # Autodiscovery is LAZY. In the worker every task module is already imported, but do not
+    # depend on that - without this the check would "find" every task missing in any context
+    # where the registry has not been built yet, and file a ticket saying so.
+    with suppress(Exception):
+        app.loader.import_default_modules()
+
+    scheduled = sorted({
+        str(e.get("task") or "").strip()
+        for e in (app.conf.beat_schedule or {}).values()
+        if str(e.get("task") or "").strip()
+    })
+    missing = [name for name in scheduled if name not in app.tasks]
+    if not missing:
+        return f"ok - {len(scheduled)} scheduled task(s) all registered"
+    # Sanity floor: one lost decorator is the failure this exists for. "Everything is
+    # missing" means the registry was not loaded, not that the whole app broke - say so in
+    # the log and file nothing, rather than raising a ticket built on a bad reading.
+    if len(missing) > max(3, len(scheduled) // 2):
+        DebugLog.error(
+            message=(
+                f"beat registry check read {len(missing)}/{len(scheduled)} scheduled tasks as "
+                "unregistered - treating as an unloaded registry, not filing a notice"
+            )
+        )
+        return f"inconclusive - registry not loaded ({len(app.tasks)} tasks known)"
+
+    # Loud in the log regardless of whether a ticket can be filed - this must never depend
+    # on the helpdesk integration being healthy to be visible.
+    DebugLog.error(
+        message=(
+            "celerybeat schedules task(s) that are NOT registered in the worker - they are "
+            f"being discarded every tick: {', '.join(missing)}"
+        )
+    )
+
+    core = CoreSettings.objects.first()
+    if not core or not core.ai_module_enabled:
+        return f"MISSING (not filed, ai module disabled): {', '.join(missing)}"
+    if not ((core.ai_helpdesk_code or "").strip() and (core.ai_helpdesk_api_base_url or "").strip()):
+        return f"MISSING (not filed, no helpdesk integration): {', '.join(missing)}"
+
+    bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+    day = djangotime.now().strftime("%Y-%m-%d")
+    body = (
+        "<p><b>celerybeat is firing scheduled task(s) that this worker does not know about.</b> "
+        "Every tick is being discarded, so whatever these tasks do is not happening:</p>"
+        + "<ul>" + "".join(f"<li><code>{n}</code></li>" for n in missing) + "</ul>"
+        + "<p>Usual cause: a missing or misplaced <code>@app.task</code> decorator (a function "
+        "inserted between the decorator and its task steals it), or a task renamed/moved "
+        "without updating <code>beat_schedule</code> in <code>tacticalrmm/celery.py</code>.</p>"
+        "<p>Check with <code>grep -n 'unregistered task' /var/log/celery/w1.log</code>. After "
+        "fixing, restart the <b>worker</b> (<code>systemctl restart celery celerybeat</code>) - "
+        "the registry is built at worker start.</p>"
+        f"<p>Scheduled names checked: {len(scheduled)}. Missing: {len(missing)}.</p>"
+    )
+    try:
+        _requests.post(
+            f"{bridge}/pi/helpdesk-op",
+            json={
+                "operation": "create_ticket",
+                "args": {
+                    "subject": "[Pi.dev AI] Scheduled task(s) are not registered - they are not running",
+                    "body": body,
+                    # One rolling ticket per day per missing set, so an hourly check cannot spam.
+                    "dedup_key": f"pi-beat-unregistered-{day}",
+                },
+                "helpdesk_api": {
+                    "base_url": core.ai_helpdesk_api_base_url or "",
+                    "api_key": core.ai_helpdesk_api_key or "",
+                },
+                "helpdesk_code": core.ai_helpdesk_code or "",
+            },
+            timeout=(5, 60),
+        )
+    except Exception as e:
+        DebugLog.error(message=f"beat registry notice could not be filed: {e}")
+    return f"MISSING: {', '.join(missing)}"
 
 
 @app.task
@@ -2460,6 +2714,67 @@ def dispatch_ai_report_schedules(self):
         return _dispatch_ai_report_schedules_inner()
 
 
+def _run_report_for_schedule(sch, context="scheduled"):
+    """Run the report a schedule describes and return its result string.
+
+    Single dispatch point for the report kinds, shared by the beat-driven scheduler and the
+    'send now' button, so the two routes can never drift apart on which kind maps to which
+    task or on how failures are recorded.
+    """
+    rcpt = sch.recipients or ""
+    opts = sch.options if isinstance(sch.options, dict) else {}
+    try:
+        if sch.kind == "tech_productivity":
+            return send_tech_productivity_report(
+                hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+        if sch.kind == "ai_spend":
+            return send_ai_spend_report(
+                hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+        if sch.kind == "autowork_readiness":
+            return send_autowork_readiness_report(
+                hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+        if sch.kind == "automation_subjects":
+            return send_automation_subjects_report(
+                hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
+        if sch.kind == "open_tickets":
+            return send_open_ticket_review(
+                force=True,
+                recipients_override=[x.strip() for x in rcpt.replace(";", ",").split(",") if x.strip()],
+                hours=sch.effective_window_hours, stamp_core=False, options=opts)
+        return send_daily_ticket_report(
+            force=True, hours=sch.effective_window_hours,
+            recipients_override=rcpt, stamp_core=False, options=opts)
+    except Exception as e:
+        DebugLog.error(message=f"{context} report '{sch.name}' failed: {e}")
+        return f"FAILED: {str(e)[:300]}"
+
+
+@app.task
+def run_ai_report_now(pk):
+    """Run one AIReportSchedule immediately, off the back of the 'send now' button.
+
+    These reports take four to six minutes (they collect a window of helpdesk data, call the
+    PBX, then an LLM). That is far longer than uwsgi's harakiri=300s, so running one inside
+    the HTTP request gets the worker SIGKILLed mid-flight and the email is never sent - which
+    is exactly what happened to the 7-day Tech Productivity report on 21 Sep 2026. Doing the
+    work on the Celery worker instead (--time-limit=86400) removes the ceiling.
+    """
+    from django.utils import timezone as djangotime
+
+    from core.models import AIReportSchedule
+
+    try:
+        sch = AIReportSchedule.objects.get(pk=pk)
+    except AIReportSchedule.DoesNotExist:
+        return f"report schedule {pk} no longer exists"
+
+    res = _run_report_for_schedule(sch, context="manual")
+    sch.last_run = djangotime.now()
+    sch.last_result = f"manual: {res}"[:1000]
+    sch.save(update_fields=["last_run", "last_result"])
+    return str(res)
+
+
 def _dispatch_ai_report_schedules_inner():
     import zoneinfo
     from datetime import timedelta
@@ -2493,34 +2808,51 @@ def _dispatch_ai_report_schedules_inner():
         ).update(last_run=djangotime.now())
         if not claimed:
             continue
-        rcpt = sch.recipients or ""
-        opts = sch.options if isinstance(sch.options, dict) else {}
-        try:
-            if sch.kind == "tech_productivity":
-                res = send_tech_productivity_report(
-                    hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
-            elif sch.kind == "ai_spend":
-                res = send_ai_spend_report(
-                    hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
-            elif sch.kind == "autowork_readiness":
-                res = send_autowork_readiness_report(
-                    hours=sch.effective_window_hours, recipients_override=rcpt, options=opts)
-            elif sch.kind == "open_tickets":
-                res = send_open_ticket_review(
-                    force=True, recipients_override=[x.strip() for x in rcpt.replace(";", ",").split(",") if x.strip()],
-                    hours=sch.effective_window_hours, stamp_core=False, options=opts)
-            else:
-                res = send_daily_ticket_report(
-                    force=True, hours=sch.effective_window_hours,
-                    recipients_override=rcpt, stamp_core=False, options=opts)
-        except Exception as e:
-            res = f"FAILED: {str(e)[:300]}"
-            DebugLog.error(message=f"scheduled report '{sch.name}' failed: {e}")
+        res = _run_report_for_schedule(sch, context="scheduled")
         # last_run was set by the claim above; record only the outcome here.
         sch.last_result = str(res)[:1000]
         sch.save(update_fields=["last_result"])
         ran.append(f"{sch.name}: {str(res)[:80]}")
     return "; ".join(ran) if ran else "nothing due"
+
+
+@app.task
+def send_automation_subjects_report(hours=None, recipients_override=None, options=None):
+    """Email 2-3 proposed Ticket Automation Subjects with one-click approve/reject links.
+    Registered as the `automation_subjects` report kind. See core.ai_subjects_report."""
+    from core.ai_subjects_report import collect, render_html
+
+    core = get_core_settings()
+    if not core.ai_module_enabled:
+        return "ai module disabled"
+    opts = options or {}
+    hours = max(1, int(hours or 24))
+    data = collect(hours=hours, options=opts)
+    if not data["proposals"] and not data.get("error") and not opts.get("send_when_empty"):
+        return f"nothing to propose ({data['uncovered']} uncovered ticket(s) in {hours}h)"
+    recipients = [x.strip() for x in
+                  (recipients_override or core.ai_daily_report_recipients or "")
+                  .replace(";", ",").split(",") if x.strip()]
+    if not recipients:
+        recipients = list(core.email_alert_recipients or [])
+    if not recipients:
+        return "no recipients configured"
+    n = len(data["proposals"])
+    subject = (f"Ticket automation - {n} subject(s) proposed for approval"
+               if n else "Ticket automation - nothing new to propose")
+    html = render_html(data, core=core)
+    text = [f"Ticket Automation Subjects, last {hours}h",
+            f"  uncovered tickets: {data['uncovered']} of {data['tickets']}",
+            f"  proposals: {n}"]
+    for p in data["proposals"]:
+        text.append(f"- {p['subject'].name} [{p['subject'].mode}] covers {len(p['tickets'])} ticket(s)")
+        text.append(f"    approve: {p['approve_url']}")
+        text.append(f"    reject : {p['reject_url']}")
+    msg, ok = core.send_mail(subject=subject, body="\n".join(text), html_body=html,
+                             override_recipients=recipients)
+    if not ok:
+        return f"email failed: {str(msg)[:200]}"
+    return f"sent to {len(recipients)} recipient(s): {n} proposal(s)"
 
 
 @app.task
@@ -2960,6 +3292,8 @@ def mine_ticket_procedures(force=False, chain=False):
                 if not cur or (draft_mined and len(nv) > len(cur)):
                     setattr(existing, f, nv)
             existing.confidence = _procedure_confidence(existing)
+            # Evidence just grew: if it now clears BOTH global gates, approve it today.
+            existing.maybe_auto_approve(core)
             existing.save()
             updated += 1
         else:
@@ -4640,6 +4974,29 @@ def send_tech_productivity_report(hours=None, recipients_override=None, options=
     if not built["rows"]:
         return "no technician had ticket activity in this window"
 
+    # DO NOT WAIT FOR SOMEBODY TO READ THE EMAIL. The 2026-08-24 PBX change moved both phone
+    # attribution keys and the report went on sending "0m on the phone" for four weeks: the
+    # figures were wrong, the report was cheerful, and nothing was logged. Any phone attribution
+    # problem now lands in DebugLog as well as in the email, with what the PBX was seen sending,
+    # so it is discoverable without re-reading a month of reports.
+    if built.get("phone_ok"):
+        d = built["desk"]
+        trouble = []
+        if not d.get("talk_minutes"):
+            trouble.append("no talk time attributed to anybody")
+        if built.get("phone_unresolved_minutes", 0) >= 20:
+            trouble.append(f'{built["phone_unresolved_minutes"]}m of answered calls went to '
+                           f'destinations that match no current extension '
+                           f'(e.g. {", ".join(built.get("phone_unresolved_samples") or [])[:80]})')
+        if d.get("unattributed_out_minutes"):
+            trouble.append(f'{d["unattributed_out_minutes"]}m of outbound '
+                           f'({d["unattributed_out_calls"]} calls) cannot be tied to a person')
+        if trouble:
+            DebugLog.warning(
+                message=("tech productivity phone attribution: " + "; ".join(trouble)
+                         + f' | inbound forms seen: {built.get("phone_dest_forms")}'
+                         + f' | outbound key: {built.get("phone_outbound_key") or "none"}'))
+
     html = tp.render(built, hours, core=core, options=opts, ledger_note=ledger_note)
 
     recipients = [x.strip() for x in
@@ -4988,3 +5345,70 @@ def send_ai_spend_report(hours=None, recipients_override=None, options=None):
         return f"email failed: {str(msg)[:200]}"
     return (f"sent to {len(recipients)} recipient(s): {_spend_money(t['cost_total'])} "
             f"over {t['turns']} turns")
+
+
+@app.task
+def reconcile_ai_spend():
+    """Nightly: make sure the spend ledger holds every dollar the bridge actually spent.
+
+    The live path is already belt-and-braces - each turn is POSTed as it settles, and a
+    POST that fails goes to the bridge's on-disk outbox and is retried until it lands
+    (see pibridge/src/spend-ledger.js). This is the third line: a bridge that is killed
+    with rows still in the outbox, a transcript written by a surface nobody wired up, a
+    row lost to a bug we have not found yet. It compares the session transcripts against
+    the ledger and writes whatever is missing.
+
+    Idempotent and cheap when there is nothing to do (2,646 transcripts, ~30s, and it
+    writes nothing on a healthy system). Anything it DOES find is a defect worth knowing
+    about, so a non-empty result is logged rather than passed over in silence.
+    """
+    from io import StringIO
+
+    from django.core.management import call_command
+    from logs.models import DebugLog
+
+    out = StringIO()
+    try:
+        call_command("backfill_ai_spend", stdout=out, stderr=out)
+    except Exception as e:
+        DebugLog.error(message=f"AI spend reconciliation failed: {e}")
+        return f"failed: {str(e)[:200]}"
+
+    # DOUBLE-BILLING WATCH. The backfill compares per conversation now, not per session id
+    # (a resumed session gets a new id, and the old scoping re-billed whole conversations -
+    # $44.51 across 10 of them before it was caught). This says so out loud if it ever
+    # happens again: two sessions on one ticket with byte-identical turn counts, cost and
+    # tokens is not a coincidence, it is the same work counted twice.
+    try:
+        from collections import defaultdict
+
+        from django.db.models import Count, Sum
+
+        from core.models import AISpendEntry
+
+        seen = defaultdict(set)
+        dupes = []
+        for r in (AISpendEntry.objects.exclude(ticket_ref="").values("ticket_ref", "session_id")
+                  .annotate(n=Count("id"), c=Sum("cost_total"), t=Sum("total_tokens"))):
+            sig = (r["n"], round(float(r["c"] or 0), 4), r["t"])
+            if sig[1] > 0 and sig in seen[r["ticket_ref"]]:
+                dupes.append((r["ticket_ref"], sig[1]))
+            seen[r["ticket_ref"]].add(sig)
+        if dupes:
+            total = sum(d[1] for d in dupes)
+            DebugLog.error(message=(
+                f"AI spend: {len(dupes)} conversation(s) appear to be billed twice "
+                f"(${total:.2f}): {', '.join(d[0] for d in dupes[:5])}"))
+    except Exception as e:
+        logger.warning("spend duplicate check failed: %s", e)
+    text = out.getvalue().strip()
+    last = text.splitlines()[-1] if text else "(no output)"
+    # "wrote 0 rows" is the healthy case and does not deserve a log entry every night.
+    if "wrote 0 rows" not in last:
+        DebugLog.warning(
+            message=(
+                "AI spend reconciliation recovered charges the live path missed - "
+                f"{last}. Check the bridge log for spend_ledger_error / spend_outbox lines."
+            )
+        )
+    return last

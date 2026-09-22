@@ -2199,13 +2199,55 @@ class AgentPiHistory(APIView):
     def get(self, request, agent_id):
         import requests as _requests
 
+        from core.models import AISpendEntry, session_spend_map
+
         agent = get_object_or_404(Agent, agent_id=agent_id)
         bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
         try:
             r = _requests.get(f"{bridge}/pi/history/{agent.agent_id}", timeout=10)
-            return Response(r.json())
+            data = r.json()
         except Exception:
-            return Response({"sessions": []})
+            data = {"sessions": []}
+
+        # WHAT EACH CHAT COST, FROM THE LEDGER - NOT FROM THE TRANSCRIPT.
+        #
+        # The transcript is deletable (and is deleted, by the Delete button on this very
+        # table); the ledger is append-only and outlives it. So the money is attached here
+        # rather than read out of the session file, and a conversation whose transcript is
+        # gone still appears - with its cost - flagged `transcript_deleted`. Otherwise
+        # deleting a chat quietly erases the record of what it spent, which is exactly the
+        # hole AISpendEntry was created to close.
+        spend = session_spend_map(AISpendEntry.objects.filter(agent=agent))
+        sessions = data.get("sessions") or []
+        for s in sessions:
+            row = spend.pop(s.get("session_id") or "", None)
+            if row:
+                s["cost"] = round(row["cost"], 6)
+                s["cost_turns"] = row["turns"]
+                s["cost_models"] = row["models"]
+                s["cost_recovered"] = row["backfilled"]
+            else:
+                s["cost"] = 0.0
+                s["cost_turns"] = 0
+        for sid, row in spend.items():
+            sessions.append({
+                "session_id": sid,
+                "name": "(transcript deleted)",
+                "label": "",
+                "user": row["actor"],
+                "model": (row["models"] or [""])[0],
+                "started": row["first"].isoformat() if row["first"] else "",
+                "last_activity": row["last"].isoformat() if row["last"] else "",
+                "last_message": "",
+                "multi": False,
+                "transcript_deleted": True,
+                "cost": round(row["cost"], 6),
+                "cost_turns": row["turns"],
+                "cost_models": row["models"],
+                "cost_recovered": row["backfilled"],
+            })
+        data["sessions"] = sessions
+        return Response(data)
 
     def delete(self, request, agent_id):
         import requests as _requests
