@@ -51,3 +51,37 @@ export function boundTranscript(messages, maxBytes = TRANSCRIPT_MAX_BYTES) {
     ...trimmed,
   ];
 }
+
+// How many attached images keep their bytes when a window reconnects. A screenshot is
+// ~0.5-2 MB of base64 EACH, and the transcript is re-sent in full on every refresh,
+// reconnect and model switch - so a long chat with a dozen screenshots would push tens of
+// megabytes down the socket to redraw thumbnails nobody is looking at. The most recent few
+// stay visible; older ones become a named chip with no preview (the model's own context is
+// untouched - this is the DISPLAY copy).
+const TRANSCRIPT_IMAGE_KEEP = Number(process.env.PI_TRANSCRIPT_IMAGE_KEEP || 4);
+
+export function dropOldImageData(messages, keep = TRANSCRIPT_IMAGE_KEEP) {
+  const all = Array.isArray(messages) ? messages : [];
+  if (!all.some((m) => Array.isArray(m?.content) && m.content.some((c) => c?.type === "image"))) {
+    return all; // nothing to do - and no copy of a large array for nothing
+  }
+  // A COPY: this may be `session.messages` itself, and the display trim must never reach
+  // the model's own record of the conversation.
+  const outMsgs = all.slice();
+  let budget = keep;
+  // Walk backwards: "the most recent" is what a returning technician is looking at.
+  for (let i = outMsgs.length - 1; i >= 0; i--) {
+    const m = outMsgs[i];
+    if (!m || !Array.isArray(m.content)) continue;
+    if (!m.content.some((c) => c?.type === "image")) continue;
+    outMsgs[i] = {
+      ...m,
+      content: m.content.map((c) => {
+        if (c?.type !== "image") return c;
+        if (budget > 0) { budget--; return c; }
+        return { ...c, data: "" }; // chip only - the UI renders no thumbnail for empty data
+      }),
+    };
+  }
+  return outMsgs;
+}

@@ -73,7 +73,25 @@ export function rememberSwitch(scopeKey, name, value, by = "") {
   writeRecord(scopeKey, rec);
 }
 
-export const SWITCHES = ["write", "auto_approve", "auto_credential", "allow_email"];
+// "auto_clear" is the odd one out: it carries no permission (it only decides whether a
+// FINISHED queue item disappears from the list) and it defaults ON, so it is recalled
+// through recallSwitch() rather than chooseSwitches(). It is in this list because
+// rememberSwitch() refuses to store a name it does not know.
+export const SWITCHES = ["write", "auto_approve", "auto_credential", "allow_email", "auto_clear"];
+
+/**
+ * One remembered switch, for the ones that need no permission check.
+ *
+ * Returns `dflt` when this window has never been told otherwise - which is the whole
+ * point: a default-ON switch must stay on for every new conversation, and only the window
+ * where someone turned it OFF may remember that.
+ */
+export function recallSwitch(scopeKey, name, dflt = false) {
+  const remembered = readRecord(scopeKey).switches || {};
+  return Object.prototype.hasOwnProperty.call(remembered, name)
+    ? !!remembered[name]
+    : !!dflt;
+}
 
 /**
  * The switch states this window should reopen with.

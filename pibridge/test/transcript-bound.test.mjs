@@ -74,3 +74,38 @@ test("the real ticket that caused this fits in the budget", () => {
   assert.ok(before > 2_000_000, `fixture should be megabytes, was ${before}`);
   assert.ok(after < 750_000, `expected under the 700KB bound, got ${after}`);
 });
+
+// ---- attached images ---------------------------------------------------------------
+// A screenshot is ~0.5-2 MB of base64 and the transcript is re-sent on every reconnect.
+// Recent ones stay renderable; older ones keep their place in the conversation as a chip.
+import { dropOldImageData } from "../src/transcript-bound.js";
+
+const img = (data) => ({ role: "user", content: [{ type: "image", data, mimeType: "image/png" }] });
+
+test("recent images keep their bytes, older ones are stripped to a chip", () => {
+  const msgs = [img("A"), img("B"), img("C"), img("D")];
+  const out = dropOldImageData(msgs, 2);
+  assert.equal(out[0].content[0].data, "");
+  assert.equal(out[1].content[0].data, "");
+  assert.equal(out[2].content[0].data, "C");
+  assert.equal(out[3].content[0].data, "D");
+});
+
+test("the caller's array and messages are never mutated (it may be session.messages)", () => {
+  const msgs = [img("A"), img("B")];
+  const out = dropOldImageData(msgs, 1);
+  assert.equal(msgs[0].content[0].data, "A", "the live session record must be untouched");
+  assert.notEqual(out[0], msgs[0]);
+});
+
+test("a conversation with no images is passed through by reference", () => {
+  const msgs = [msg("user", "hi"), msg("assistant", "hello")];
+  assert.equal(dropOldImageData(msgs), msgs);
+});
+
+test("text alongside an image survives the strip", () => {
+  const m = { role: "user", content: [{ type: "image", data: "A", mimeType: "image/png" }, { type: "text", text: "what is this?" }] };
+  const out = dropOldImageData([m, img("B"), img("C"), img("D")], 3);
+  assert.equal(out[0].content[0].data, "");
+  assert.equal(out[0].content[1].text, "what is this?");
+});

@@ -116,7 +116,7 @@ test("incomplete writes are ignored rather than half-remembered", () => {
 // "on refreshes whatever options are enabled (like write mode) stay enabled". Same rule as
 // the model: memory NAMES a state, it never grants one - every switch is re-checked
 // against the permissions of whoever is opening the window.
-const { rememberSwitch, chooseSwitches } = await import("../src/window-memory.js");
+const { rememberSwitch, chooseSwitches, recallSwitch } = await import("../src/window-memory.js");
 
 /** A blob for a technician with every right, and the surface defaults. */
 const full = (extra = {}) => ({
@@ -191,4 +191,20 @@ test("switch memory and model memory share one record without clobbering", () =>
 test("an unknown switch name is ignored", () => {
   rememberSwitch("w-bad", "delete_everything", true, "chris");
   assert.deepEqual(chooseSwitches("w-bad", full()).restored, []);
+});
+
+// recallSwitch: for switches with no permission behind them (Auto-clear). A default-ON
+// switch must stay on everywhere except the window that turned it off.
+test("recallSwitch returns the default until this window says otherwise", () => {
+  assert.equal(recallSwitch("AC-WIN-1", "auto_clear", true), true);
+  rememberSwitch("AC-WIN-1", "auto_clear", false, "dan");
+  assert.equal(recallSwitch("AC-WIN-1", "auto_clear", true), false);
+  // Another window is untouched by that choice.
+  assert.equal(recallSwitch("AC-WIN-2", "auto_clear", true), true);
+  // Back on, explicitly.
+  rememberSwitch("AC-WIN-1", "auto_clear", true, "dan");
+  assert.equal(recallSwitch("AC-WIN-1", "auto_clear", true), true);
+  // An unknown switch name is never stored, so it always reads as the default.
+  rememberSwitch("AC-WIN-1", "not_a_switch", false, "dan");
+  assert.equal(recallSwitch("AC-WIN-1", "not_a_switch", true), true);
 });

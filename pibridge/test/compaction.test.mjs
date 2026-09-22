@@ -129,11 +129,12 @@ test("a compaction that saved nothing is not advertised as a win", () => {
 
 // ------------------------------------------------------------------ end to end
 
-function rig({ contextTokens = 120000, compact } = {}) {
+function rig({ contextTokens = 120000, compact, trimContext } = {}) {
   const sent = [];
   let noted = null;
   const cmd = makeCompactCommand({
     session: okSession(compact ? { compact } : {}),
+    trimContext,
     costMeter: {
       get contextTokens() { return contextTokens; },
       noteCompaction(n) { noted = n; },
@@ -183,4 +184,53 @@ test("the technician sees it is working before the summarisation call", async ()
   const working = r.sent.find((f) => f.type === "working");
   assert.ok(working, "a summarisation is a slow LLM call - say so up front");
   assert.match(working.note, /Compacting/);
+});
+
+
+// ---------------------------------------------- the dead end (owner, 2026-09-22)
+//
+// "i can't summarize and compact... i can't continue": a 2.96 MB tool result put the
+// conversation past the model's window, and the harness then refused to compact it
+// ("Nothing to compact (session too small)") because the only thing after the last cut
+// point was that single result.
+
+test("an oversized tool result is dropped from context BEFORE the summariser is asked", async () => {
+  const order = [];
+  const r = rig({
+    contextTokens: 871750,
+    trimContext: () => { order.push("trim"); return { trimmed: [{ tool: "helpdesk_call", size: 2_960_000 }], freed: 2_960_000, note: "Dropped an oversized tool result from the AI's context: helpdesk_call (3.0 MB). You can carry on now." }; },
+    compact: async () => { order.push("compact"); return { summary: "s", tokensBefore: 871750, estimatedTokensAfter: 30000 }; },
+  });
+  await r.cmd.run("/compact");
+  assert.deepEqual(order, ["trim", "compact"], "trimming first is what makes the compaction able to help");
+  // The technician is told what was dropped, in the transcript, not just in a log.
+  const note = r.sent.find((f) => f.type === "system_note");
+  assert.match(note.text, /helpdesk_call/);
+});
+
+test("when the harness refuses on a huge conversation, the message says what is actually wrong", async () => {
+  const r = rig({
+    contextTokens: 871750,
+    trimContext: () => ({ trimmed: [{ tool: "helpdesk_call", size: 2_960_000 }], freed: 2_960_000, note: "Dropped an oversized tool result from the AI's context: helpdesk_call (3.0 MB)." }),
+    compact: async () => { throw new Error("Nothing to compact (session too small)"); },
+  });
+  const res = await r.cmd.run("/compact");
+  assert.equal(res.ok, false);
+  const err = r.sent.filter((f) => f.type === "error").at(-1).text || r.sent.filter((f) => f.type === "error").at(-1).message;
+  // NOT "the session is too small" to someone staring at 871,750 tokens.
+  assert.match(err, /871,750 tokens against a 200,000-token window/);
+  assert.match(err, /nothing for the summariser to cut/);
+  assert.match(err, /send your message again/);
+  assert.doesNotMatch(err, /Nothing was changed/);
+});
+
+test("the same refusal on a genuinely small conversation still reads as the harness said it", async () => {
+  const r = rig({
+    contextTokens: 30000,
+    compact: async () => { throw new Error("Nothing to compact (session too small)"); },
+  });
+  await r.cmd.run("/compact");
+  const err = r.sent.filter((f) => f.type === "error").at(-1);
+  assert.match(err.message, /Could not compact the conversation/);
+  assert.match(err.message, /exactly as it was/);
 });

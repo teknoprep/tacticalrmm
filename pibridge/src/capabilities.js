@@ -118,6 +118,45 @@ export const SURFACE_CLASSES = {
   triage:        ["read"],
   // Learning: reads closed tickets, writes only to our own stores.
   mining:        ["read", "knowledge"],
+  // TICKET AUTOMATION SUBJECTS (2026-09-15): a ticket the owner has said the AI may work
+  // alone, within the subject's mode.
+  //   advise            - reply to the customer and leave notes. This surface is built with
+  //                       NO device toolbelt at all (see runAutowork), so "never touch a
+  //                       file" is not a rule it follows - it is a tool it does not have.
+  //   autowork_readonly - the same, plus read-only device probes; write tools are not
+  //                       constructed and run_device_command refuses anything mutating.
+  // Neither may close, route, or reach credentials. Closing stays with a human.
+  // NOTE ON CLOSING (2026-09-17): an automation that resolves a ticket DOES file it to AI
+  // Closed, along with the duplicates it answered - but that is done by CODE at the end of
+  // the run, from the verdict, exactly like the customer reply. The model never holds a
+  // closing tool, so these surfaces still carry no `close` class. Same reason as always:
+  // the model reports what it found; the code decides what happens.
+  advise:            ["read", "note", "customer"],
+  autowork_readonly: ["read", "note", "customer"],
+  //   autowork_fix      - the same, plus a REVIEWED remediation the owner attached to the
+  //                       subject as data (fix_actions). The model chooses an action by
+  //                       NAME; it cannot compose a command, so the blast radius is the
+  //                       list a human wrote and nothing else. Still no closing authority:
+  //                       a fix that works posts a note and leaves the ticket for a human.
+  autowork_fix:      ["read", "note", "customer"],
+  // PRE-SALES DISCOVERY on a CRM opportunity (2026-09-16). An IT tech surveys what the
+  // customer actually has so a sales rep can quote it. Read the estate, read tickets and
+  // KB, record findings ON THE OPPORTUNITY, and (with the role permission) draft a quote.
+  //
+  // `customer` is deliberately ABSENT: a discovery session never contacts the customer.
+  // Pre-sales correspondence is the sales rep's job and their relationship to manage; an
+  // AI emailing a prospect mid-survey could cost the deal. `close` and `routing` are
+  // absent because there is no ticket here to close or re-route, and both `secret`
+  // classes are absent because surveying what exists needs no stored credential.
+  //
+  // KNOWLEDGE IS READ-ONLY HERE (owner's ruling, 2026-09-16). Discovery may READ every KB
+  // article - that is how it learns the customer's estate - but it writes NOTHING to the
+  // knowledge base. A scope is a proposal about work nobody has done yet, and filing
+  // proposals as knowledge pollutes the KB with things that were never verified, and may
+  // never even be sold. ALL of it belongs on the opportunity, which is where the deal
+  // lives. KB articles get written when a TICKET does the work and the facts are real.
+  // (`knowledge` and `global_knowledge` are the write classes; reads are class `read`.)
+  discovery:         ["read", "note", "sales"],
 };
 
 // "warn"    - log what WOULD be denied, allow it through (observation window)
@@ -216,7 +255,12 @@ export function checkOp({ surface, op, opClasses, mutating, grants }) {
 // about it - and because a credential READ is not a mutating operation, no approval gate
 // stands behind the class check to catch it. There is no observation window worth that, so
 // these two classes are enforced from the moment they are checked.
-const ALWAYS_ENFORCED = new Set(["secret", "secret_write"]);
+// `customer` joined them 2026-09-15. Six weeks of warn-mode logs showed an UNATTENDED
+// scheduled task emailing a customer (surface=unattended op=reply_to_ticket) and three
+// resolving tickets - the exact acts the class system exists to stop, logged and then
+// allowed. An email to a customer is as irreversible as a password handed to the model;
+// no observation window is worth one sent by a job nobody was watching.
+const ALWAYS_ENFORCED = new Set(["secret", "secret_write", "customer"]);
 
 export function gateOp(ctx) {
   const v = checkOp(ctx);

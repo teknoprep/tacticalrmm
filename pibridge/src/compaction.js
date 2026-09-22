@@ -157,6 +157,9 @@ export function parseCompactCommand(text) {
 export function makeCompactCommand({
   session, costMeter, send, log, key, sessionId,
   currentModel = () => null, rateLookup = null, inTurn = (fn) => fn(),
+  // Optional: drop oversized tool results out of the model's context before summarising
+  // (context-trim.js). Injected so this module keeps no opinion about session internals.
+  trimContext = null,
   // "Summarise & clear history": writes a durable cut marker into the session file so
   // every rebuilt transcript (reload, resume, the phone) starts at the cut. Optional -
   // a surface that does not pass it simply cannot clear.
@@ -185,6 +188,24 @@ export function makeCompactCommand({
         return { ok: false, skipped: true };
       }
 
+      // ONE OVERSIZED TOOL RESULT FIRST (see context-trim.js). Compaction summarises whole
+      // turns up to a cut point and KEEPS the recent tail - so a single 3 MB tool result
+      // sitting in that tail survives the compaction and the chat stays wedged. Worse, when
+      // the tail is the only thing after the last cut point, the harness refuses outright
+      // with "Nothing to compact (session too small)" on a conversation of 871,000 tokens,
+      // which is where the owner found himself on 2026-09-22: unable to talk to it AND
+      // unable to compact it.
+      //
+      // Dropping the monster out of CONTEXT (never out of the transcript) both un-wedges
+      // the window on its own and gives the summariser something it can actually cut.
+      let trimmed = { trimmed: [], freed: 0, note: "" };
+      if (typeof trimContext === "function") {
+        try { trimmed = trimContext() || trimmed; } catch (e) {
+          log?.("compact_trim_error", key, sessionId, String(e?.message || e).slice(0, 200));
+        }
+        if (trimmed.note) send({ type: "system_note", text: trimmed.note });
+      }
+
       send({
         type: "working", elapsed_ms: 0, quiet_ms: 0, alive: true, last_byte_ms: null,
         bytes: 0, tools_in_flight: 0,
@@ -208,8 +229,29 @@ export function makeCompactCommand({
       }
 
       if (!res.ok) {
-        send({ type: "error", message: `Could not compact the conversation: ${res.error}. Nothing was changed - the chat is exactly as it was.` });
-        return res;
+        // "Nothing to compact (session too small)" from the harness means there is no cut
+        // point it is willing to use - NOT that the conversation is small. Saying "too
+        // small" to someone looking at a 871k-token window that refuses every prompt is
+        // how a person ends up with no idea what to do, so say what is actually true and
+        // what just happened about it.
+        const tooSmall = /too small|nothing to compact/i.test(String(res.error || ""));
+        const huge = window > 0 && before >= window * 0.8;
+        let message = `Could not compact the conversation: ${res.error}. Nothing was changed - the chat is exactly as it was.`;
+        if (tooSmall && huge) {
+          message =
+            `This conversation is ${before.toLocaleString("en-US")} tokens against a ` +
+            `${window.toLocaleString("en-US")}-token window, but it cannot be summarised: ` +
+            `everything since the last summary is a single exchange, so there is nothing for ` +
+            `the summariser to cut. ` +
+            (trimmed.trimmed.length
+              ? `The oversized tool output has been dropped from the AI's context, so send your ` +
+                `message again - it should go through now.`
+              : `The weight is not in the conversation - it is in one large tool result. Start a ` +
+                `new chat (the transcript and cost stay in AI History), or ask an admin to check ` +
+                `the bridge log for the oversized tool call.`);
+        }
+        send({ type: "error", message });
+        return { ...res, trimmed: trimmed.trimmed };
       }
 
       const after = res.tokensAfter || 0;

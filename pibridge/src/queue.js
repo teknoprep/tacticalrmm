@@ -32,7 +32,39 @@ import { CONFIG } from "./config.js";
 
 export const QUEUE_MAX_ITEMS = Number(process.env.PI_QUEUE_MAX_ITEMS || 100);
 export const QUEUE_MAX_TEXT = Number(process.env.PI_QUEUE_MAX_TEXT || 8000);
-export const QUEUE_MAX_HISTORY = Number(process.env.PI_QUEUE_MAX_HISTORY || 500);
+// The history is no longer only "what the queue did": since 2026-09-14 it records EVERY
+// prompt that reached the model in this conversation, whoever sent it and from where (see
+// notePrompt). That is what an operator means by "the history" - a chat that scrolled
+// past, or was summarised away by /compact, still has to be answerable for what it was
+// asked. Hence a much larger cap; it is only ever read by a human, never by the model.
+export const QUEUE_MAX_HISTORY = Number(process.env.PI_QUEUE_MAX_HISTORY || 5000);
+// Per entry. Prompts can be long; the history is a record of WHAT was asked, and 4k of a
+// pasted log adds nothing a human will read.
+export const QUEUE_HISTORY_TEXT = Number(process.env.PI_QUEUE_HISTORY_TEXT || 2000);
+// A name, not an essay. Long enough for "Firstname Lastname (username)" shapes.
+const ACTOR_MAX = 150;
+
+/**
+ * WHO DID IT.
+ *
+ * A live session is shared: one person drives, others watch, the seat is handed over, and
+ * a paired phone is another socket on the same conversation. So "the operator" is not one
+ * person over the life of a chat, and a history that only says WHAT was asked cannot
+ * answer the question an admin actually has - who asked it. Every row therefore carries
+ * the person responsible for it: `user` (the login, stable, what you search on) and `by`
+ * (their display name, what a human reads).
+ *
+ * Rows with no actor are the AI's own or the bridge's (a question from the model, a
+ * provider failure) and are left blank rather than being attributed to whoever was
+ * watching at the time.
+ */
+function actorOf(a) {
+  if (!a || typeof a !== "object") return null;
+  const user = String(a.user || a.username || "").slice(0, ACTOR_MAX);
+  const display = String(a.display || a.user_display || user || "").slice(0, ACTOR_MAX);
+  if (!user && !display) return null;
+  return { user, display };
+}
 
 // "waiting" = the assistant asked a question on this item and is waiting for the answer.
 // It is the one state auto-clear never touches: the question IS the work in progress.
@@ -44,23 +76,56 @@ function queuePath(root, scopeKey, sessionId) {
   return path.join(dir, `${sessionId}.json`);
 }
 
-function emptyState() {
-  return { version: 1, auto_next: false, auto_clear_done: false, paused: null, items: [], questions: [], history: [] };
+// WHERE A QUEUED ITEM'S IMAGES LIVE.
+//
+// Images are kept in a per-item sidecar file, NOT in the queue state, because the state
+// file is rewritten on every publish (a queue tick, a status change, an answer) and a
+// couple of 8 MB screenshots inlined there would turn each of those into a multi-megabyte
+// disk write. Text attachments need no storage at all: they are inlined into the prompt
+// text at queue time, exactly as they are for a typed prompt.
+function attachPath(root, scopeKey, sessionId, itemId) {
+  const dir = path.join(root, scopeKey, "queue", "attachments");
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${sessionId}.${itemId}.json`);
 }
 
-function sanitize(raw) {
-  const st = emptyState();
+// An item that no longer exists must not leave megabytes of screenshots behind.
+function dropAttachments(root, scopeKey, sessionId, itemId) {
+  try { fs.unlinkSync(attachPath(root, scopeKey, sessionId, itemId)); } catch { /* none, or already gone */ }
+}
+
+// AUTO-CLEAR DEFAULTS ON (owner, 2026-09-22): "auto clear should always be selected by
+// default unless that chat window turned it off, which should be persistent".
+//
+// It only decides whether a FINISHED item leaves the list, so ON is the tidy default and
+// OFF is the deliberate choice - which means the stored value alone is not enough to go
+// on. `auto_clear_set` records that a PERSON chose; without it the default applies, so
+// state written before this change (when the default was OFF and every file therefore
+// said false) does not read as forty windows having asked for it off.
+function emptyState(autoClearDefault = true) {
+  return { version: 1, auto_next: false, auto_clear_done: !!autoClearDefault, auto_clear_set: false, paused: null, items: [], questions: [], history: [], prompts_backfilled: false };
+}
+
+function sanitize(raw, autoClearDefault = true) {
+  const st = emptyState(autoClearDefault);
   if (!raw || typeof raw !== "object") return st;
   st.auto_next = !!raw.auto_next;
-  st.auto_clear_done = !!raw.auto_clear_done;
+  // Only an explicit choice survives; anything else takes this window's default.
+  st.auto_clear_set = !!raw.auto_clear_set;
+  st.auto_clear_done = st.auto_clear_set ? !!raw.auto_clear_done : !!autoClearDefault;
   st.paused = raw.paused && typeof raw.paused === "object" && raw.paused.reason
-    ? { reason: String(raw.paused.reason).slice(0, 1000), at: raw.paused.at || null, by: raw.paused.by || "system" }
+    ? { reason: String(raw.paused.reason).slice(0, 1000), at: raw.paused.at || null, by: raw.paused.by || "system", who: typeof raw.paused.who === "string" ? raw.paused.who.slice(0, ACTOR_MAX) : "" }
     : null;
   for (const it of Array.isArray(raw.items) ? raw.items : []) {
     if (!it || typeof it !== "object" || !it.id || typeof it.text !== "string") continue;
     st.items.push({
       id: String(it.id),
       text: it.text.slice(0, QUEUE_MAX_TEXT),
+      // Who queued (or typed) it - carried so the history rows this item generates later
+      // (started, done, failed) name the person whose work it is, not whoever is watching
+      // the window when it eventually runs.
+      by: typeof it.by === "string" ? it.by.slice(0, ACTOR_MAX) : "",
+      user: typeof it.user === "string" ? it.user.slice(0, ACTOR_MAX) : "",
       compact_first: !!it.compact_first,
       status: STATUSES.has(it.status) ? it.status : "pending",
       added_at: it.added_at || null,
@@ -72,7 +137,7 @@ function sanitize(raw) {
       thread: Array.isArray(it.thread)
         ? it.thread
             .filter((t) => t && typeof t.text === "string" && (t.role === "assistant" || t.role === "operator"))
-            .map((t) => ({ role: t.role, text: t.text.slice(0, 4000), at: t.at || null, via: t.via || undefined }))
+            .map((t) => ({ role: t.role, text: t.text.slice(0, 4000), at: t.at || null, via: t.via || undefined, by: typeof t.by === "string" ? t.by.slice(0, ACTOR_MAX) : undefined }))
         : [],
     });
   }
@@ -98,9 +163,14 @@ function sanitize(raw) {
       text: typeof h.text === "string" ? h.text.slice(0, 4000) : "",
       detail: typeof h.detail === "string" ? h.detail.slice(0, 4000) : "",
       item_id: h.item_id ? String(h.item_id) : null,
+      // Blank on rows written before the history recorded who sent them, and on the AI's
+      // own rows. The window shows "unknown" rather than guessing.
+      by: typeof h.by === "string" ? h.by.slice(0, ACTOR_MAX) : "",
+      user: typeof h.user === "string" ? h.user.slice(0, ACTOR_MAX) : "",
     });
   }
   if (st.history.length > QUEUE_MAX_HISTORY) st.history = st.history.slice(-QUEUE_MAX_HISTORY);
+  st.prompts_backfilled = !!raw.prompts_backfilled;
   return st;
 }
 
@@ -126,10 +196,19 @@ export function queuePromptSection() {
  * @param {function} o.isStreaming  () => boolean
  * @param {string}   [o.root]       sessions root (tests override)
  */
-export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStreaming, root = CONFIG.sessionsRoot }) {
+export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStreaming, root = CONFIG.sessionsRoot,
+  // The SAME intake the composer uses (attachments.js): byte-sniffing, size caps, images
+  // only when the model accepts them, and a spoken refusal for anything it will not take.
+  // Injected rather than imported so the queue keeps no opinion about attachments.
+  intake = null, compose = (text) => text,
+  // AUTO-CLEAR. On unless THIS window has been told otherwise - the caller reads that from
+  // window-memory.js (recallSwitch) so the choice outlives the session, the socket and the
+  // bridge, and reports it back through onSwitch when someone flips it.
+  autoClearDefault = true, onSwitch = null }) {
   let sessionId = null;
+  let inherited = "";        // the session id this queue was carried over from, if any
   let file = null;
-  let st = emptyState();
+  let st = emptyState(autoClearDefault);
   let detached = false;
   let engineBusy = false;
   let runningId = null;
@@ -154,7 +233,12 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       pending,
       items: st.items.map(({ pending_question, ...i }) => ({ ...i })),
       questions: st.questions.map((q) => ({ ...q })),
-      history: st.history.map((h) => ({ ...h })),
+      // COUNT ONLY. queue_state is sent on every queue change, and the history now holds
+      // every prompt of the conversation - shipping all of it on each frame would put
+      // hundreds of KB on the socket repeatedly, which is exactly what once starved the
+      // heartbeat and made chats "keep disconnecting" (see transcript-bound.js). The
+      // window asks for the list when the operator opens it, and gets it fresh.
+      history_count: st.history.length,
     };
   }
 
@@ -163,27 +247,48 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     try { send(snapshot()); } catch { /* socket gone */ }
   }
 
+  /** The full history, on request. Oldest first; the window reverses it for display. */
+  function sendHistory() {
+    try {
+      send({
+        type: "queue_history",
+        count: st.history.length,
+        history: st.history.map((h) => ({ ...h })),
+      });
+    } catch { /* socket gone */ }
+  }
+
   /**
    * Append to the human-facing history. `text` is what it was about (the prompt or the
    * question), `detail` how it went (the answer, the failure, who did it). Capped so a
    * long-lived conversation cannot grow the file without bound.
    */
-  function record(event, { text = "", detail = "", item = null } = {}) {
+  function record(event, { text = "", detail = "", item = null, actor = null } = {}) {
+    // Explicit actor first (the socket that sent this frame), then the item's owner - so
+    // "started/done/failed" on a queued prompt is attributed to whoever queued it, hours
+    // later and whoever is watching by then. `actor: false` means "nobody": the row is
+    // the AI's or the bridge's, and must not borrow the item owner's name.
+    const who = actor === false
+      ? null
+      : actorOf(actor) || actorOf(item ? { user: item.user, display: item.by } : null);
     st.history.push({
       at: now(),
       event,
-      text: String(text || "").slice(0, 4000),
-      detail: String(detail || "").slice(0, 4000),
+      text: String(text || "").slice(0, QUEUE_HISTORY_TEXT),
+      detail: String(detail || "").slice(0, QUEUE_HISTORY_TEXT),
       item_id: item ? item.id : null,
+      by: who ? who.display : "",
+      user: who ? who.user : "",
     });
     if (st.history.length > QUEUE_MAX_HISTORY) st.history.splice(0, st.history.length - QUEUE_MAX_HISTORY);
   }
 
-  function pause(reason, by = "system") {
+  function pause(reason, by = "system", actor = null) {
     if (st.paused && !(by === "assistant" && st.paused.by === "assistant")) return;
-    st.paused = { reason: String(reason || "paused").slice(0, 1000), at: now(), by };
-    log?.("queue_paused", key(), `${by}: ${st.paused.reason.slice(0, 200)}`);
-    if (by !== "assistant") record("paused", { text: st.paused.reason, detail: `by ${by}` });
+    const who = actorOf(actor);
+    st.paused = { reason: String(reason || "paused").slice(0, 1000), at: now(), by, who: who ? who.display : "" };
+    log?.("queue_paused", key(), `${who ? who.display : by}: ${st.paused.reason.slice(0, 200)}`);
+    if (by !== "assistant") record("paused", { text: st.paused.reason, detail: `by ${who ? who.display : by}`, actor: who });
   }
 
   function nextPending() {
@@ -215,7 +320,18 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       }
       if (detached) throw new Error("window closed");
       send({ type: "queue_started", id: item.id, text, reply: isReply });
-      await runPrompt(text);
+      // The files queued WITH this prompt, read back at the moment it runs.
+      let images = [];
+      if (!isReply && item.images) {
+        try { images = JSON.parse(fs.readFileSync(attachPath(root, scopeKey, sessionId, item.id), "utf8")); }
+        catch { images = []; }
+        if (!images.length) {
+          // Never silent: the operator queued a screenshot and the model is about to answer
+          // without it, which is worse than refusing.
+          send({ type: "error", message: `The ${item.images} image(s) queued with "${item.text.slice(0, 40)}" could not be read back - answering without them.` });
+        }
+      }
+      await runPrompt(text, images);
       if (item.status === "failed") {
         // noteError() already marked it and paused the queue.
       } else if (st.questions.some((q) => q.item_id === item.id)) {
@@ -238,11 +354,18 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       item.ended_at = now();
       runningId = null;
       engineBusy = false;
-      // Auto-clear: a finished item leaves the list on its own. Only a plain "done" -
-      // failed, skipped and waiting ones still need the technician, and a done item that
-      // carried a question-and-answer keeps its trail visible until "Clear done".
-      if (st.auto_clear_done && item.status === "done" && !item.thread.length) {
+      // Auto-clear: a finished item leaves the list on its own. Only a plain "done" goes -
+      // failed, skipped and waiting ones still need the technician.
+      //
+      // A done item that carried a question-and-answer USED to be kept back, so its trail
+      // stayed visible. That is why "auto clear is on, but it doesn't auto clear" (owner,
+      // 2026-09-22): most finished work has a question in it somewhere, so most items sat
+      // there with the switch on, and enabling the switch swept them anyway (below) - the
+      // two paths disagreed. The trail is not lost by clearing: the question, the answer,
+      // the time and who gave it are all in the history, which is one click away.
+      if (st.auto_clear_done && item.status === "done") {
         st.items = st.items.filter((i) => i.id !== item.id);
+        if (item.images) dropAttachments(root, scopeKey, sessionId, item.id);
         record("auto_cleared", { text: item.text, item });
       }
       publish();
@@ -268,18 +391,117 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
 
   const queue = {
     /** Two-phase start: the session id exists only after createAgentSession(). */
-    attach(sid) {
+    /**
+     * Bind the queue to this session instance.
+     *
+     * @param {string} sid           the live session id
+     * @param {string} inheritFrom   the id this session was RESUMED from, if any
+     *
+     * THE QUEUE BELONGS TO THE CONVERSATION, NOT TO THE PROCESS. Resuming a conversation
+     * mints a NEW session id (the harness assigns it), and the queue state was written
+     * under the OLD one - so every reconnect, and therefore every one of our deploys,
+     * silently abandoned the queue: items gone, pause state gone, history gone, nothing
+     * left to resume. The work was on disk the whole time, under a filename nobody looked
+     * at again.
+     *
+     * So a session that resumed another one inherits its queue and re-persists it under
+     * the new id. Only when this session has NO state of its own, so a real queue is
+     * never overwritten by an older one.
+     */
+    attach(sid, inheritFrom = "") {
       sessionId = String(sid);
       file = queuePath(root, scopeKey, sessionId);
-      try { st = sanitize(JSON.parse(fs.readFileSync(file, "utf8"))); }
-      catch { st = emptyState(); }
+      try { st = sanitize(JSON.parse(fs.readFileSync(file, "utf8")), autoClearDefault); }
+      catch { st = null; }
+      if (!st && inheritFrom && String(inheritFrom) !== sessionId) {
+        try {
+          st = sanitize(JSON.parse(fs.readFileSync(queuePath(root, scopeKey, String(inheritFrom)), "utf8")), autoClearDefault);
+          inherited = String(inheritFrom);
+        } catch { st = null; }
+      }
+      if (!st) st = emptyState(autoClearDefault);
       // A session that was mid-run when its window went away must not restart on its
       // own. Any item still "running" from that life is a pending one now.
-      for (const it of st.items) if (it.status === "running") it.status = "pending";
-      if (st.auto_next && nextPending() && !st.paused) {
+      //
+      // It also means the work was INTERRUPTED - the bridge was restarted (we deploy
+      // often), the server bounced, or the connection dropped mid-answer. That is not the
+      // same as reopening a window, and it must not be silent: the operator is told what
+      // was in flight and asked whether to run it again. Their call, not ours - re-running
+      // a turn costs money and may repeat an action.
+      const interrupted = st.items.filter((it) => it.status === "running");
+      for (const it of interrupted) {
+        it.status = "pending";
+        it.started_at = null;
+        it.note = "interrupted - the session stopped while this was running";
+        record("interrupted", { text: it.text, detail: "the session stopped while this was running", item: it });
+      }
+      if (interrupted.length) {
+        const what = interrupted[interrupted.length - 1].text.replace(/\s+/g, " ").slice(0, 160);
+        pause(
+          `Interrupted: "${what}" was still running when this session stopped (a server restart or a dropped ` +
+          `connection). Press Resume to run it again, or skip it in the queue.`,
+          "system",
+        );
+      } else if (st.auto_next && nextPending() && !st.paused) {
         pause("Window reopened - press Resume to continue the queue", "system");
       }
+      if (inherited) {
+        record("resumed", { text: "Queue carried over from the previous session", detail: inherited.slice(0, 8) });
+      }
+      // WITH THE SWITCH ON, A REOPENED WINDOW STARTS TIDY TOO. Items that finished while
+      // the rule was different (or before Auto-clear was turned on) would otherwise sit
+      // there for good, which is exactly what "auto clear is on but it doesn't auto clear"
+      // looked like. Only plain "done" goes; failed, skipped and waiting still need a human.
+      if (st.auto_clear_done) {
+        for (const it of st.items.filter((i) => i.status === "done")) {
+          if (it.images) dropAttachments(root, scopeKey, sessionId, it.id);
+          record("auto_cleared", { text: it.text, item: it });
+        }
+        st.items = st.items.filter((i) => i.status !== "done");
+      }
       publish();
+    },
+
+    /**
+     * One-time repair for conversations that predate prompt recording.
+     *
+     * Every prompt is recorded from now on (notePrompt), but a conversation that has been
+     * running for a week would still open showing only the handful of queue events from
+     * its early days - which is precisely the complaint. The transcript already holds
+     * every prompt, so the history is rebuilt from it once, in time order, and the flag
+     * stops it ever being done twice.
+     *
+     * @param {Array<{at?:string, text:string}>} prompts  oldest first, from the session file
+     */
+    backfillPrompts(prompts) {
+      if (st.prompts_backfilled) return 0;
+      st.prompts_backfilled = true;
+      const list = (Array.isArray(prompts) ? prompts : [])
+        .map((p) => ({ at: p?.at || null, text: String(p?.text || "").trim() }))
+        .filter((p) => p.text);
+      if (!list.length) { persist(); return 0; }
+      const rows = list.map((p) => ({
+        at: p.at,
+        event: "prompt",
+        text: p.text.slice(0, QUEUE_HISTORY_TEXT),
+        detail: "recovered from the transcript",
+        item_id: null,
+        // The transcript does not say who typed these, and a guess in an audit is worse
+        // than a blank: the window shows them as "unknown".
+        by: "",
+        user: "",
+      }));
+      // Merge, oldest first: the recovered prompts belong BETWEEN the queue events that
+      // already have timestamps, not bolted on at either end.
+      st.history = [...st.history, ...rows].sort((a, b) =>
+        String(a.at || "").localeCompare(String(b.at || "")),
+      );
+      if (st.history.length > QUEUE_MAX_HISTORY) {
+        st.history = st.history.slice(-QUEUE_MAX_HISTORY);
+      }
+      log?.("queue_history_backfill", key(), `${rows.length} prompt(s) recovered`);
+      publish();
+      return rows.length;
     },
 
     detach() { detached = true; persist(); },
@@ -290,8 +512,9 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
 
     /** The operator typed something (not a window command). If we were waiting on
      *  them, that is the answer: clear the pause so the queue continues after this turn. */
-    noteOperatorReply(text = "") {
+    noteOperatorReply(text = "", actor = null) {
       if (!st.paused && !st.questions.length) return;
+      const who = actorOf(actor);
       st.paused = null;
       // A reply typed in the chat answers whatever was open. If a question belonged to a
       // queued item, the answer is recorded on that item and it counts as done, so the
@@ -299,22 +522,113 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       for (const q of st.questions) {
         const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
         if (it) {
-          it.thread.push({ role: "operator", text: String(text || "").slice(0, 4000), at: now(), via: "chat" });
+          it.thread.push({ role: "operator", text: String(text || "").slice(0, 4000), at: now(), via: "chat", by: who ? who.display : undefined });
           if (it.status === "waiting") { it.status = "done"; it.ended_at = now(); }
         }
-        record("answered_in_chat", { text: q.text, detail: String(text || ""), item: it });
+        // The ANSWER is this person's, even when the item was queued by someone else.
+        record("answered_in_chat", { text: q.text, detail: String(text || ""), item: it, actor: who });
       }
       st.questions = [];
       log?.("queue_resumed", key(), "operator replied in chat");
       publish();
     },
 
+    /**
+     * A prompt reached the model. EVERY one is recorded here - typed in the chat, sent
+     * from a paired phone, or steered into a running turn - because the queue panel's
+     * History is where an operator goes to answer "what was this conversation asked?".
+     * Until now it only showed what the QUEUE did, so a conversation driven by typing
+     * (which is most of them) showed a handful of entries and looked empty or stale.
+     *
+     * Queue-driven prompts are skipped: they are already recorded as `started` /
+     * `answer_sent`, with the item they belong to.
+     */
+    /**
+     * A prompt TYPED IN THE CHAT becomes the active queue item (owner's ruling 2026-09-16).
+     *
+     * Before this, typing in the chat and queueing work were two different worlds: a typed
+     * prompt ran immediately and left only a line in the history, so if the bridge restarted
+     * mid-answer the window came back with no record of what was being worked and nothing to
+     * resume. The queue is meant to be the list of what this conversation is doing - so what
+     * you type IS the active item.
+     *
+     * The chat still runs it (the caller owns the turn); this only makes it visible and
+     * resumable. Steers are excluded: a steer edits the turn in flight rather than being a
+     * new piece of work, and would otherwise duplicate the item already running.
+     *
+     * @returns {string} item id, to settle later. "" when nothing was recorded.
+     */
+    beginTypedItem(text, origin = "browser", actor = null) {
+      const body = String(text || "").trim();
+      if (!body || origin === "queue") return "";
+      const who = actorOf(actor);
+      // The chat is driving this turn, so an item created here is already running: it must
+      // not be picked up a second time by advance().
+      const item = {
+        id: randomUUID(), text: body.slice(0, 4000), compact_first: false, status: "running",
+        typed: true, origin, note: "", thread: [], created_at: now(), started_at: now(), ended_at: null,
+        by: who ? who.display : "", user: who ? who.user : "",
+      };
+      st.items.push(item);
+      if (st.items.length > QUEUE_MAX_ITEMS) st.items.splice(0, st.items.length - QUEUE_MAX_ITEMS);
+      runningId = item.id;
+      record("started", { text: item.text, detail: origin === "phone" ? "typed on the phone" : "typed in the chat", item, actor: who });
+      publish();
+      return item.id;
+    },
+
+    /** The typed turn finished (or died). Settles the item the chat was running. */
+    settleTypedItem(id, ok, note = "") {
+      if (!id) return;
+      const it = st.items.find((i) => i.id === id);
+      if (!it || it.status !== "running") return;
+      it.status = ok ? "done" : "failed";
+      it.note = String(note || "").slice(0, 300);
+      it.ended_at = now();
+      if (runningId === id) runningId = null;
+      record(ok ? "done" : "failed", { text: it.text, detail: it.note, item: it });
+      // Same rule as a queued item (see runItem): with the switch on, a finished prompt
+      // leaves the list whether or not the assistant asked something along the way.
+      if (st.auto_clear_done && it.status === "done") {
+        st.items = st.items.filter((x) => x.id !== it.id);
+        if (it.images) dropAttachments(root, scopeKey, sessionId, it.id);
+        record("auto_cleared", { text: it.text, item: it });
+      }
+      publish();
+    },
+
+    notePrompt(text, origin = "browser", { steer = false, actor = null } = {}) {
+      if (origin === "queue") return;
+      // An attached text file is INLINED into the prompt between sentinels
+      // (attachments.js). The history wants "what was asked", not 200 KB of pasted log,
+      // so the bodies come out and the fact of the attachment stays.
+      const raw = String(text || "");
+      const names = [];
+      const body = raw
+        .replace(/\[\[pi-attachment:([^\]|]*)\|(\d+)\]\]\n?[\s\S]*?\[\[\/pi-attachment\]\]/g,
+          (_m, name) => { names.push(name); return ""; })
+        .replace(/The technician attached \d+ file\(s\)\. Their full contents follow[^\n]*\n?/g, "")
+        .trim();
+      if (!body && !names.length) return;
+      const from = origin === "phone" ? "from the paired phone" : "";
+      const attached = names.length ? `with ${names.join(", ")}` : "";
+      record(steer ? "steer" : (origin === "phone" ? "prompt_phone" : "prompt"), {
+        text: body || "(attachment only)",
+        detail: [from, attached].filter(Boolean).join(" \u00b7 "),
+        actor,
+      });
+      publish();
+    },
+
     /** Operator pressed Stop. */
-    noteAbort() {
+    noteAbort(actor = null) {
       if (!st.auto_next && !runningId) return;
+      const who = actorOf(actor);
       const it = st.items.find((i) => i.id === runningId);
-      if (it) { it.status = "failed"; it.note = "stopped by operator"; record("stopped", { text: it.text, detail: "by operator", item: it }); }
-      pause("Stopped by the operator", "operator");
+      // The STOP belongs to whoever pressed it, which is not necessarily the person whose
+      // prompt was running - that is exactly the kind of thing an admin is looking for.
+      if (it) { it.status = "failed"; it.note = `stopped by ${who ? who.display : "operator"}`; record("stopped", { text: it.text, detail: `by ${who ? who.display : "operator"}`, item: it, actor: who }); }
+      pause("Stopped by the operator", "operator", who);
       publish();
     },
 
@@ -335,7 +649,8 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       if (!st.questions.some((q) => q.text === question && q.item_id === (it ? it.id : null))) {
         st.questions.push({ id: randomUUID(), item_id: it ? it.id : null, text: question, at: now() });
         if (it) it.thread.push({ role: "assistant", text: question, at: now() });
-        record("asked", { text: question, detail: it ? `while running: ${it.text.slice(0, 200)}` : "in chat", item: it });
+        // The AI asked this, not the person whose item it came up on.
+        record("asked", { text: question, detail: it ? `while running: ${it.text.slice(0, 200)}` : "in chat", item: it, actor: false });
       }
       pause(question, "assistant");
       log?.("queue_question", key(), `${it ? "on item" : "standalone"}: ${question.slice(0, 160)}`);
@@ -363,13 +678,37 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
 
     /**
      * Route a `queue_*` frame from the window. Returns true when it was one of ours.
+     *
+     * `actor` is the person on the socket that sent the frame ({user, display}); a shared
+     * session has several, and the history names the one who did each thing rather than
+     * "the operator".
      */
-    async handle(msg) {
+    async handle(msg, actor = null) {
       if (!msg || typeof msg.type !== "string" || !msg.type.startsWith("queue_")) return false;
+      const who = actorOf(actor);
+      // Every row this frame writes is attributed to its sender. Passing `actor` last
+      // would let a call site's own attribution win; it does not - the socket is the
+      // authority on who pressed the button.
+      const rec = (event, opts = {}) => record(event, { ...opts, actor: who });
       switch (msg.type) {
         case "queue_add": {
-          const text = String(msg.text || "").trim().slice(0, QUEUE_MAX_TEXT);
-          if (!text) break;
+          // ATTACHMENTS ON A QUEUED PROMPT. Screenshots and logs are often the whole point
+          // of the request ("fix what this error says"), and until now they could only be
+          // sent with a prompt typed right now - so queueing work meant losing the evidence.
+          // Processed at ADD time, not run time, so a refusal is reported while the operator
+          // is still looking at the window instead of an hour later.
+          const att = intake ? intake(msg) : { images: [], text: "", accepted: [], rejected: [] };
+          const text = String(compose(String(msg.text || ""), att.text) || "").trim().slice(0, QUEUE_MAX_TEXT);
+          if (!text) {
+            // A file on its own is evidence, not an instruction. Queueing it with no words
+            // would mean an item nobody can read and a model guessing what to do with a
+            // screenshot an hour later - so say what is missing instead of dropping it.
+            if ((att.accepted || []).length) {
+              send({ type: "error", message: "Say what you want done with " +
+                att.accepted.map((a) => a.name).join(", ") + " - a queued prompt needs words as well as the file." });
+            }
+            break;
+          }
           if (st.items.length >= QUEUE_MAX_ITEMS) {
             send({ type: "error", message: `The queue is full (${QUEUE_MAX_ITEMS} items). Clear finished items first.` });
             break;
@@ -377,9 +716,30 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           const added = {
             id: randomUUID(), text, compact_first: !!msg.compact_first, status: "pending",
             added_at: now(), started_at: null, ended_at: null, note: "", thread: [],
+            // Stamped now, so when this runs in an hour the history still knows whose
+            // work it was (see sanitize()).
+            by: who ? who.display : "", user: who ? who.user : "",
+            // Metadata only - enough for the window to show chips, with no payload in the
+            // state file. The bytes (if any) are in the sidecar.
+            attachments: (att.accepted || []).map((a) => ({ name: a.name, kind: a.kind || (a.mimeType ? "image" : "text"), bytes: a.bytes || 0 })),
           };
+          if ((att.images || []).length) {
+            try {
+              fs.writeFileSync(attachPath(root, scopeKey, sessionId, added.id), JSON.stringify(att.images));
+              added.images = att.images.length;
+            } catch (e) {
+              added.images = 0;
+              added.note = "images could not be stored: " + String(e?.message || e).slice(0, 120);
+            }
+          }
           st.items.push(added);
-          record("added", { text, detail: added.compact_first ? "compact & clear first" : "", item: added });
+          rec("added", {
+            text,
+            detail: [added.compact_first ? "compact & clear first" : "",
+                     added.attachments.length ? `with ${added.attachments.map((a) => a.name).join(", ")}` : ""]
+              .filter(Boolean).join(" \u00b7 "),
+            item: added,
+          });
           publish();
           await advance("added");
           break;
@@ -388,16 +748,16 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           const it = st.items.find((i) => i.id === msg.id);
           if (!it || it.status === "running") break;
           if (typeof msg.text === "string" && msg.text.trim() && msg.text.trim() !== it.text) {
-            record("edited", { text: msg.text.trim(), detail: `was: ${it.text.slice(0, 500)}`, item: it });
+            rec("edited", { text: msg.text.trim(), detail: `was: ${it.text.slice(0, 500)}`, item: it });
             it.text = msg.text.trim().slice(0, QUEUE_MAX_TEXT);
           }
           if (msg.compact_first !== undefined) it.compact_first = !!msg.compact_first;
           // Re-queue a finished/failed/skipped item ("run it again").
           if (msg.status === "pending" && it.status !== "pending") {
             it.status = "pending"; it.note = ""; it.started_at = null; it.ended_at = null;
-            record("requeued", { text: it.text, item: it });
+            rec("requeued", { text: it.text, item: it });
           }
-          if (msg.status === "skipped" && it.status === "pending") { it.status = "skipped"; record("skipped", { text: it.text, item: it }); }
+          if (msg.status === "skipped" && it.status === "pending") { it.status = "skipped"; rec("skipped", { text: it.text, item: it }); }
           publish();
           await advance("updated");
           break;
@@ -420,9 +780,9 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           st.questions = st.questions.filter((x) => x.id !== q.id);
           if (!st.questions.length) st.paused = null;   // the answer is what the pause was waiting for
           const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
-          record("answered", { text: q.text, detail: text, item: it });
+          rec("answered", { text: q.text, detail: text, item: it });
           if (it) {
-            it.thread.push({ role: "operator", text, at: now() });
+            it.thread.push({ role: "operator", text, at: now(), by: who ? who.display : undefined });
             await runItem(it, text, { isReply: true });
           } else {
             engineBusy = true;
@@ -447,7 +807,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           if (!q) break;
           st.questions = st.questions.filter((x) => x.id !== q.id);
           const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
-          record("dismissed", { text: q.text, item: it });
+          rec("dismissed", { text: q.text, item: it });
           if (it && it.status === "waiting") { it.status = "done"; it.note = "question dismissed"; it.ended_at = now(); }
           if (!st.questions.length && st.paused?.by === "assistant") st.paused = null;
           publish();
@@ -457,7 +817,8 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
         case "queue_remove": {
           const i = st.items.findIndex((x) => x.id === msg.id);
           if (i < 0 || st.items[i].status === "running") break;
-          record("removed", { text: st.items[i].text, detail: `was ${st.items[i].status}`, item: st.items[i] });
+          rec("removed", { text: st.items[i].text, detail: `was ${st.items[i].status}`, item: st.items[i] });
+          if (st.items[i].images) dropAttachments(root, scopeKey, sessionId, st.items[i].id);
           st.items.splice(i, 1);
           publish();
           break;
@@ -477,28 +838,47 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
         case "queue_set_auto": {
           st.auto_next = !!msg.value;
           log?.("queue_auto", key(), st.auto_next ? "on" : "off");
-          record("auto_next", { detail: st.auto_next ? "on" : "off" });
+          rec("auto_next", { detail: st.auto_next ? "on" : "off" });
           publish();
           if (st.auto_next) await advance("auto on");
           break;
         }
         case "queue_set_auto_clear": {
           st.auto_clear_done = !!msg.value;
+          // A PERSON has now chosen, so the default no longer applies to this
+          // conversation - and the choice is remembered for the window, not just this
+          // session, so it survives New chat, a refresh and a bridge restart.
+          st.auto_clear_set = true;
           // Turning it on also sweeps what is already done, so the list matches the switch.
           if (st.auto_clear_done) st.items = st.items.filter((i) => i.status !== "done");
+          rec("auto_clear", { detail: st.auto_clear_done ? "on" : "off" });
+          try { onSwitch?.("auto_clear", st.auto_clear_done, who); } catch { /* preference only */ }
           publish();
           break;
         }
         case "queue_pause":
-          pause("Paused by the operator", "operator");
+          pause("Paused by the operator", "operator", who);
           publish();
           break;
-        case "queue_resume":
-          if (st.paused) record("resumed", { text: st.paused.reason });
+        case "queue_resume": {
+          if (st.paused) rec("resumed", { text: st.paused.reason });
           st.paused = null;
           publish();
-          await advance("resume");
+          // RESUME MEANS RUN IT. advance() only fires when Auto-Next is on, so with
+          // Auto-Next off (the default) pressing Resume cleared the pause and then did
+          // NOTHING - the operator saw "Interrupted... press Resume", pressed it, and the
+          // work sat there pending with no way to start it but a second, differently
+          // named button. Pressing Resume IS the instruction to continue, whatever
+          // Auto-Next is set to.
+          if (!(await advance("resume"))) {
+            const item = nextPending();
+            if (item && !engineBusy && !(typeof isStreaming === "function" && isStreaming())) {
+              await runItem(item);
+              setImmediate(() => { advance("chain").catch(() => {}); });
+            }
+          }
           break;
+        }
         case "queue_run_next": {
           // Run the head item once, regardless of Auto-Next. Same guards otherwise.
           if (engineBusy || (typeof isStreaming === "function" && isStreaming())) {
@@ -515,16 +895,27 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
         case "queue_clear_done": {
           const gone = st.items.filter((i) => i.status !== "pending" && i.status !== "running");
           st.items = st.items.filter((i) => i.status === "pending" || i.status === "running");
-          if (gone.length) record("cleared_finished", { detail: `${gone.length} item(s)` });
+          if (gone.length) rec("cleared_finished", { detail: `${gone.length} item(s)` });
           publish();
           break;
         }
         case "queue_clear_history":
           st.history = [];
+          // Clearing the record is itself a thing that happened, and the one row an admin
+          // must never lose: otherwise a wiped history is indistinguishable from a quiet
+          // conversation. It is written AFTER the wipe, so it survives it.
+          rec("cleared_history", { detail: "history cleared" });
           publish();
+          sendHistory();
+          break;
+        // The window asks for the list when it opens the History dialog, so what it shows
+        // is what the file holds RIGHT NOW - not a copy that arrived with an old frame.
+        case "queue_history":
+          sendHistory();
           break;
         case "queue_clear":
-          record("cleared_all", { detail: `${st.items.length} item(s), ${st.questions.length} question(s)` });
+          rec("cleared_all", { detail: `${st.items.length} item(s), ${st.questions.length} question(s)` });
+          for (const it of st.items) if (it.images && it.status !== "running") dropAttachments(root, scopeKey, sessionId, it.id);
           st.items = st.items.filter((i) => i.status === "running");
           st.questions = [];
           st.paused = null;

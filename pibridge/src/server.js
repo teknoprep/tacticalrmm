@@ -7,7 +7,9 @@ import {
   SessionManager,
   DefaultResourceLoader,
   createAgentSession,
+  defineTool,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { CONFIG } from "./config.js";
 import { brandEmailPolicy, BRAND } from "./brand.js";
 import { buildTools, buildReportTools, buildTicketTriageTools, buildDecisionTools, buildProcedureMiningTools, operatorPromptSection } from "./tools.js";
@@ -33,12 +35,28 @@ import {
 } from "./agent-groups.js";
 import { makeRemoteBinding } from "./remote-room.js";
 import * as windowMemory from "./window-memory.js";
+import { trimOversized, isContextOverflowError } from "./context-trim.js";
 import { makeChatCommands } from "./chat-commands.js";
 import { makePromptQueue, queuePromptSection } from "./queue.js";
-import { boundTranscript } from "./transcript-bound.js";
+import { boundTranscript, dropOldImageData } from "./transcript-bound.js";
 import { buildCatalog, registerModels, pruneShadowedModels, MODELS_JSON } from "./models-catalog.js";
 import { piRuntime, piGeneration, piSelfTest, builtinModel } from "./pi-runtime.js";
 import { startOdooChat } from "./odoo-chat.js";
+import { attachSpendLedger, ledgerSink, startSpendOutbox } from "./spend-ledger.js";
+import { LIVE, LIVE_PENDING, claimPending, liveKey, makeHub, DRIVING_FRAMES, actorOn } from "./live-hub.js";
+import { presenceFrame } from "./live-presence.js";
+import { makeAttachmentIntake, composePrompt, ATTACH_LIMITS } from "./attachments.js";
+
+// What the composer may offer, for the `ready` frame of any chat surface. Whether the
+// CURRENT model can read images is per surface, so it is passed in.
+const attachReady = (model) => ({
+  enabled: true,
+  max_files: ATTACH_LIMITS.maxFiles,
+  max_file_bytes: ATTACH_LIMITS.maxFileBytes,
+  max_total_bytes: ATTACH_LIMITS.maxTotalBytes,
+  images_supported: Array.isArray(model?.input) ? model.input.includes("image") : false,
+});
+const imagesSupported = (model) => (Array.isArray(model?.input) ? model.input.includes("image") : false);
 // Nothing the technician sends may be dropped because the window was still building.
 import { bufferEarlyFrames } from "./early-frames.js";
 
@@ -355,7 +373,18 @@ function multiDeviceMemorySection(machines) {
 // (partner/team/dedup) stay inside the tool itself.
 function helpdeskSection(blob, clientName) {
   const p = (blob.helpdesk_prompt || "").trim();
-  if (!p) return "";
+  // "IS ANYONE ALREADY ON THIS?" Owner's rule (2026-09-15): before any agent works a thing,
+  // it checks whether the same thing is already being worked - on another ticket, by a
+  // person or by automation. Django answers that from the work-claim ledger and passes it
+  // here, so every surface that touches tickets (chats, triage, autowork) is told in the
+  // same words, first, before its own instructions.
+  const w = blob.already_worked;
+  const dup = w && w.ticket_ref
+    ? `\n\n!! ALREADY BEING WORKED: what this ticket is about is already in hand on ${w.ticket_ref}` +
+      ` (${w.worker || "someone"}${w.what ? `: ${String(w.what).slice(0, 160)}` : ""}). Do NOT redo that work.` +
+      ` Say so to the technician, reference ${w.ticket_ref}, and only proceed if they explicitly tell you this is a different problem.\n`
+    : "";
+  if (!p) return dup;
   const generic = !!(blob.helpdesk_api?.base_url && blob.helpdesk_api?.api_key);
   const toolNote = generic
     ? `Tickets are created with the helpdesk_api_request tool following the API flow ` +
@@ -367,7 +396,7 @@ function helpdeskSection(blob, clientName) {
   const fmtNote = ` Customer replies are auto-formatted into clean, branded, email-safe HTML. Put tabular data in a ` +
     `TABLE (markdown | col | col | or an HTML <table>), raw command output in a fenced code block, and ` +
     `use section headings - NEVER space-aligned plain text (it collapses). HTML or markdown both work.`;
-  return `\n\nHELPDESK POLICY (admin-defined):\n${p}\n${toolNote}${fmtNote}${HANDOFF_FLOOR}`;
+  return dup + `\n\nHELPDESK POLICY (admin-defined):\n${p}\n${toolNote}${fmtNote}${HANDOFF_FLOOR}`;
 }
 
 // A floor under the admin policy, not a restatement of it. This closes the specific
@@ -660,7 +689,9 @@ function uiTranscript(sessionManager, session) {
     out.push(m);
   }
   // Fall back to the live message list for a brand-new session (empty branch).
-  return boundTranscript(out.length ? out : session?.messages || []);
+  // Image bytes are dropped BEFORE the byte bound is applied, or a couple of screenshots
+  // would evict the conversation around them just to carry thumbnails.
+  return boundTranscript(dropOldImageData(out.length ? out : session?.messages || []));
 }
 
 // ---- The credential-read policy, in ONE place --------------------------------
@@ -706,6 +737,82 @@ function makeCredentialGate({ isOn, allowed, prompt, log, key, sessionId }) {
         key, sid(), String(summary).slice(0, 160));
     return { ok: true, privileged: !!opts.privileged };
   };
+}
+
+// Every prompt this conversation has already been given, read from its transcript.
+// Used once per conversation to repair a queue history that predates prompt recording
+// (see queue.backfillPrompts). Attachment bodies are inlined into a prompt by
+// attachments.js; the history wants what was ASKED, so they are left to the queue's own
+// stripper - this only pulls out the user text and when it was sent.
+function transcriptPrompts(sessionManager) {
+  let branch = [];
+  try { branch = sessionManager?.getBranch?.() || []; } catch { return []; }
+  const out = [];
+  for (const entry of branch) {
+    if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+    const c = entry.message.content;
+    const text = typeof c === "string"
+      ? c
+      : (Array.isArray(c) ? c : []).filter((b) => b?.type === "text").map((b) => b.text).join("");
+    if (!String(text || "").trim()) continue;
+    out.push({ at: entry.timestamp || null, text });
+  }
+  return out;
+}
+
+// ---- SERVER-RESIDENT SESSIONS ----------------------------------------------------------
+// A chat's AI session lives in the bridge; every browser (and the phone app) is a viewer
+// that attaches to it. See live-hub.js for the rules. These two helpers are what both chat
+// surfaces use to (a) join a session that is already live instead of opening a second one,
+// and (b) route each socket's frames through the driving check.
+function graceMsFor(blob) {
+  // Global Setting: minutes the session keeps running with nobody watching. 0 = never stop.
+  const m = blob.detach_grace_minutes;
+  const n = m === undefined || m === null ? 5 : Number(m);
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 60 * 1000) : 0;
+}
+
+/** The guarded per-socket message handler: seat frames for everyone, driving frames for the owner. */
+function hubMessageHandler(hub, ws) {
+  return async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    // Seat management is every viewer's right.
+    if (msg.type === "takeover") { hub.takeover(ws); return; }
+    if (msg.type === "takeover_response") { hub.respondTakeover(ws, !!msg.approve); return; }
+    if (msg.type === "presence") { hub.sendTo(ws, hub.presenceFrameFor(ws)); return; }
+    if (msg.type === "pin") { hub.setPin(ws, msg.value); return; }
+    // Driving the session is the owner's alone - enforced HERE, whatever the browser shows.
+    if (DRIVING_FRAMES.has(msg.type) && !hub.canDrive(ws)) { hub.refuse(ws, msg.type); return; }
+    // WHAT THE DRIVER TYPED, TO EVERYONE ELSE. The driver's own window adds the message
+    // locally; viewers only ever saw the answer arrive, with no question above it, until
+    // they refreshed. Sent before the frame is processed so it lands above the reply.
+    if ((msg.type === "prompt" || msg.type === "steer") && String(msg.message || "").trim()) {
+      const who = hub.presence.members.get(ws);
+      const nAtt = Array.isArray(msg.attachments) ? msg.attachments.length : 0;
+      hub.sendExcept(ws, {
+        type: "user_message",
+        text: String(msg.message || ""),
+        by: (who && who.display) || "the driver",
+        steer: msg.type === "steer",
+        attachments: nAtt,
+      });
+    }
+    await hub.onFrame(raw, ws);
+  };
+}
+
+/** Install a socket on a hub: presence, ready frame, frame routing, detach on close.
+ *  `installMessage=false` for the FIRST socket, whose handler goes in via the early-frame
+ *  buffer (handOff) so nothing typed while the session was being built is lost. */
+function attachSocketToHub(hub, ws, blob, { installMessage = true } = {}) {
+  hub.attach(ws, blob);
+  hub.sendTo(ws, hub.readyFor(ws));
+  // Catch the newcomer up on the session's current state (queue + spend), which was last
+  // broadcast when whoever opened the session was the only one here.
+  hub.replayState(ws);
+  if (installMessage) ws.on("message", hubMessageHandler(hub, ws));
+  ws.on("close", () => hub.detach(ws));
 }
 
 // ---- WebSocket session lifecycle -------------------------------------------
@@ -779,7 +886,7 @@ async function startChat(ws, blob) {
     const id = randomUUID();
     return new Promise((resolve) => {
       pendingApprovals.set(id, resolve);
-      ws.send(JSON.stringify({ type: "approval_request", id, summary }));
+      hub.send(JSON.stringify({ type: "approval_request", id, summary }));
       // The whole point of working from a phone is being able to say yes to this while
       // standing in front of the machine it is about.
       remote?.onApprovalRequest(id, summary);
@@ -789,7 +896,6 @@ async function startChat(ws, blob) {
   // it, but the binding needs the session's prompt path, which does not exist yet.
   let remote = null;
   const startedAt = Date.now();
-  mirrorBrowserFramesToPhone(ws, () => remote);
 
   // mutateAllowed = the operator's role can write at all. readonly = the current
   // (toggleable) state; an "AI Resolve" session starts read-only but the operator
@@ -816,7 +922,7 @@ async function startChat(ws, blob) {
     prompt: (ask) => new Promise((resolve) => {
       const id = randomUUID();
       pendingApprovals.set(id, resolve);
-      ws.send(JSON.stringify({ type: "approval_request", id, summary: ask }));
+      hub.send(JSON.stringify({ type: "approval_request", id, summary: ask }));
       remote?.onApprovalRequest(id, ask);
     }),
     log, key: agentId, sessionId: () => sessionId,
@@ -873,11 +979,20 @@ async function startChat(ws, blob) {
   // further down this function and only ever called once a turn can run.
   const queue = makePromptQueue({
     scopeKey: agentId,
-    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
     log,
-    runPrompt: (text) => runPrompt(text, [], "queue"),
+    runPrompt: (text, images = []) => runPrompt(text, images, "queue"),
+    // Queued prompts take attachments through the SAME intake as typed ones.
+    intake: (msg) => takeAttachments(msg),
+    compose: (text, attachText) => composePrompt(text, attachText),
     compact: (reason) => compactCmd.run("", { reason, clear: true }),
     isStreaming: () => !!session?.isStreaming,
+    // Auto-clear is ON unless THIS window turned it off - and that choice is remembered
+    // per conversation (window-memory.js), like Write mode and Auto-approve, so it
+    // survives New chat, a refresh and a bridge restart.
+    autoClearDefault: windowMemory.recallSwitch(agentId, "auto_clear", true),
+    onSwitch: (name, value, actor) =>
+      windowMemory.rememberSwitch(agentId, name, value, actor?.user || blob.username || ""),
   });
   tools.push(queue.tool);
 
@@ -947,6 +1062,29 @@ async function startChat(ws, blob) {
       }
     }
   }
+  // ALREADY LIVE? The conversation we are about to resume may be running on the server
+  // right now (another tab, the phone app, or this same person reconnecting after a drop).
+  // Then this socket is a VIEW onto it, not a second copy of it.
+  let pendingClaim = null;
+  if (resumedSessionId) {
+    const pk = liveKey(agentId, resumedSessionId);
+    const liveHub = LIVE.get(pk);
+    if (liveHub && !liveHub.disposed) {
+      attachSocketToHub(liveHub, ws, blob);
+      log("chat attached", agentId, resumedSessionId, `${blob.username || "?"} joined a live session`);
+      return;
+    }
+    if (LIVE_PENDING.has(pk)) {
+      // Someone else is building this very session right now: wait for theirs.
+      try {
+        const built = await LIVE_PENDING.get(pk);
+        attachSocketToHub(built, ws, blob);
+        log("chat attached", agentId, resumedSessionId, `${blob.username || "?"} joined a session being built`);
+        return;
+      } catch { /* their build failed; build our own below */ }
+    }
+    pendingClaim = claimPending(pk);
+  }
   if (!sessionManager) sessionManager = SessionManager.create(CONFIG.sessionsRoot);
 
   const { session } = await createAgentSession({
@@ -962,7 +1100,31 @@ async function startChat(ws, blob) {
   });
 
   const sessionId = session.sessionId;
-  queue.attach(sessionId);
+  // THE SESSION LIVES HERE, NOT IN THE SOCKET. Every former ws.send below is hub.send: a
+  // fan-out to whoever is watching. Sockets come and go; the session stays until the grace
+  // period after the last one leaves (Global Setting; 0 = never).
+  const hub = makeHub({
+    key: liveKey(agentId, sessionId),
+    // The id this conversation was resumed FROM is what every existing link still asks for.
+    aliases: resumedSessionId ? [liveKey(agentId, resumedSessionId)] : [],
+    graceMs: graceMsFor(blob),
+    log,
+    onDispose: (reason) => teardown(reason),
+    onOwnerChange: (owner, why) => {
+      hub.send(JSON.stringify({ type: "system_note", text: owner
+        ? `\u{1F3AE} ${owner.display} is now driving this session (${why}).`
+        : `\u{1F3AE} Nobody is driving this session (${why}). Press Take over to drive it.` }));
+    },
+  });
+  hub.presenceFrameFor = (forWs) => presenceFrame(hub.presence, forWs);
+  if (pendingClaim) pendingClaim.resolve(hub);
+  // A resumed conversation inherits its queue (see queue.attach): the harness gives the
+  // resumed session a NEW id, and the queue must follow the conversation, not the id.
+  queue.attach(sessionId, resumedSessionId);
+  // One-time: a conversation that started before prompts were recorded still has all of
+  // them in its transcript, so its history is rebuilt from there rather than opening with
+  // a handful of stale queue events.
+  queue.backfillPrompts(transcriptPrompts(sessionManager));
   const chatTitle = multi
     ? `Multi: ${toolMachines.map((m) => m.label).join(" + ")}`
     : `Chat about ${facts.hostname}`;
@@ -1013,7 +1175,7 @@ async function startChat(ws, blob) {
   let lastClientFrameAt = Date.now();
   // Cost meter: gated on the role permission resolved by the RMM (can_view_ai_cost).
   const costMeter = makeCostMeter({
-    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
     log,
     visible: !!blob.cost_visible,
     key: agentId,
@@ -1025,12 +1187,7 @@ async function startChat(ws, blob) {
     // Bookkeeping must never break a chat, but a SILENT failure means the spend ledger
     // quietly stops recording - which is how a whole surface went unrecorded on
     // 2026-08-04. Swallow the error for the chat, but always log it.
-    ledger: (entry) => {
-      trmm.logSpend(entry).catch((e) => {
-        log("spend_ledger_error", entry.surface, entry.session_id,
-            `turn ${entry.turn_index}: ${String(e?.message || e).slice(0, 300)}`);
-      });
-    },
+    ledger: ledgerSink(log),
     context: {
       surface: "device_chat",
       actorUsername: blob.username || "",
@@ -1040,6 +1197,15 @@ async function startChat(ws, blob) {
       site: facts?.site || "",
     },
   });
+  // Agent-group specialists ("delegate") run their own sessions in a temp directory that
+  // is deleted afterwards. Hand them this conversation's accounting identity so their
+  // turns are billed to THIS chat instead of disappearing. See agent-groups.js.
+  groupState.spend = {
+    log, key: agentId, sessionId,
+    actorUsername: blob.username || "",
+    agentId, agentHostname: facts?.hostname || "",
+    client: facts?.client || "", site: facts?.site || "",
+  };
   // Silent recovery from provider faults the harness does not recognise (see
   // llm-recovery.js). A technician watching this window should not lose a turn to a
   // transient blip the provider phrased in words pi-ai has no pattern for.
@@ -1086,11 +1252,27 @@ async function startChat(ws, blob) {
       if (recovery.consider(event.message)) {
         log("llm_error_recoverable", agentId, sessionId, "no content, no tokens - will re-run silently");
       } else {
+        // THE PROMPT DID NOT FIT. Almost always one runaway tool result rather than a
+        // long conversation, and until 2026-09-22 it left the window unusable: every
+        // prompt rejected, and "Summarise & clear" refusing because the harness saw
+        // nothing it was willing to cut. Drop the oversized result out of the context
+        // here, automatically, and tell the technician in one sentence that they can
+        // carry on - it is the difference between a hiccup and a dead window.
+        let overflowNote = "";
+        if (isContextOverflowError(why)) {
+          const t = trimOversized(session, { log, key: agentId, sessionId });
+          overflowNote = t.note
+            ? ` ${t.note}`
+            : " Nothing in this conversation is individually oversized, so the whole thing is" +
+              " simply too long: press Summarise & clear, or start a new chat (this transcript" +
+              " and its cost stay in AI History).";
+        }
         try {
-          ws.send(JSON.stringify({
+          hub.send(JSON.stringify({
             type: "error",
-            message: recovery.exhaustedNote(why)
-              || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
+            message: (recovery.exhaustedNote(why)
+              || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`)
+              + overflowNote,
           }));
         } catch {}
         queue.noteError(why);
@@ -1110,7 +1292,7 @@ async function startChat(ws, blob) {
             `${Math.round((watchdog?.budgetMs ?? CONFIG.turnStallMs) / 1000)}s stall budget`);
       } else {
         try {
-          ws.send(JSON.stringify({
+          hub.send(JSON.stringify({
             type: "error",
             message: recovery.exhaustedNote(why)
               || `The AI turn stalled (no response for ${silentFor}s) and was automatically ` +
@@ -1126,12 +1308,14 @@ async function startChat(ws, blob) {
       const silent = silentStopMessage(event.message);
       if (silent) {
         log("turn_no_answer", agentId, sessionId, `stopReason=${event.message?.stopReason}`);
-        try { ws.send(JSON.stringify({ type: "error", message: silent })); } catch {}
+        try { hub.send(JSON.stringify({ type: "error", message: silent })); } catch {}
       }
     }
     remote?.onAgentEvent(event);
     try {
-      ws.send(JSON.stringify({ type: "agent_event", event }));
+      const frame = JSON.stringify({ type: "agent_event", event });
+      hub.send(frame);
+      hub.noteTurnEvent(frame, event);
       lastClientFrameAt = Date.now();
     } catch {}
     if (event.type === "agent_end" && blob.persist_history) {
@@ -1152,25 +1336,25 @@ async function startChat(ws, blob) {
   function applyReadonly(v) {
     if (mutateAllowed) readonly = !v;
     windowMemory.rememberSwitch(agentId, "write", !!v, blob.username || "");
-    try { ws.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
+    try { hub.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
   }
   function applyAutoApprove(v) {
     autoApprove = !!v && !!blob.autoapprove_allowed;
     windowMemory.rememberSwitch(agentId, "auto_approve", !!v, blob.username || "");
-    try { ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
+    try { hub.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
   }
   function applyAutoCredential(v) {
     autoCredential = !!v && autocredentialAllowed;
     windowMemory.rememberSwitch(agentId, "auto_credential", !!v, blob.username || "");
     log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
         agentId, sessionId, `by ${blob.username || "?"}`);
-    try { ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
+    try { hub.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
   }
   function applyLabel(v) {
     sessionLabel = String(v ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
     if (blob.persist_history) history.recordSession(agentId, sessionId, { label: sessionLabel });
     log("label set", agentId, sessionId, sessionLabel || "(cleared)");
-    try { ws.send(JSON.stringify({ type: "label_state", value: sessionLabel })); } catch {}
+    try { hub.send(JSON.stringify({ type: "label_state", value: sessionLabel })); } catch {}
     // Remote (if on) names itself from this field; tell the browser what the next
     // pairing code will be called.
     remote?.pushState();
@@ -1214,9 +1398,11 @@ async function startChat(ws, blob) {
     }),
   });
 
-  ws.send(
-    JSON.stringify({
+  hub.readyFor = (forWs) => ({
       type: "ready",
+      presence: presenceFrame(hub.presence, forWs),
+      streaming: !!session.isStreaming,
+      pinned: !!hub.pinned, pinned_by: hub.pinnedBy || "",
       session_id: sessionId,
       hostname: multi ? toolMachines.map((m) => m.label).join(" + ") : facts.hostname,
       // Autocomplete is fed by the server so the list can never offer a switch this
@@ -1262,6 +1448,10 @@ async function startChat(ws, blob) {
       // Does this window offer the Remote (phone) button? Role + global switch + relay.
       remote_allowed: !!blob.remote_allowed && !!blob.remote_relay_url,
       context_window: Number(model?.contextWindow || 0),
+      // Attachments: what the composer may offer, and whether the CURRENT model can read
+      // images at all. The caps come from the bridge so the UI can never offer something
+      // the server will then refuse; the UI re-checks images on every model_changed.
+      attachments: attachReady(model),
       operator_enabled: !!(blob.operator && blob.operator.enabled),
       operator_machines: (blob.operator && blob.operator.machines) || [],
       label: sessionLabel,
@@ -1272,12 +1462,15 @@ async function startChat(ws, blob) {
       // talking about another machine".
       resumed: resumedFrom,
       resumed_session: resumedSessionId,
-    }),
-  );
+  });
   await hydrateWindowCost(costMeter, { agent_id: agentId }, {
-    ws, visible: !!blob.cost_visible, log, key: agentId, sessionId,
+    ws: hub, visible: !!blob.cost_visible, log, key: agentId, sessionId,
   });
   queue.publish();
+  // Everything a socket needs to render the window's CURRENT state, replayed to whoever
+  // attaches later (refresh, second tab, phone, viewer). See hub.replayState.
+  hub.stateProviders.push(() => queue.state());
+  if (blob.cost_visible) hub.stateProviders.push(() => costMeter.snapshot());
 
   // Idle disposal. "Idle" means NEITHER side has done anything for idleTimeoutMs: the
   // technician has not typed, AND the assistant has not streamed, called a tool or
@@ -1296,8 +1489,11 @@ async function startChat(ws, blob) {
       idleTimer = setTimeout(idleCheck, Math.max(1000, CONFIG.idleTimeoutMs - quiet));
       return;
     }
-    log("ws idle close", `${agentId} ${sessionId} quiet ${Math.round(quiet / 1000)}s (browser ${Math.round((Date.now() - lastBrowserMsgAt) / 1000)}s, assistant ${Math.round((Date.now() - lastActivity) / 1000)}s)`);
-    try { ws.close(1000, "idle"); } catch {}
+    if (graceMsFor(blob) === 0) { idleTimer = setTimeout(idleCheck, CONFIG.idleTimeoutMs); return; }
+    log("ws idle close", `${agentId} ${sessionId} quiet ${Math.round(quiet / 1000)}s`);
+    // Closing the sockets starts the hub's grace timer; the session itself is untouched.
+    hub.send(JSON.stringify({ type: "system_note", text: "Idle for a while - this window disconnected; the session stays on the server and reconnecting picks it straight back up." }));
+    for (const sock of [...hub.presence.members.keys()]) { try { sock.close(1000, "idle"); } catch {} }
   };
   const resetIdle = () => {
     lastBrowserMsgAt = Date.now();
@@ -1327,13 +1523,16 @@ async function startChat(ws, blob) {
   // and a model switch are the two expensive shapes this exists to fix.
   const compactCmd = makeCompactCommand({
     session, costMeter,
-    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
     log, key: agentId, sessionId,
     currentModel: () => session.model || model,
     rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
     inTurn,
     markCleared: () => sessionManager.appendCustomEntry("transcript_cleared",
       { at: new Date().toISOString(), by: blob.username || "" }),
+    // A single huge tool result can put the conversation past the model's window and
+    // survive compaction in the retained tail - see context-trim.js.
+    trimContext: () => trimOversized(session, { log, key: agentId, sessionId }),
     ...compactSummarizerHooks(session, rt, groupState),
   });
 
@@ -1347,7 +1546,7 @@ async function startChat(ws, blob) {
     if (quiet < CONFIG.workingPingMs) return;
     const lastByteMs = liveness.quietMs();
     try {
-      ws.send(JSON.stringify({
+      hub.send(JSON.stringify({
         type: "working",
         elapsed_ms: liveness.elapsedMs(),
         quiet_ms: quiet,
@@ -1372,10 +1571,26 @@ async function startChat(ws, blob) {
     if (!text) return;
     // One frame. `mirrorBrowserFramesToPhone` puts the same line on the phone, so the
     // desk and the pocket read the same transcript without two call sites to keep in step.
-    try { ws.send(JSON.stringify({ type: "system_note", text })); } catch { /* socket gone */ }
+    try { hub.send(JSON.stringify({ type: "system_note", text })); } catch { /* socket gone */ }
   }
 
-  async function runPrompt(text, images = [], origin = "browser") {
+  // Screenshots and log files dropped on the composer. Images take the same path a phone
+  // photo already uses; text files are inlined into the prompt; anything refused comes
+  // back named, with a reason. `session.model` (not the opening one) because the operator
+  // switches models mid-chat and vision is a property of the model answering.
+  const takeAttachments = makeAttachmentIntake({
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    model: () => session.model || model,
+    log,
+    key: agentId,
+    sessionId,
+  });
+
+  async function runPrompt(text, images = [], origin = "browser", actor = null) {
+    // WHOSE PROMPT THIS IS. Passed down from the socket that sent it (see actorOn), so a
+    // shared window's history names the person who typed each line rather than whoever
+    // opened the conversation.
+    const who = actor || actorOn(hub, null, blob);
     // Mirror a browser-typed turn onto the phone, so someone following on mobile sees
     // what the person at the desk just asked rather than an answer to nothing. (A phone
     // turn already carries its own id, which the app uses to thread the reply.)
@@ -1397,7 +1612,17 @@ async function startChat(ws, blob) {
       return;
     }
     // A real prompt from a human while the queue is waiting on them IS the answer.
-    if (origin !== "queue") queue.noteOperatorReply(text);
+    if (origin !== "queue") queue.noteOperatorReply(text, who);
+    // EVERY prompt that reaches the model goes in the conversation's history - typed,
+    // queued or from a phone, and by whom. Recorded here, after the window-command and
+    // /compact early-returns above, so the history is what the MODEL was asked and
+    // nothing else.
+    queue.notePrompt(text, origin, { actor: who });
+    // What you type IS the active queue item, so the window always shows what this
+    // conversation is working on - and an interrupted turn can be resumed instead of
+    // being lost with the socket. The turn is still run right here; the item only makes
+    // it visible and resumable.
+    const typedItem = origin === "queue" ? "" : queue.beginTypedItem(text, origin, who);
     techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
     recovery.beginTurn();
     // A new request earns a fresh, tight watchdog budget: the widened one exists
@@ -1408,54 +1633,37 @@ async function startChat(ws, blob) {
     liveness.reset();
     // A photo of the screen or the asset label is often the fastest way to say what is
     // wrong, and it is the one thing a phone has that the browser does not.
-    const content = images.length
-      ? [
-          ...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })),
-          { type: "text", text: String(text || "") },
-        ]
-      : text;
-    await inTurn(async () => {
-      if (session.isStreaming) {
-        await session.prompt(content, { streamingBehavior: "steer" });
-      } else {
-        await session.prompt(content);
-      }
-      // prompt() resolves once the whole turn has settled (including the harness's own
-      // retries), so this is the point at which we know a blank rejection ended it.
-      // Loop rather than retry once: the recovery object owns the budget.
-      while (recovery.pending) {
-        if (!(await recovery.run(session))) break;
-      }
-    });
+    // Images travel in the OPTIONS bag, not as a content array. prompt() takes a string
+    // (`text.startsWith(...)` inside the SDK); passing blocks threw "text.startsWith is
+    // not a function" and killed the turn - which is what every photo sent from a phone
+    // did, silently, until an attachment test found it.
+    const body = String(text || "");
+    const imageBlocks = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime }));
+    try {
+      await inTurn(async () => {
+        if (session.isStreaming) {
+          await session.prompt(body, { streamingBehavior: "steer", images: imageBlocks });
+        } else {
+          await session.prompt(body, { images: imageBlocks });
+        }
+        // prompt() resolves once the whole turn has settled (including the harness's own
+        // retries), so this is the point at which we know a blank rejection ended it.
+        // Loop rather than retry once: the recovery object owns the budget.
+        while (recovery.pending) {
+          if (!(await recovery.run(session))) break;
+        }
+      });
+      queue.settleTypedItem(typedItem, true);
+    } catch (e) {
+      // The item stays on the queue as FAILED, with the reason - never silently dropped.
+      queue.settleTypedItem(typedItem, false, String(e?.message || e));
+      throw e;
+    }
   }
 
-  remote = makeRemoteBinding({
-    blob,
-    key: agentId,
-    // The technician's own Label for this chat, read live (a function, not a snapshot)
-    // so renaming the window renames what the phone shows on the next code it is given.
-    // Falls back to the machine when the field is still empty.
-    label: () => sessionLabel.trim() || `${facts?.hostname || agentId} \u2014 ${BRAND.name || "RMM"}`,
-    log,
-    toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
-    // After a phone turn settles the queue may continue, same as a browser turn.
-    submitPrompt: (text, images) => runPrompt(text, images, "phone").finally(() => queue.advance("phone turn settled")),
-    abort: () => { queue.noteAbort(); return session.abort(); },
-    resolveApproval: (id, ok) => {
-      const resolve = pendingApprovals.get(id);
-      if (resolve) { pendingApprovals.delete(id); resolve(!!ok); }
-      // Keep the browser's approval banner in step - the tech may be looking at both.
-      try { ws.send(JSON.stringify({ type: "approval_resolved", id, approved: !!ok, by: "mobile" })); } catch {}
-    },
-    transcript: () => uiTranscript(sessionManager, session),
-    startedAt,
-    // The LIVE model, not the one the blob asked for. Since model-memory landed a
-    // reopened window can be running something the blob never named, and the phone's
-    // model picker reads this.
-    currentModel: () => session.model || model,
-  });
+  // (phone 'remote' binding removed 2026-09-15: the mobile app attaches to the live session like any other viewer)
 
-  const onBrowserFrame = async (raw) => {
+  const onBrowserFrame = async (raw, sock = null) => {
     resetIdle();
     let msg;
     try {
@@ -1463,9 +1671,12 @@ async function startChat(ws, blob) {
     } catch {
       return;
     }
+    // The person on the far end of THIS socket - the unit of attribution for everything
+    // this frame goes on to record (see actorOn and queue.js).
+    const who = actorOn(hub, sock, blob);
     try {
       if (await remote?.handleBrowser(msg)) return;
-      if (await queue.handle(msg)) return;
+      if (await queue.handle(msg, who)) return;
       switch (msg.type) {
         case "compact":
           await compactCmd.run(String(msg.message || ""), {
@@ -1474,18 +1685,39 @@ async function startChat(ws, blob) {
             instructions: msg.instructions,
           });
           break;
-        case "prompt":
-          await runPrompt(msg.message);
+        case "prompt": {
+          // Screenshots and log files dropped on the composer. Images ride the same path
+          // a phone photo already uses; text files are inlined into the prompt.
+          //
+          // A window command ("/write on") never reaches the model, so an attachment sent
+          // with one would vanish without trace. Say so and run the command alone.
+          if (chatCmds.parse(String(msg.message || "")) && Array.isArray(msg.attachments) && msg.attachments.length) {
+            announce("Attachments are not sent with a / command - run the command, then send the files with a normal message.");
+            await runPrompt(String(msg.message || ""), [], "browser", who);
+            break;
+          }
+          const att = takeAttachments(msg);
+          const text = composePrompt(msg.message, att.text);
+          // A message whose every attachment was refused must not become an empty turn:
+          // the operator already has the rejection notice and nothing is left to ask.
+          if (!text && !att.images.length) break;
+          await runPrompt(text, att.images, "browser", who);
           // The turn has settled (prompt() resolves only then). If Auto-Next is on and
           // nothing paused the queue, the next queued prompt goes now.
           await queue.advance("turn settled");
           break;
-        case "steer":
+        }
+        case "steer": {
+          const att = takeAttachments(msg);
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
-          await inTurn(() => session.steer(msg.message));
+          const text = composePrompt(msg.message, att.text);
+          if (!text && !att.images.length) break;
+          queue.notePrompt(msg.message, "browser", { steer: true, actor: who });
+          await inTurn(() => session.steer(text, att.images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime }))));
           break;
+        }
         case "abort":
-          queue.noteAbort();
+          queue.noteAbort(who);
           await session.abort();
           break;
         // A toolbar click and a typed command are the same event with a different input
@@ -1514,14 +1746,14 @@ async function startChat(ws, blob) {
           break;
         }
         case "set_group":
-          await applySetGroup({ ws, session, rt, blob, groupState, msg, costMeter, log, key: agentId });
+          await applySetGroup({ ws: hub, session, rt, blob, groupState, msg, costMeter, log, key: agentId });
           break;
         case "set_model": {
           const allowed = (blob.allowed_models || []).find(
             (m) => m.model_id === msg.model_id,
           );
           if (!allowed) {
-            ws.send(
+            hub.send(
               JSON.stringify({
                 type: "error",
                 message: `Model not permitted: ${msg.model_id}`,
@@ -1539,7 +1771,7 @@ async function startChat(ws, blob) {
           } catch { /* preview is advisory only */ }
           const newModel = modelRegistry.findModel(allowed.provider, allowed.model_id);
           if (!newModel) {
-            ws.send(
+            hub.send(
               JSON.stringify({
                 type: "error",
                 message: `Model not found: ${allowed.provider}/${allowed.model_id}`,
@@ -1563,11 +1795,15 @@ async function startChat(ws, blob) {
             group_id: groupState.current?.id ?? null,
             by: blob.username || "",
           });
-          ws.send(
+          hub.send(
             JSON.stringify({
               type: "model_changed",
               model_id: allowed.model_id,
               display: newModel.name,
+              // Vision is per model and the operator switches mid-chat. Without this the
+              // paperclip would keep offering screenshots to a model that can only
+              // reject them - one turn later, after the upload.
+              images_supported: imagesSupported(newModel),
             }),
           );
           break;
@@ -1585,14 +1821,16 @@ async function startChat(ws, blob) {
           break;
       }
     } catch (e) {
-      ws.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) }));
+      hub.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) }));
     }
   };
   // Live from here - and anything the technician sent while the window was still being
   // built runs now, in the order they sent it.
-  handOff(onBrowserFrame);
+  // First socket: its handler goes through the early-frame buffer AND the driving check.
+  hub.onFrame = (raw, sock) => onBrowserFrame(raw, sock);
+  handOff(hubMessageHandler(hub, ws));
 
-  ws.on("close", () => {
+  function teardown(reason) {
     clearTimeout(idleTimer);
     watchdog?.stop();
     if (workingPing) clearInterval(workingPing);
@@ -1606,8 +1844,11 @@ async function startChat(ws, blob) {
     // Stop the queue engine: prompts must not keep firing with nobody to approve them.
     queue.detach();
     try { session.dispose(); } catch {}
-    log("chat closed", agentId, sessionId);
-  });
+    log("chat closed", agentId, sessionId, reason || "");
+  }
+
+  // This socket is the first viewer. Later ones attach through the LIVE check above.
+  attachSocketToHub(hub, ws, blob, { installMessage: false });
 
   log("chat started", agentId, sessionId, `${blob.provider}/${blob.model_id}`);
 }
@@ -1619,8 +1860,15 @@ async function startChat(ws, blob) {
 // the same approval UX. Session is persisted per TICKET so reconnects resume it.
 async function startDecisionChat(ws, blob) {
   const handOff = bufferEarlyFrames(ws);
-  const ticketRef = blob.ticket_ref || "";
-  const histKey = `decision:${ticketRef}`;
+  // WHAT IS THIS THREAD ABOUT? A helpdesk ticket (the original and default), or a CRM
+  // opportunity being scoped before a quote (2026-09-16). One window, one engine, two
+  // subjects: the difference is the tool belt and the ceiling, both set from here.
+  const isCrm = blob.subject_kind === "crm";
+  const leadRef = isCrm ? String(blob.subject_ref || "") : "";
+  const ticketRef = isCrm ? "" : (blob.ticket_ref || "");
+  const subjectRef = isCrm ? leadRef : ticketRef;
+  const subjectTitle = isCrm ? `Opportunity ${leadRef}` : `Ticket ${ticketRef}`;
+  const histKey = `decision:${subjectRef}`;
   const ctx = blob.context || {};
   // Prior thread (triage note + any earlier chat) so a fresh session isn't blank
   // and the AI has continuity.
@@ -1643,6 +1891,10 @@ async function startDecisionChat(ws, blob) {
   // Same remembered-choice rule as the device chat (see above).
   let autoApprove = switches.autoApprove;
   let allowEmail = switches.allowEmail;
+  // Discovery starts with customer email OFF - the recipient of a stray message here is a
+  // PROSPECT, and that conversation belongs to the sales rep. The technician can switch it
+  // on in the window when they mean to, and internal email does not need it at all.
+  if (isCrm && switches.restored?.allowEmail === undefined) allowEmail = false;
   // AUTO-CREDENTIAL. Its own role permission (can_use_ai_autocredential), its own
   // toggle, and its own remembered default - never inferred from Auto-approve. What it
   // buys: an ordinary IT Notebook row can be read without stopping the work to ask.
@@ -1687,14 +1939,13 @@ async function startDecisionChat(ws, blob) {
     const id = randomUUID();
     return new Promise((resolve) => {
       pendingApprovals.set(id, resolve);
-      ws.send(JSON.stringify({ type: "approval_request", id, summary }));
+      hub.send(JSON.stringify({ type: "approval_request", id, summary }));
       remote?.onApprovalRequest(id, summary);
     });
   }
   // See the device chat: requestApproval closes over this before the binding can exist.
   let remote = null;
   const startedAt = Date.now();
-  mirrorBrowserFramesToPhone(ws, () => remote);
 
   // WHAT THE TECHNICIAN ACTUALLY TYPED, kept verbatim by product code.
   //
@@ -1857,18 +2108,43 @@ async function startDecisionChat(ws, blob) {
     return { ok: true };
   }
 
+  // The discovery ceiling, applied to every gated kind before the ticket logic can run.
+  // Stated as refusals with reasons, so the model tells the tech what it cannot do here
+  // instead of silently producing nothing.
+  const baseGate = gate;
+  if (isCrm) {
+    gate = async (kind, summary) => {
+      // DEVICE changes are NOT blanket-refused here. They follow the ordinary rules -
+      // Write mode (role: can_use_ai_mutate) plus the approval prompt - because discovery
+      // routinely turns into "while you are in there, fix it", and a technician allowed
+      // to change a machine is allowed to do it on this surface too. What stays refused
+      // is customer contact and anything that prices the work.
+      // EMAIL is not refused here any more (owner, 2026-09-16): it follows the window's
+      // switches, exactly like a ticket chat. send_email decides which switch applies -
+      // Write mode for our own people, "Allow customer email" plus a click for anyone
+      // else - so the technician's toggles mean the same thing on every surface.
+      if (kind === "close") {
+        return { ok: false, reason: "there is no ticket here to close, and opportunity stages are moved by the sales rep in Odoo." };
+      }
+      return baseGate(kind, summary);
+    };
+  }
+
   const { tools, hd, hdError } = buildDecisionTools({
     helpdeskApi: blob.helpdesk_api || null,
     helpdeskCode: blob.helpdesk_code || "",
     ticketRef,
-    gate,
+    leadRef,
+    gate: (kind, summary) => gate(kind, summary),
     // A human is driving this surface by definition, so their ticket work is credited to
     // them rather than to the bot that typed it.
     creditActor: blob.username || "",
     // A getter, not a value: `sessionId` is assigned below this call, so reading it here
     // directly would throw (temporal dead zone) the moment a ticket chat opened.
     creditSession: () => (typeof sessionId === "string" ? sessionId : ""),
-    surface: "decision_chat",   // human driving the ticket; approves each mutating call
+    // Surface = the ceiling. "discovery" holds no `customer`, `close` or credential
+    // classes at all, so those operations are not even advertised to the model.
+    surface: isCrm ? "discovery" : "decision_chat",
     globalKnowledgeAuthorisation: () => globalKBAuthorisation(techSaid),
     operatorPolicy: blob.operator || null,
     operatorActor: blob.username || "",
@@ -1880,9 +2156,68 @@ async function startDecisionChat(ws, blob) {
   });
   if (!hd) { ws.send(JSON.stringify({ type: "error", message: `helpdesk.js failed to load: ${hdError}` })); ws.close(); return; }
 
+  // PRE-SALES DISCOVERY PROMPT. The deliverable is not a fix, it is a SCOPE: what the
+  // customer has, what the work involves, and what nobody knows yet - written down well
+  // enough that a sales rep with no RMM access can quote from it.
+  function discoveryPrompt() {
+    const o = ctx.opportunity || {};
+    return (
+      `You are Pi, doing PRE-SALES DISCOVERY on CRM opportunity ${leadRef} live with an IT technician in a chat.\n` +
+      `This chat is STATEFUL: everything you learn stays in context - never repeat work you have already done; build on it.\n` +
+      `\nTHE OPPORTUNITY\n` +
+      `- Title: ${o.name || "(unknown)"}\n- Stage: ${o.stage || ""}\n- Sales rep: ${o.salesperson || "(unassigned)"}\n` +
+      `- Prospect/customer: ${o.partner || o.email_domain || "(unknown)"}\n- Contact: ${o.email || ""}\n` +
+      `- RMM client: ${ctx.client || "(not matched - say so rather than guessing)"}\n` +
+      (o.description ? `- The brief as written by whoever raised it:\n${String(o.description).slice(0, 4000)}\n` : "") +
+      (o.quotations && o.quotations.length
+        ? `- ALREADY QUOTED: ${o.quotations.map((q) => `${q.name} (${q.state}, ${q.total})`).join("; ")}. Do not propose a duplicate quote; amend or explain the difference.\n`
+        : "") +
+      `\nWHY YOU ARE HERE\n` +
+      `An IT technician is scoping this so a SALES REP can price it. The sales rep has no RMM access and will never see this\n` +
+      `chat - they will read what you write onto the opportunity. So the value you add is FACT: what the customer actually has,\n` +
+      `gathered from their estate, their tickets and our KB - instead of assumptions made in a meeting.\n` +
+      `\nWHAT YOU MAY DO\n` +
+      `- Read the estate: find_devices, run_device_command (READ-ONLY diagnostics), get_device_notes, event logs.\n` +
+      `- Read history: their tickets, closed work, our KB articles and procedures - recurring pain is quotable work.\n` +
+      `- Read the opportunity: get_opportunity (chatter included) - the requirement is often stated in an email there.\n` +
+      `- Record findings ON THE OPPORTUNITY: add_opportunity_note, and submit_discovery_scope for the full scope.\n` +
+      `- submit_discovery_scope: the deliverable. Call it when you have something worth handing over.\n` +
+      `\nWHAT YOU MAY NOT DO - these are refused in code, so do not plan around them\n` +
+      `- NO changes to any device. Discovery is read-only: this is a prospect's estate being surveyed, not a machine we were asked to fix.\n` +
+      `- EMAIL follows this window's switches, like everywhere else. To US (our own staff): Write mode ON, or the tech\n` +
+      `  approves the prompt - so "email me the scope" is something you CAN do. To anyone OUTSIDE the company: the tech\n` +
+      `  must have "Allow customer email" ON and approve it, because the recipient is a prospect and the sales rep owns\n` +
+      `  that conversation. Never reply on a ticket from here.\n` +
+      `- NO prices, rates, discounts or totals from you. You state HOURS and MATERIALS; money is the sales rep's decision.\n` +
+      `  (If the tech asks for a quotation in Odoo and you have the sales tool, it goes in as a DRAFT for a human to price and send.\n` +
+      `   A copy of every quote you raise is filed automatically in the opportunity's INTERNAL NOTES - branded, and replacing\n` +
+      `   the previous copy so there is only ever one current quote on file. Your findings and notes stay in the chatter.)\n` +
+      `- NO moving the opportunity's stage or probability. A human does that in Odoo.\n` +
+      `- NO writing to the knowledge base. You may READ every KB article - that is how you learn this customer's\n` +
+      `  estate - but you create and update NOTHING there. A scope is work nobody has done yet, and unverified\n` +
+      `  proposals do not belong in the KB. EVERYTHING you find goes on the opportunity instead: it is the whole\n` +
+      `  record of this job, so write it there in full. KB articles get written when a TICKET does the real work.\n` +
+      `\nHOW TO WORK\n` +
+      `1. Read the opportunity and the brief FIRST. Ask the tech what the customer actually asked for if it is not written down.\n` +
+      `2. Establish the current state from evidence, naming the device or ticket each fact came from. "Unknown" is a valid,\n` +
+      `   useful answer - an assumption presented as fact is how a quote loses money.\n` +
+      `3. Separate what is IN scope from what is explicitly OUT, and list what still has to be confirmed with the customer.\n` +
+      `4. Estimate effort in HOURS per phase, with the reasoning visible. If you cannot estimate something, say why.\n` +
+      `5. Hand over with submit_discovery_scope.\n` +
+      priorText + `\n` +
+      (String(blob.discovery_prompt || "").trim() ? String(blob.discovery_prompt).trim() + "\n" : "") +
+      (blob.sales_enabled && String(blob.sales_prompt || "").trim()
+        ? ("\nSALES INTEGRATION POLICY:\n" + String(blob.sales_prompt).trim() + "\n") : "") +
+      helpdeskSection(blob, ctx.client) +
+      procedureSection(blob) +
+      operatorPromptSection(blob.operator) +
+      queuePromptSection()
+    );
+  }
+
   const loader = new DefaultResourceLoader(attachGroupToLoader({
     agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
-    systemPromptOverride: () =>
+    systemPromptOverride: () => (isCrm ? discoveryPrompt() :
       `You are Pi, an AI helpdesk technician working ONE ticket (${ticketRef}) live with a technician in a chat.\n` +
       `This chat is STATEFUL: everything you learn and run stays in context for the whole conversation - never repeat work you've already done; build on it.\n` +
       `What triage already found:\n` +
@@ -1907,28 +2242,58 @@ async function startDecisionChat(ws, blob) {
       helpdeskSection(blob, ctx.client) +
       procedureSection(blob) +
       operatorPromptSection(blob.operator) +
-      queuePromptSection(),
+      queuePromptSection()),
   }, groupState));
   await loader.reload();
 
   // PROMPT QUEUE - same engine as the device chat; see the note there.
   const queue = makePromptQueue({
     scopeKey: histKey,
-    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
     log,
-    runPrompt: (text) => runPrompt(text, [], "queue"),
+    runPrompt: (text, images = []) => runPrompt(text, images, "queue"),
+    // Queued prompts take attachments through the SAME intake as typed ones.
+    intake: (msg) => takeAttachments(msg),
+    compose: (text, attachText) => composePrompt(text, attachText),
     compact: (reason) => compactCmd.run("", { reason, clear: true }),
     isStreaming: () => !!session?.isStreaming,
+    // See the device chat: on by default, off only where someone said so, remembered.
+    autoClearDefault: windowMemory.recallSwitch(histKey, "auto_clear", true),
+    onSwitch: (name, value, actor) =>
+      windowMemory.rememberSwitch(histKey, name, value, actor?.user || blob.username || ""),
   });
   tools.push(queue.tool);
 
   // Persist per ticket: resume the latest session for this ticket if one exists.
   let sessionManager;
+  let latestId = "";
   try {
     const idx = history.readIndex(histKey);
     const latest = Object.entries(idx).sort((a, b) => String(b[1].last_activity || "").localeCompare(String(a[1].last_activity || "")))[0];
-    if (latest && latest[1]?.file) { try { sessionManager = SessionManager.open(latest[1].file); } catch { sessionManager = null; } }
+    if (latest && latest[1]?.file) {
+      latestId = latest[0];
+      try { sessionManager = SessionManager.open(latest[1].file); } catch { sessionManager = null; }
+    }
   } catch { /* no history yet */ }
+  // ALREADY LIVE? Attach as a viewer of the running session instead of opening a copy.
+  const pk = liveKey(histKey, latestId || "new");
+  {
+    const liveHub = latestId ? LIVE.get(pk) : null;
+    if (liveHub && !liveHub.disposed) {
+      attachSocketToHub(liveHub, ws, blob);
+      log("decision chat attached", histKey, latestId, `${blob.username || "?"} joined a live session`);
+      return;
+    }
+    if (LIVE_PENDING.has(pk)) {
+      try {
+        const built = await LIVE_PENDING.get(pk);
+        attachSocketToHub(built, ws, blob);
+        log("decision chat attached", histKey, latestId || "new", `${blob.username || "?"} joined a session being built`);
+        return;
+      } catch { /* build our own */ }
+    }
+  }
+  const pendingClaim = claimPending(pk);
   if (!sessionManager) sessionManager = SessionManager.create(CONFIG.sessionsRoot);
 
   const { session } = await createAgentSession({
@@ -1937,12 +2302,47 @@ async function startDecisionChat(ws, blob) {
     sessionManager, agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
   });
   const sessionId = session.sessionId;
-  queue.attach(sessionId);
+  // Server-resident session; sockets are viewers. See the device chat and live-hub.js.
+  const hub = makeHub({
+    key: liveKey(histKey, sessionId),
+    aliases: latestId ? [liveKey(histKey, latestId)] : [],
+    graceMs: graceMsFor(blob),
+    log,
+    onDispose: (reason) => teardown(reason),
+    onOwnerChange: (owner, why) => {
+      hub.send(JSON.stringify({ type: "system_note", text: owner
+        ? `\u{1F3AE} ${owner.display} is now driving this session (${why}).`
+        : `\u{1F3AE} Nobody is driving this session (${why}). Press Take over to drive it.` }));
+    },
+  });
+  hub.presenceFrameFor = (forWs) => presenceFrame(hub.presence, forWs);
+  pendingClaim.resolve(hub);
+  let ticketStage = String(blob.ticket_stage || "");
+  const refreshStage = async () => {
+    try {
+      let st = "";
+      if (isCrm) {
+        if (!hd.operations.get_opportunity) return;
+        const o = await hd.operations.get_opportunity({ lead: leadRef, messages: 0 });
+        st = o && !o.error ? String(o.stage || "") : "";
+      } else {
+        if (!hd.operations.get_ticket_stages) return;
+        const r = await hd.operations.get_ticket_stages({ refs: [ticketRef] });
+        st = r && r[ticketRef] ? String(r[ticketRef].stage || "") : "";
+      }
+      if (st && st !== ticketStage) {
+        ticketStage = st;
+        hub.send(JSON.stringify({ type: "ticket_stage", stage: ticketStage }));
+      }
+    } catch { /* stage is decoration; never break the chat over it */ }
+  };
+  queue.attach(sessionId, latestId);
+  queue.backfillPrompts(transcriptPrompts(sessionManager));
   // Same technician-set label as the device chat (see the note there).
   let sessionLabel = String(history.readIndex(histKey)[sessionId]?.label || "");
   history.recordSession(histKey, sessionId, {
     file: session.sessionFile,
-    name: `Ticket ${ticketRef}`,
+    name: subjectTitle,
     label: sessionLabel,
     started: history.readIndex(histKey)[sessionId]?.started || new Date().toISOString(),
     last_activity: new Date().toISOString(),
@@ -1950,11 +2350,11 @@ async function startDecisionChat(ws, blob) {
   });
 
   let lastActivity = Date.now(), toolsInFlight = 0, postedToTicket = false;
-  const work = makeWorkRecorder({ ticketRef, surface: "ticket_chat",
+  const work = makeWorkRecorder({ ticketRef: subjectRef, surface: isCrm ? "discovery_chat" : "ticket_chat",
     username: blob.username || "", sessionId });
   // Cost meter: gated on the role permission resolved by the RMM (can_view_ai_cost).
   const costMeter = makeCostMeter({
-    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
     log,
     visible: !!blob.cost_visible,
     key: histKey,
@@ -1964,18 +2364,19 @@ async function startDecisionChat(ws, blob) {
     // Bookkeeping must never break a chat, but a SILENT failure means the spend ledger
     // quietly stops recording - which is how a whole surface went unrecorded on
     // 2026-08-04. Swallow the error for the chat, but always log it.
-    ledger: (entry) => {
-      trmm.logSpend(entry).catch((e) => {
-        log("spend_ledger_error", entry.surface, entry.session_id,
-            `turn ${entry.turn_index}: ${String(e?.message || e).slice(0, 300)}`);
-      });
-    },
+    ledger: ledgerSink(log),
     context: {
       surface: "decision_chat",
       actorUsername: blob.username || "",
       ticketRef,
     },
   });
+  // Same as the device chat: delegated specialists bill to this conversation.
+  groupState.spend = {
+    log, key: histKey, sessionId,
+    actorUsername: blob.username || "",
+    ticketRef,
+  };
   const CHATTER_OPS = new Set(["reply_to_ticket", "add_note", "resolve_ticket"]);
   // Same silent recovery as the device chat (see llm-recovery.js).
   const recovery = makeLlmRecovery({ log, key: histKey, sessionId });
@@ -1992,23 +2393,43 @@ async function startDecisionChat(ws, blob) {
     } else if (event.type === "auto_retry_end" && !event.success) {
       log("retry_end", histKey, sessionId, `gave up: ${String(event.finalError || "").slice(0, 120)}`);
       recovery.noteHarnessGaveUp();
+      // The turn died without an end event: stop replaying its frames to newcomers.
+      hub.clearTurnBuffer();
     } else if (event.type === "message_end" && event.message?.stopReason === "error") {
       const why = String(event.message.errorMessage || "unknown provider error");
       log("llm_error", histKey, sessionId, why.slice(0, 400));
       if (recovery.consider(event.message)) {
         log("llm_error_recoverable", histKey, sessionId, "no content, no tokens - will re-run silently");
       } else {
+        // THE PROMPT DID NOT FIT. Almost always one runaway tool result rather than a
+        // long conversation, and until 2026-09-22 it left the window unusable: every
+        // prompt rejected, and "Summarise & clear" refusing because the harness saw
+        // nothing it was willing to cut. Drop the oversized result out of the context
+        // here, automatically, and tell the technician in one sentence that they can
+        // carry on - it is the difference between a hiccup and a dead window.
+        let overflowNote = "";
+        if (isContextOverflowError(why)) {
+          const t = trimOversized(session, { log, key: histKey, sessionId });
+          overflowNote = t.note
+            ? ` ${t.note}`
+            : " Nothing in this conversation is individually oversized, so the whole thing is" +
+              " simply too long: press Summarise & clear, or start a new chat (this transcript" +
+              " and its cost stay in AI History).";
+        }
         try {
-          ws.send(JSON.stringify({
+          hub.send(JSON.stringify({
             type: "error",
-            message: recovery.exhaustedNote(why)
-              || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`,
+            message: (recovery.exhaustedNote(why)
+              || `The model returned no answer - the provider rejected the request: ${why.slice(0, 600)}`)
+              + overflowNote,
           }));
         } catch {}
         queue.noteError(why);
       }
     } else if (event.type === "agent_end") {
       log("agent_end", histKey, sessionId);
+      // A turn may have closed, cancelled or reassigned the ticket: re-read its stage.
+      refreshStage();
       const last = session.messages.filter((m) => m.role === "assistant").slice(-1)[0];
       const t = last?.content?.find?.((c) => c.type === "text")?.text;
       history.touchSession(histKey, sessionId, t || "");
@@ -2036,23 +2457,29 @@ async function startDecisionChat(ws, blob) {
       const silent = silentStopMessage(event.message);
       if (silent) {
         log("turn_no_answer", histKey, sessionId, `stopReason=${event.message?.stopReason}`);
-        try { ws.send(JSON.stringify({ type: "error", message: silent })); } catch {}
+        try { hub.send(JSON.stringify({ type: "error", message: silent })); } catch {}
       }
     }
     remote?.onAgentEvent(event);
-    try { ws.send(JSON.stringify({ type: "agent_event", event })); } catch {}
+    try {
+      const frame = JSON.stringify({ type: "agent_event", event });
+      hub.send(frame);
+      hub.noteTurnEvent(frame, event);
+    } catch {}
   });
 
   // /compact - same command on the ticket surface. No liveness context here (this surface
   // has no stall watchdog), so the turn wrapper is a pass-through.
   const compactCmd = makeCompactCommand({
     session, costMeter,
-    send: (frame) => { try { ws.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
     log, key: histKey, sessionId,
     currentModel: () => session.model || model,
     rateLookup: (provider, modelId) => modelRegistry.findModel(provider, modelId)?.cost || null,
     markCleared: () => sessionManager.appendCustomEntry("transcript_cleared",
       { at: new Date().toISOString(), by: blob.username || "" }),
+    // See the device chat: one oversized tool result must not be able to wedge a window.
+    trimContext: () => trimOversized(session, { log, key: histKey, sessionId }),
     ...compactSummarizerHooks(session, rt, groupState),
   });
 
@@ -2062,30 +2489,30 @@ async function startDecisionChat(ws, blob) {
   function applyReadonly(v) {
     if (mutateAllowed) readonly = !v;
     windowMemory.rememberSwitch(histKey, "write", !!v, blob.username || "");
-    try { ws.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
+    try { hub.send(JSON.stringify({ type: "readonly_state", value: readonly })); } catch {}
   }
   function applyAutoApprove(v) {
     autoApprove = !!v && autoapproveAllowed;
     windowMemory.rememberSwitch(histKey, "auto_approve", !!v, blob.username || "");
-    try { ws.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
+    try { hub.send(JSON.stringify({ type: "autoapprove_state", value: autoApprove })); } catch {}
   }
   function applyAutoCredential(v) {
     autoCredential = !!v && autocredentialAllowed;
     windowMemory.rememberSwitch(histKey, "auto_credential", !!v, blob.username || "");
     log(autoCredential ? "auto-credential ON" : "auto-credential OFF",
         histKey, sessionId, `by ${blob.username || "?"}`);
-    try { ws.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
+    try { hub.send(JSON.stringify({ type: "autocredential_state", value: autoCredential })); } catch {}
   }
   function applyAllowEmail(v) {
     allowEmail = !!v;
     windowMemory.rememberSwitch(histKey, "allow_email", !!v, blob.username || "");
-    try { ws.send(JSON.stringify({ type: "allow_email_state", value: allowEmail })); } catch {}
+    try { hub.send(JSON.stringify({ type: "allow_email_state", value: allowEmail })); } catch {}
   }
   function applyLabel(v) {
     sessionLabel = String(v ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
     history.recordSession(histKey, sessionId, { label: sessionLabel });
     log("label set", histKey, sessionId, sessionLabel || "(cleared)");
-    try { ws.send(JSON.stringify({ type: "label_state", value: sessionLabel })); } catch {}
+    try { hub.send(JSON.stringify({ type: "label_state", value: sessionLabel })); } catch {}
     remote?.pushState();
   }
 
@@ -2135,8 +2562,14 @@ async function startDecisionChat(ws, blob) {
     }),
   });
 
-  ws.send(JSON.stringify({
-    type: "ready", session_id: sessionId, hostname: `Ticket ${ticketRef}`,
+  hub.readyFor = (forWs) => ({
+    type: "ready", session_id: sessionId, hostname: subjectTitle,
+    presence: presenceFrame(hub.presence, forWs),
+    streaming: !!session.isStreaming,
+    // The ticket's helpdesk stage, as of opening; refreshed after every turn (ticket_stage
+    // frames) so a close or hand-off done in this very chat shows up in the title bar.
+    ticket_stage: ticketStage,
+    pinned: !!hub.pinned, pinned_by: hub.pinnedBy || "",
     multi: false, machines: [],
     // Server-fed autocomplete: never offers a switch this role does not carry.
     commands: chatCmds.spec(),
@@ -2158,6 +2591,8 @@ async function startDecisionChat(ws, blob) {
     // Does this window offer the Remote (phone) button? Role + global switch + relay.
     remote_allowed: !!blob.remote_allowed && !!blob.remote_relay_url,
     context_window: Number(model?.contextWindow || 0),
+    // Same composer as the device chat, so the same caps and the same vision check.
+    attachments: attachReady(model),
     operator_enabled: !!(blob.operator && blob.operator.enabled),
     operator_machines: (blob.operator && blob.operator.machines) || [],
     // A cleared transcript suppresses the ticket's prior thread too - the whole point
@@ -2166,11 +2601,13 @@ async function startDecisionChat(ws, blob) {
       ...(transcriptClearedAt(sessionManager).cut >= 0 ? [] : priorHist),
       ...uiTranscript(sessionManager, session),
     ],
-  }));
-  await hydrateWindowCost(costMeter, { ticket_ref: ticketRef }, {
-    ws, visible: !!blob.cost_visible, log, key: histKey, sessionId,
+  });
+  await hydrateWindowCost(costMeter, { ticket_ref: subjectRef }, {
+    ws: hub, visible: !!blob.cost_visible, log, key: histKey, sessionId,
   });
   queue.publish();
+  hub.stateProviders.push(() => queue.state());
+  if (blob.cost_visible) hub.stateProviders.push(() => costMeter.snapshot());
 
   // As soon as the tech actually STARTS TALKING to this chat (first prompt), assign
   // the ticket to them (matched by their RMM email/login to an Odoo user). Only takes
@@ -2178,6 +2615,8 @@ async function startDecisionChat(ws, blob) {
   let assignAttempted = false;
   async function assignWorkingUser() {
     if (assignAttempted) return; assignAttempted = true;
+    if (isCrm) return;   // no ticket here to assign, and CRM ownership is the sales rep's
+
     if (!blob.user_email && !blob.user_display && !blob.username) return;
     if (!hd?.operations?.assign_to_working_user) return;
     try {
@@ -2185,7 +2624,7 @@ async function startDecisionChat(ws, blob) {
         ticket: ticketRef, email: blob.user_email || "", name: blob.user_display || blob.username || "",
       });
       log("decision assign", histKey, JSON.stringify(r || {}).slice(0, 180));
-      if (r?.ok && r?.assignee) { try { ws.send(JSON.stringify({ type: "info", message: `Ticket assigned to ${r.assignee}` })); } catch {} }
+      if (r?.ok && r?.assignee) { try { hub.send(JSON.stringify({ type: "info", message: `Ticket assigned to ${r.assignee}` })); } catch {} }
     } catch (e) { log("decision assign err", histKey, String(e).slice(0, 180)); }
   }
 
@@ -2197,10 +2636,22 @@ async function startDecisionChat(ws, blob) {
     if (!text) return;
     // One frame. `mirrorBrowserFramesToPhone` puts the same line on the phone, so the
     // desk and the pocket read the same transcript without two call sites to keep in step.
-    try { ws.send(JSON.stringify({ type: "system_note", text })); } catch { /* socket gone */ }
+    try { hub.send(JSON.stringify({ type: "system_note", text })); } catch { /* socket gone */ }
   }
 
-  async function runPrompt(text, images = [], origin = "browser") {
+  // Attachments, identical to the device chat (a screenshot from the customer is the
+  // commonest evidence a ticket ever carries).
+  const takeAttachments = makeAttachmentIntake({
+    send: (frame) => { try { hub.send(JSON.stringify(frame)); } catch { /* socket gone */ } },
+    model: () => session.model || model,
+    log,
+    key: histKey,
+    sessionId,
+  });
+
+  async function runPrompt(text, images = [], origin = "browser", actor = null) {
+    // See the device chat: whose prompt this is, for the history.
+    const who = actor || actorOn(hub, null, blob);
     if (origin !== "phone") remote?.beginBrowserTurn(text);
     // A typed switch ("/email off"). See the device chat.
     const typed = chatCmds.parse(text);
@@ -2213,47 +2664,35 @@ async function startDecisionChat(ws, blob) {
       await compactCmd.run(text);
       return;
     }
-    if (origin !== "queue") queue.noteOperatorReply(text);
+    if (origin !== "queue") queue.noteOperatorReply(text, who);
+    // Same as the device chat: the history records every prompt the model was given, and
+    // who gave it.
+    queue.notePrompt(text, origin, { actor: who });
+    // ...and it becomes the active queue item - see the device chat.
+    const typedItem = origin === "queue" ? "" : queue.beginTypedItem(text, origin, who);
     // Keep the tech's own words for the close-authorisation test above.
     techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
     work.humanTurn();
     assignWorkingUser(); // fire-and-forget: claim the ticket for the working tech on first message
     recovery.beginTurn();
-    const content = images.length
-      ? [
-          ...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })),
-          { type: "text", text: String(text || "") },
-        ]
-      : text;
-    if (session.isStreaming) await session.prompt(content, { streamingBehavior: "steer" });
-    else await session.prompt(content);
-    // See the device chat: re-run a blank provider rejection before telling the tech.
-    while (recovery.pending) {
-      if (!(await recovery.run(session))) break;
+    // See the device chat: images go in the options bag; prompt() itself takes a string.
+    const body = String(text || "");
+    const imageBlocks = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime }));
+    try {
+      if (session.isStreaming) await session.prompt(body, { streamingBehavior: "steer", images: imageBlocks });
+      else await session.prompt(body, { images: imageBlocks });
+      // See the device chat: re-run a blank provider rejection before telling the tech.
+      while (recovery.pending) {
+        if (!(await recovery.run(session))) break;
+      }
+      queue.settleTypedItem(typedItem, true);
+    } catch (e) {
+      queue.settleTypedItem(typedItem, false, String(e?.message || e));
+      throw e;
     }
   }
 
-  remote = makeRemoteBinding({
-    blob,
-    key: histKey,
-    // Same as the device chat: the Label field wins, the ticket is the fallback.
-    label: () => sessionLabel.trim() || `Ticket ${ticketRef}`,
-    log,
-    toBrowser: (frame) => { try { ws.send(JSON.stringify(frame)); } catch {} },
-    submitPrompt: (text, images) => runPrompt(text, images, "phone").finally(() => queue.advance("phone turn settled")),
-    abort: () => { queue.noteAbort(); return session.abort(); },
-    resolveApproval: (id, ok) => {
-      const resolve = pendingApprovals.get(id);
-      if (resolve) { pendingApprovals.delete(id); resolve(!!ok); }
-      try { ws.send(JSON.stringify({ type: "approval_resolved", id, approved: !!ok, by: "mobile" })); } catch {}
-    },
-    transcript: () => uiTranscript(sessionManager, session),
-    startedAt,
-    // The LIVE model, not the one the blob asked for. Since model-memory landed a
-    // reopened window can be running something the blob never named, and the phone's
-    // model picker reads this.
-    currentModel: () => session.model || model,
-  });
+  // (phone 'remote' binding removed 2026-09-15: the mobile app attaches to the live session like any other viewer)
 
   // Idle disposal - same rule as the device chat (see the comment there): close only when
   // neither the technician nor the assistant has done anything for idleTimeoutMs. A
@@ -2268,8 +2707,10 @@ async function startDecisionChat(ws, blob) {
       idleTimer = setTimeout(idleCheck, Math.max(1000, CONFIG.idleTimeoutMs - quiet));
       return;
     }
-    log("ws idle close", `${histKey} ${sessionId} quiet ${Math.round(quiet / 1000)}s (browser ${Math.round((Date.now() - lastBrowserMsgAt) / 1000)}s, assistant ${Math.round((Date.now() - lastActivity) / 1000)}s)`);
-    try { ws.close(1000, "idle"); } catch {}
+    if (graceMsFor(blob) === 0) { idleTimer = setTimeout(idleCheck, CONFIG.idleTimeoutMs); return; }
+    log("ws idle close", `${histKey} ${sessionId} quiet ${Math.round(quiet / 1000)}s`);
+    hub.send(JSON.stringify({ type: "system_note", text: "Idle for a while - this window disconnected; the session stays on the server and reconnecting picks it straight back up." }));
+    for (const sock of [...hub.presence.members.keys()]) { try { sock.close(1000, "idle"); } catch {} }
   };
   const resetIdle = () => {
     lastBrowserMsgAt = Date.now();
@@ -2278,12 +2719,14 @@ async function startDecisionChat(ws, blob) {
   };
   resetIdle();
 
-  const onBrowserFrame = async (raw) => {
+  const onBrowserFrame = async (raw, sock = null) => {
     resetIdle();
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+    // Who is on this socket - see the device chat.
+    const who = actorOn(hub, sock, blob);
     try {
       if (await remote?.handleBrowser(msg)) return;
-      if (await queue.handle(msg)) return;
+      if (await queue.handle(msg, who)) return;
       switch (msg.type) {
         case "compact":
           await compactCmd.run(String(msg.message || ""), {
@@ -2292,24 +2735,42 @@ async function startDecisionChat(ws, blob) {
             instructions: msg.instructions,
           });
           break;
-        case "prompt":
-          await runPrompt(msg.message);
+        case "prompt": {
+          // See the device chat: a / command is answered by the window, so attachments
+          // sent with one would be silently discarded.
+          if (chatCmds.parse(String(msg.message || "")) && Array.isArray(msg.attachments) && msg.attachments.length) {
+            announce("Attachments are not sent with a / command - run the command, then send the files with a normal message.");
+            await runPrompt(String(msg.message || ""), [], "browser", who);
+            break;
+          }
+          const att = takeAttachments(msg);
+          const text = composePrompt(msg.message, att.text);
+          // Every attachment refused and nothing typed: the operator already has the
+          // rejection notice, so do not send an empty turn to the model.
+          if (!text && !att.images.length) break;
+          await runPrompt(text, att.images, "browser", who);
           await queue.advance("turn settled");
           break;
-        case "steer":
+        }
+        case "steer": {
+          const att = takeAttachments(msg);
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           work.humanTurn();
-          await session.steer(msg.message);
+          const text = composePrompt(msg.message, att.text);
+          if (!text && !att.images.length) break;
+          queue.notePrompt(msg.message, "browser", { steer: true, actor: who });
+          await session.steer(text, att.images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })));
           break;
-        case "abort": queue.noteAbort(); await session.abort(); break;
+        }
+        case "abort": queue.noteAbort(who); await session.abort(); break;
         case "set_group":
-          await applySetGroup({ ws, session, rt, blob, groupState, msg, costMeter, log, key: histKey });
+          await applySetGroup({ ws: hub, session, rt, blob, groupState, msg, costMeter, log, key: histKey });
           break;
         case "set_model": {
           const allowed = (blob.allowed_models || []).find((m) => m.model_id === msg.model_id);
-          if (!allowed) { ws.send(JSON.stringify({ type: "error", message: `Model not permitted: ${msg.model_id}` })); break; }
+          if (!allowed) { hub.send(JSON.stringify({ type: "error", message: `Model not permitted: ${msg.model_id}` })); break; }
           const nm = modelRegistry.findModel(allowed.provider, allowed.model_id);
-          if (!nm) { ws.send(JSON.stringify({ type: "error", message: `Model not found: ${allowed.model_id}` })); break; }
+          if (!nm) { hub.send(JSON.stringify({ type: "error", message: `Model not found: ${allowed.model_id}` })); break; }
           // Warn about the cache rewrite this switch forces (see the device-chat note).
           try { costMeter.previewModelSwitch(nm, allowed.display_name || allowed.model_id); } catch {}
           await session.setModel(nm);
@@ -2320,7 +2781,10 @@ async function startDecisionChat(ws, blob) {
             group_id: groupState.current?.id ?? null,
             by: blob.username || "",
           });
-          ws.send(JSON.stringify({ type: "model_changed", model_id: allowed.model_id, display: nm.name }));
+          hub.send(JSON.stringify({
+            type: "model_changed", model_id: allowed.model_id, display: nm.name,
+            images_supported: imagesSupported(nm),
+          }));
           break;
         }
         // See the device chat: one setter, one sentence, both surfaces.
@@ -2354,11 +2818,12 @@ async function startDecisionChat(ws, blob) {
         }
         default: break;
       }
-    } catch (e) { ws.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) })); }
+    } catch (e) { hub.send(JSON.stringify({ type: "error", message: apiErrorMessage(e) })); }
   };
-  handOff(onBrowserFrame);
+  hub.onFrame = (raw, sock) => onBrowserFrame(raw, sock);
+  handOff(hubMessageHandler(hub, ws));
 
-  ws.on("close", () => {
+  function teardown(reason) {
     clearTimeout(idleTimer);
     unsubscribe();
     for (const [, resolve] of pendingApprovals) resolve(false);
@@ -2369,8 +2834,9 @@ async function startDecisionChat(ws, blob) {
     try { session.dispose(); } catch {}
     // Flush whatever burst was open, so a chat closed mid-thought still records its time.
     try { work.close("socket closed"); } catch {}
-    log("decision chat closed", histKey, sessionId);
-  });
+    log("decision chat closed", histKey, sessionId, reason || "");
+  }
+  attachSocketToHub(hub, ws, blob, { installMessage: false });
   log("decision chat started", histKey, sessionId, `${blob.provider}/${blob.model_id}`);
 }
 
@@ -2482,6 +2948,15 @@ async function runHeadless(blob) {
     cwd: CONFIG.sessionsRoot,
   });
   if (runId) activeRuns.set(runId, session);
+  // Unattended work bills exactly like a chat does, and nobody is watching it - which is
+  // why it MUST be in the ledger: an AI task running nightly across a fleet is the easiest
+  // way to spend money with no trace. See spend-ledger.js.
+  attachSpendLedger(session, {
+    surface: "unattended", log, key: agentId,
+    actorUsername: blob.username || "",
+    agentId, agentHostname: facts?.hostname || "",
+    client: facts?.client || "", site: facts?.site || "",
+  });
 
   // Stream progress to the live buffer as the agent works.
   let textBuf = "";
@@ -2622,6 +3097,10 @@ async function runReport(blob) {
     cwd: CONFIG.sessionsRoot,
   });
   if (runId) activeRuns.set(runId, session);
+  attachSpendLedger(session, {
+    surface: "report", log, key: runId || "report",
+    actorUsername: blob.username || "",
+  });
 
   const unsub = session.subscribe((event) => {
     if (event.type === "tool_execution_start")
@@ -2849,6 +3328,9 @@ async function runProcedureMining(blob) {
         noTools: "builtin", customTools: tools, resourceLoader: loader,
         sessionManager: SessionManager.create(CONFIG.sessionsRoot), agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
       });
+      attachSpendLedger(session, {
+        surface: "mining", log, key: "mining", actorUsername: blob.username || "",
+      });
       const compact = chunk.map((t) => {
         const tech = decisionTranscript(t.ref);
         return {
@@ -2899,6 +3381,400 @@ async function runProcedureMining(blob) {
 // It never emails the customer, never closes/cancels, never makes disruptive changes
 // (those need a human in the console). It finishes by posting ONE internal note that
 // either says "RESOLVED pending sign-off (+ draft reply)" or "NEEDS A HUMAN: <steps>".
+// ---- TICKET AUTOMATION SUBJECTS: work one ticket unattended --------------------------
+//
+// Owner's rule (2026-09-15): a ticket that falls into an approved automation SUBJECT may be
+// worked on its own, with a matching procedure/KB article to start from, and the AI must be
+// sure - or it does nothing and asks. The two safety properties are STRUCTURAL:
+//
+//   * advise mode builds NO device toolbelt. There is no tool with which to touch a file.
+//   * device_readonly builds the decision toolbelt HARD read-only: every device gate
+//     refuses, so run_device_command cannot execute anything mutating.
+//
+// The model never decides whether the customer is contacted. It reports a VERDICT via the
+// report_verdict tool; CODE below decides, from the verdict's own fields: only a `confident`
+// verdict with at least two concrete findings on an approved subject sends the reply, and
+// the reply is the model's draft ONLY where the subject has no template. Anything short of
+// that becomes an internal note + needs-input tag. Closing is never done here.
+async function runAutowork(blob) {
+  const ticketRef = blob.ticket_ref || "";
+  const subj = blob.subject || {};
+  // MODE IS THE CEILING (see AITicketAutomationSubject.mode). device_fix is only honoured
+  // when the owner actually attached reviewed actions to the subject - a mode with no
+  // actions behind it degrades to read-only investigation rather than pretending.
+  const fixActions = Array.isArray(subj.fix_actions) ? subj.fix_actions.filter((a) => a && a.name && a.command) : [];
+  const mode = subj.mode === "device_fix" && fixActions.length ? "device_fix"
+    : (subj.mode === "device_readonly" || subj.mode === "device_fix" ? "device_readonly" : "advise");
+  const surface = mode === "advise" ? "advise" : (mode === "device_fix" ? "autowork_fix" : "autowork_readonly");
+  const rt = await piRuntime({ [blob.provider]: blob.api_key });
+  const model = rt.findModel(blob.provider, blob.model_id);
+  if (!model) return { error: `Model not found: ${blob.provider}/${blob.model_id}` };
+
+  // Every gate refuses. Customer contact is done by CODE after the verdict, never by the
+  // model through helpdesk_call; device mutations never; closing never.
+  // OWNER'S RULING (2026-09-17): "if the ticket auto group allows for this ticket type to
+  // be auto done, then that rule may be bypassed since it's an auto resolvable ticket."
+  //
+  // So an APPROVED subject IS the authority for customer contact on the tickets of the
+  // incident it covers - a person decided this ticket type may be answered without them.
+  // The session may therefore reply itself, which is what lets one session answer the
+  // primary AND every duplicate in each requester's own words instead of a copied
+  // paragraph. What still bounds it is not a prompt:
+  //   * `allowedTickets` - only this ticket and the duplicates held behind it;
+  //   * `reply_allowed`  - the subject's own switch; off means off;
+  //   * the CLOSE remains code-driven, from the verdict, at the end of the run.
+  // Device changes are unaffected: still apply_fix or nothing.
+  const replyAllowedHere = subj.reply_allowed !== false;
+  const gate = async (kind) => {
+    if (kind === "device") {
+      return { ok: false, reason: mode === "device_fix"
+        ? "free-form device changes are refused even in fix mode: use apply_fix with one of the subject's reviewed actions, or report the verdict and leave it to a human."
+        : "automation subjects are read-only on devices; a technician must approve changes in the ticket chat." };
+    }
+    if (kind === "email") {
+      if (mode === "advise") {
+        // No device toolbelt on this surface and no evidence to stand on: the verdict path
+        // sends the reply, so the wording still passes the confidence gate.
+        return { ok: false, reason: "on this subject the reply is sent by the automation from your verdict - call report_verdict instead of replying directly." };
+      }
+      if (!replyAllowedHere) {
+        return { ok: false, reason: "this subject does not permit customer replies. Report the verdict; a human will answer." };
+      }
+      return { ok: true, authorised_by: { by: "automation subject", what: subj.name } };
+    }
+    return { ok: false, reason: "not permitted in unattended automation; a human does that in the console." };
+  };
+
+  const verdict = {
+    reported: false, kind: "", confidence: "", findings: [], summary: "",
+    customer_reply: "", internal_note: "", needs_human_because: "", duplicate_replies: [],
+  };
+  const report_verdict = defineTool({
+    name: "report_verdict",
+    label: "Report verdict",
+    description:
+      "Finish by reporting your verdict EXACTLY ONCE. The automation decides what to do with it; " +
+      "you do not send anything yourself. kind: what this ticket IS (e.g. 'phishing', 'legitimate', " +
+      "'service_down', 'service_up', 'unclear'). confidence: 'confident' ONLY if you would stake the " +
+      "customer relationship on it with no human check; otherwise 'unsure'. findings: concrete, " +
+      "checkable evidence, one per item (a misspelled brand, a mismatched sender domain, a TCP port " +
+      "that is not listening) - at least two for a confident verdict.",
+    parameters: Type.Object({
+      kind: Type.String(),
+      confidence: Type.Union([Type.Literal("confident"), Type.Literal("unsure")]),
+      findings: Type.Array(Type.String()),
+      summary: Type.String({ description: "one paragraph for the internal note" }),
+      customer_reply: Type.Optional(Type.String({ description: "the reply to the customer, plain text, send-ready; empty if no reply is warranted" })),
+      // ONE INCIDENT, EVERY TICKET. Other people wrote in about the same thing while you
+      // worked; each of them asked separately and deserves their own answer, in their own
+      // words - not a copy of someone else's. You write them; the automation sends them
+      // and files those tickets to AI Closed, the same way it handles this one.
+      duplicate_replies: Type.Optional(Type.Array(Type.Object({
+        ticket: Type.String({ description: "the duplicate's reference, from list_duplicate_tickets" }),
+        reply: Type.String({ description: "the reply for THAT requester, plain text, send-ready" }),
+      }), { description: "replies for the tickets held behind this one - call list_duplicate_tickets first" })),
+      needs_human_because: Type.Optional(Type.String()),
+    }),
+    execute: async (_id, p) => {
+      Object.assign(verdict, {
+        duplicate_replies: (p.duplicate_replies || [])
+          .filter((d) => d && d.ticket && d.reply)
+          .map((d) => ({ ticket: String(d.ticket).trim(), reply: String(d.reply).slice(0, 6000) }))
+          .slice(0, 20),
+        reported: true, kind: String(p.kind || "").slice(0, 40), confidence: p.confidence,
+        findings: (p.findings || []).map((f) => String(f).slice(0, 400)).slice(0, 12),
+        summary: String(p.summary || "").slice(0, 4000),
+        customer_reply: String(p.customer_reply || "").slice(0, 6000),
+        needs_human_because: String(p.needs_human_because || "").slice(0, 1000),
+      });
+      return { content: [{ type: "text", text: "Verdict recorded. Stop now." }], details: {} };
+    },
+  });
+
+  // ---- THE REVIEWED REMEDIATION ---------------------------------------------------
+  //
+  // "A restart should be enough to fix it" (owner, 2026-09-16). So the automation may
+  // restart the thing - but only the thing, only the way a human wrote down, and only
+  // when it has first PROVEN the service is actually down.
+  //
+  // The model supplies a NAME. It never supplies a command: the commands are
+  // subject.fix_actions, reviewed in the Procedures page. That is what keeps "restart
+  // SendPlot" from becoming anything else, whatever a ticket or an injected instruction
+  // asks for.
+  // THE INCIDENT'S TICKETS. This one, plus every ticket held behind it. The session may
+  // reply to and close these and nothing else (enforced in buildDecisionTools via
+  // allowedTickets), so "handle your duplicates too" cannot become "touch any ticket".
+  const incidentTickets = new Set([ticketRef, ...((blob.duplicates || []).map(String))]);
+  const list_duplicate_tickets = defineTool({
+    name: "list_duplicate_tickets",
+    label: "List duplicate tickets",
+    description:
+      "Other tickets reporting the SAME incident, held behind this one. Call this BEFORE you " +
+      "report your verdict: duplicates usually arrive while you are working, so the list at " +
+      "the start is not the final list. For each one you get back: reply to that requester in " +
+      "their own context (they asked separately and deserve their own answer), then close it " +
+      "with ai_close_ticket - but only if you actually resolved the problem. If you did not " +
+      "resolve it, leave them alone and say so; a human will pick them up.",
+    parameters: Type.Object({}),
+    execute: async () => {
+      try {
+        const out = await trmm.autoworkDuplicates(ticketRef);
+        const dups = (out && out.duplicates) || [];
+        for (const d of dups) if (d && d.ticket_ref) incidentTickets.add(String(d.ticket_ref));
+        if (!dups.length) {
+          return { content: [{ type: "text", text: "No other tickets are held behind this one. Just this ticket to answer." }], details: {} };
+        }
+        return {
+          content: [{ type: "text", text:
+            `${dups.length} ticket(s) report the same incident and are waiting on you:\n` +
+            dups.map((d) => `- ${d.ticket_ref} from ${d.requester || "(unknown)"}: "${String(d.subject || "").slice(0, 90)}" (arrived ${d.arrived})`).join("\n") +
+            `\n\nReply to each, then ai_close_ticket each - only if you resolved the problem.` }],
+          details: { duplicates: dups.map((d) => d.ticket_ref) },
+        };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Could not read the duplicate list: ${String(e?.message || e).slice(0, 200)}. Answer this ticket; a human will handle any duplicates.` }], details: {} };
+      }
+    },
+  });
+
+  const fixLog = [];
+  let fixAttempted = false;
+  const apply_fix = defineTool({
+    name: "apply_fix",
+    label: "Apply the reviewed fix",
+    description:
+      "Run ONE of this subject's reviewed remediation actions, by name: " +
+      fixActions.map((a) => `'${a.name}'${a.what ? ` (${a.what})` : ""}`).join(", ") + ". " +
+      "Or name 'all' to run them in the order listed, which is what a full restart means. " +
+      "PRECONDITIONS, enforced in code: you must already have probed and shown the service is " +
+      "DOWN (a failed port test or a non-200 page), and a fix may run only once per ticket. " +
+      "Never use this on a service that is responding - a working service is not an incident. " +
+      "After it runs, PROBE AGAIN and report what you found; if it is still down, say so and " +
+      "let a human take it.",
+    parameters: Type.Object({
+      action: Type.String({ description: "the action name, or 'all'" }),
+      evidence: Type.String({ description: "the read-only result that shows it is down - the probe output, quoted" }),
+    }),
+    execute: async (_id, p) => {
+      if (fixAttempted) {
+        return { content: [{ type: "text", text: "A fix has already been applied on this ticket. Probe, report the verdict, and leave the rest to a human." }], details: {} };
+      }
+      const ev = String(p.evidence || "").trim();
+      if (ev.length < 20) {
+        return { content: [{ type: "text", text: "Refused: quote the read-only probe output that shows the service is down before changing anything." }], details: {} };
+      }
+      const want = String(p.action || "").trim().toLowerCase();
+      const chosen = want === "all" ? fixActions : fixActions.filter((a) => String(a.name).toLowerCase() === want);
+      if (!chosen.length) {
+        return { content: [{ type: "text", text: `No such action. This subject allows: ${fixActions.map((a) => a.name).join(", ")}, or 'all'.` }], details: {} };
+      }
+      fixAttempted = true;
+      const agentId = String(subj.fix_agent_id || blob.fix_agent_id || "");
+      if (!agentId) {
+        return { content: [{ type: "text", text: "No target device is pinned on this subject, so there is nothing safe to run this on. Report the verdict for a human." }], details: {} };
+      }
+      const out = [];
+      for (const act of chosen) {
+        const started = Date.now();
+        let res;
+        try {
+          res = await trmm.sendCmd(agentId, {
+            shell: act.shell || "powershell", cmd: act.command, timeout: Number(act.timeout || 120),
+          });
+        } catch (e) {
+          res = `FAILED: ${String(e?.message || e).slice(0, 300)}`;
+        }
+        const line = { action: act.name, ms: Date.now() - started, output: String(typeof res === "string" ? res : JSON.stringify(res)).slice(0, 1500) };
+        fixLog.push(line);
+        out.push(`--- ${act.name} (${line.ms} ms)\n${line.output}`);
+        log("autowork_fix", ticketRef, subj.name || "", `${act.name} on ${agentId.slice(0, 8)}`);
+        if (act.wait) await new Promise((r) => setTimeout(r, Math.min(Number(act.wait) * 1000, 30000)));
+      }
+      return {
+        content: [{ type: "text", text: `Ran ${chosen.length} reviewed action(s). Now PROBE AGAIN and report what you find.\n\n${out.join("\n\n")}` }],
+        details: { actions: chosen.map((a) => a.name) },
+      };
+    },
+  });
+
+  let tools, hd, hdError;
+  if (mode === "advise") {
+    // NO device toolbelt. Only the ticket itself, read-only, plus the verdict.
+    const t = buildTicketTriageTools({ helpdeskApi: blob.helpdesk_api || null, helpdeskCode: blob.helpdesk_code || "" });
+    hd = t.hd; hdError = t.hdError;
+    tools = [...t.tools.filter((x) => x.name === "get_ticket"), report_verdict, list_duplicate_tickets];
+  } else {
+    const t = buildDecisionTools({
+      helpdeskApi: blob.helpdesk_api || null, helpdeskCode: blob.helpdesk_code || "", ticketRef, gate,
+      surface, allowedTickets: incidentTickets,
+    });
+    hd = t.hd; hdError = t.hdError;
+    tools = [...t.tools, report_verdict, list_duplicate_tickets];
+    if (mode === "device_fix") tools.push(apply_fix);
+  }
+  if (!hd) return { error: `helpdesk.js failed to load: ${hdError}` };
+
+  const procs = (subj.procedures || []).map((p) =>
+    `PROCEDURE: ${p.title}\nAPPLIES TO: ${p.applies_to || ""}\nSYMPTOM: ${p.symptom || ""}\nROOT CAUSE: ${p.root_cause || ""}\nFIX: ${p.fix || ""}\nVERIFICATION: ${p.verification || ""}`,
+  ).join("\n\n");
+  const kbs = (subj.kb_articles || []).map((a) => `KB ${a.id} "${a.title}" (${a.company || "global"}):\n${String(a.content || "").replace(/<[^>]+>/g, " ").slice(0, 4000)}`).join("\n\n");
+
+  const loader = new DefaultResourceLoader({
+    agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
+    systemPromptOverride: () =>
+      `You are Pi, working helpdesk ticket ${ticketRef} UNATTENDED under the automation subject "${subj.name}".\n` +
+      `Mode: ${mode === "advise"
+        ? "ADVISE - you can read the ticket and nothing else; there are no device tools."
+        : mode === "device_fix"
+          ? "FIX - read-only probes, PLUS one reviewed remediation (apply_fix) you may run ONLY after proving the service is down. " +
+            "You cannot compose a command; you choose one of the owner's named actions. Restarting something that is working is a fault, not a fix."
+          : "INVESTIGATE - read-only device probes are allowed; nothing may be changed."}\n` +
+      `Client: ${blob.client || "(unknown)"}; requester: ${blob.requester_email || "(unknown)"}.\n\n` +
+      `WHAT THE SUBJECT COVERS:\n${subj.description || "(none)"}\n\n` +
+      (subj.instructions ? `OWNER'S INSTRUCTIONS FOR THIS SUBJECT (follow exactly):\n${subj.instructions}\n\n` : "") +
+      (procs ? `APPROVED PROCEDURES (follow; do not invent your own):\n${procs}\n\n` : "") +
+      (kbs ? `CUSTOMER KB (specifics for this customer):\n${kbs}\n\n` : "") +
+      `RULES:\n` +
+      `- Read the ticket first (get_ticket). Base the verdict on what is IN the ticket${mode === "advise" ? "" : " and what read-only probes show"}.\n` +
+      `- Never claim a check you did not do. Findings must be concrete and individually checkable.\n` +
+      `- If the ticket is NOT actually about this subject, report kind='off_subject', confidence='unsure'.\n` +
+      `- If anything is uncertain, confidence='unsure' and say what a human should look at. Unsure is a good answer.\n` +
+      `- Write customer_reply in plain, friendly language for a non-technical person; say what it is, how you know (2-4 bullet-style points), what they should do, and ask them to reply if they clicked/entered anything or if it keeps happening. No jargon, no blame. Sign off as the BlueCloud support team.\n` +
+      (blob.prior_incident
+        ? `\nTHIS EXACT THING WAS JUST WORKED - READ THIS BEFORE YOU PROBE\n` +
+          `Ticket ${blob.prior_incident.ticket_ref} covered the same problem and finished at ${blob.prior_incident.finished_at}` +
+          `${blob.prior_incident.fix_applied ? " AFTER APPLYING THE REVIEWED FIX (the service was restarted)" : ""}.\n` +
+          `What happened there: ${String(blob.prior_incident.summary || "(no summary recorded)").slice(0, 1200)}\n` +
+          `So if your probes show the service UP, that is very probably BECAUSE of that fix - it does NOT mean this\n` +
+          `person imagined it or that their PC is at fault. Tell them plainly what was wrong and what was done, and\n` +
+          `that it is working now. Never suggest the problem was on their machine unless you have specific evidence\n` +
+          `of that; blaming the customer for an outage we caused and fixed is the worst answer available.\n` +
+          `The fix is withheld (cooldown) - do not try to restart anything. If your probes show it is DOWN AGAIN,\n` +
+          `that is NEW and a human must take it: report it and say so.\n`
+        : "") +
+      `- OTHER TICKETS FOR THE SAME INCIDENT: before you finish, call list_duplicate_tickets. People often write\n` +
+      `  in separately about the same outage. If you RESOLVED the problem, reply to each of those tickets too -\n` +
+      `  in that requester's own context, not a copy of someone else's answer - and the automation files them to\n` +
+      `  AI Closed with this one. If you did NOT resolve it, leave them alone and say so; a human takes them.\n` +
+      (mode === "device_fix"
+        ? `- THE FIX SEQUENCE, in this order: (1) probe read-only and establish it is DOWN, quoting the output; ` +
+          `(2) apply_fix with that evidence; (3) probe AGAIN; (4) report_verdict saying whether service was restored. ` +
+          `If the probe shows it is UP, do NOT fix anything - report that it is working. One fix attempt per ticket, ever.\n`
+        : "") +
+      `- Finish with report_verdict exactly once. Do not call any other tool after it.\n` +
+      helpdeskSection(blob, blob.client || ""),
+  });
+  await loader.reload();
+  const { session } = await createAgentSession({
+    model, thinkingLevel: blob.thinking_level || "medium", ...rt.sessionOpts,
+    noTools: "builtin", customTools: tools, resourceLoader: loader,
+    sessionManager: SessionManager.inMemory(), agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
+  });
+  attachSpendLedger(session, {
+    surface: "autowork", log, key: ticketRef, ticketRef,
+    actorUsername: `subject:${subj.name || "?"}`.slice(0, 150),
+    client: blob.client || "",
+  });
+  const started = Date.now();
+  // HARD DEADLINE. Django waits 600s then records an error and releases the work claim.
+  // A session still running past that could send a customer reply AFTER the system had
+  // written it off - so the session is aborted first, at 8 minutes, and settles here.
+  const DEADLINE_MS = Number(process.env.PI_AUTOWORK_DEADLINE_MS || 480_000);
+  let timedOut = false;
+  const killer = setTimeout(() => { timedOut = true; try { session.abort(); } catch {} }, DEADLINE_MS);
+  let runError = "";
+  // A provider rejection (bad key, quota, 4xx) does NOT throw: it arrives as a finished
+  // assistant message with stopReason "error" and no content. Without catching it here the
+  // run ended as "the model reported no verdict", which reads like the model looked and had
+  // nothing to say - when in fact it was never able to look at all.
+  const unsubErr = session.subscribe((ev) => {
+    if (ev.type === "message_end" && ev.message?.role === "assistant" && ev.message?.stopReason === "error") {
+      runError = runError || `the AI provider rejected the request: ${String(ev.message.errorMessage || "unknown error").slice(0, 300)}`;
+    }
+  });
+  try {
+    await session.prompt(`Work ticket ${ticketRef} now under the subject "${subj.name}". Read it first, then report your verdict.`);
+  } catch (e) {
+    runError = apiErrorMessage(e);
+  } finally {
+    clearTimeout(killer);
+    try { unsubErr(); } catch {}
+    try { session.dispose(); } catch {}
+  }
+  if (timedOut && !runError) runError = `stopped at the ${Math.round(DEADLINE_MS / 60000)}-minute deadline before it finished`;
+  const elapsed = Math.round((Date.now() - started) / 1000);
+  if (runError) {
+    // A failure is still a fact about the ticket: say so ON the ticket and hand it to a
+    // human, so "the AI never got to it" is never mistaken for "the AI looked and found
+    // nothing". Then return the error for Django's record.
+    const failNote =
+      `\u{1F916} Pi.dev AI \u2014 Automation subject "${subj.name}"\n` +
+      `COULD NOT WORK THIS TICKET \u00b7 ${elapsed}s\n\n` +
+      `Reason\n${runError.slice(0, 800)}\n\n` +
+      (verdict.reported ? `Partial verdict before it stopped: ${verdict.kind} (${verdict.confidence}), ${verdict.findings.length} finding(s).\n\n` : "") +
+      `Nothing was sent to the customer and nothing on any device was changed. A technician needs to pick this up.` +
+      (blob.decision_url ? `\n\n\u27a1 Chat with me to continue this ticket: ${blob.decision_url}` : "");
+    try { if (hd.operations.add_note) await hd.operations.add_note({ ticket: ticketRef, message: failNote }); } catch {}
+    try { if (hd.operations.set_needs_input_tag) await hd.operations.set_needs_input_tag({ ticket: ticketRef }); } catch {}
+    log("autowork_failed", ticketRef, `subject="${subj.name}" ${runError.slice(0, 200)}`);
+    return { error: runError, action: "failed", verdict, elapsed_s: elapsed };
+  }
+
+  // ---- CODE decides ---------------------------------------------------------------
+  const chatLink = blob.decision_url ? `\n\n\u27a1 Chat with me to continue this ticket: ${blob.decision_url}` : "";
+  const heading = `\u{1F916} Pi.dev AI \u2014 Automation subject "${subj.name}"`;
+  const findingsTxt = verdict.findings.length ? verdict.findings.map((f) => `\u2022 ${f}`).join("\n") : "(none)";
+  const isConfident = verdict.reported && verdict.confidence === "confident" && verdict.findings.length >= 2
+    && verdict.kind && verdict.kind !== "off_subject" && verdict.kind !== "unclear";
+  const replyAllowed = !!subj.reply_allowed;
+  let action = "note";
+  let replySent = false;
+  let replyText = "";
+
+  if (isConfident && replyAllowed && (verdict.customer_reply || subj.reply_template)) {
+    // Template beats draft: the owner's wording is the one that goes out. The model's
+    // findings fill the blank.
+    replyText = subj.reply_template
+      ? String(subj.reply_template).replace(/\{\{\s*findings\s*\}\}/g, findingsTxt).replace(/\{\{\s*kind\s*\}\}/g, verdict.kind)
+      : verdict.customer_reply;
+    if (!blob.shadow && hd.operations.reply_to_ticket) {
+      try {
+        await hd.operations.reply_to_ticket({ ticket: ticketRef, message: replyText });
+        replySent = true;
+        action = "replied";
+      } catch (e) {
+        action = "reply_failed";
+        verdict.needs_human_because = `reply failed: ${String(e?.message || e).slice(0, 200)}`;
+      }
+    } else {
+      action = "shadow_reply";
+    }
+  }
+
+  // Always leave the record on the ticket: what was decided, on what evidence, by which rule.
+  const noteBody =
+    `${heading}\n` +
+    `${action === "replied" ? "REPLIED TO THE CUSTOMER" : action === "shadow_reply" ? "SHADOW - would have replied (not sent)" : "NO REPLY SENT - needs a human"}` +
+    ` \u00b7 verdict: ${verdict.kind || "none"} (${verdict.confidence || "none"}) \u00b7 ${elapsed}s\n\n` +
+    `Summary\n${verdict.summary || "(the model reported no verdict)"}\n\n` +
+    `Findings\n${findingsTxt}\n` +
+    (verdict.needs_human_because ? `\nWhy a human is needed\n${verdict.needs_human_because}\n` : "") +
+    (replyText ? `\n${action === "replied" ? "Reply sent" : "Reply that would have been sent"}\n${replyText}\n` : "") +
+    `\nPolicy: ${mode === "advise" ? "advise-only - no device access exists in this mode" : "read-only device probes only - nothing was changed"}; ` +
+    `a reply is sent only on a confident verdict with 2+ findings; the ticket is never closed by automation.` +
+    chatLink;
+  try { if (hd.operations.add_note) await hd.operations.add_note({ ticket: ticketRef, message: noteBody }); } catch {}
+  if (action !== "replied" && action !== "shadow_reply" && hd.operations.set_needs_input_tag) {
+    try { await hd.operations.set_needs_input_tag({ ticket: ticketRef }); } catch {}
+  }
+  log("autowork", ticketRef, `subject="${subj.name}" mode=${mode} action=${action} kind=${verdict.kind} conf=${verdict.confidence} findings=${verdict.findings.length}`);
+  // WHICH REVIEWED ACTIONS ACTUALLY RAN. Django records this against the subject
+  // (fixes_applied / last_fix_at), which is what makes the cooldown real - without it the
+  // automation would restart a failing service on every new ticket.
+  return { action, reply_sent: replySent, mode, verdict, elapsed_s: elapsed, reply_text: replyText,
+           fix_applied: fixLog.map((f) => f.action), fix_log: fixLog };
+}
+
 async function runTicketResolve(blob) {
   const ticketRef = blob.ticket_ref || "";
   const ctx = blob.context || {};
@@ -2944,6 +3820,10 @@ async function runTicketResolve(blob) {
     model, thinkingLevel: blob.thinking_level || "medium", ...rt.sessionOpts,
     noTools: "builtin", customTools: tools, resourceLoader: loader,
     sessionManager: SessionManager.inMemory(), agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
+  });
+  attachSpendLedger(session, {
+    surface: "resolve", log, key: ticketRef, ticketRef,
+    actorUsername: blob.username || "",
   });
   try {
     await session.prompt(`Attempt to auto-resolve ${ticketRef} now. Investigate read-only, then post your single internal note.`);
@@ -3276,6 +4156,10 @@ async function runTicketTriage(blob) {
     sessionManager: SessionManager.inMemory(),
     agentDir: CONFIG.sessionsRoot,
     cwd: CONFIG.sessionsRoot,
+  });
+  attachSpendLedger(session, {
+    surface: "triage", log, key: blob.ticket_ref || "triage",
+    ticketRef: blob.ticket_ref || "", actorUsername: blob.username || "",
   });
   try {
     await session.prompt(
@@ -3722,6 +4606,10 @@ async function runAssist(blob) {
     agentDir: CONFIG.sessionsRoot,
     cwd: CONFIG.sessionsRoot,
   });
+  attachSpendLedger(session, {
+    surface: "assist", log, key: blob.kind || "assist",
+    actorUsername: blob.username || "",
+  });
   const convo = (blob.messages || [])
     .map((m) => `${(m.role || "user").toUpperCase()}: ${m.content}`)
     .join("\n\n");
@@ -3823,6 +4711,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   // Headless auto-resolve attempt from the Ticket Console (called by celery task).
+  if (url.pathname === "/pi/autowork" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      try {
+        const result = await runAutowork(JSON.parse(body || "{}"));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: apiErrorMessage(e) }));
+      }
+    });
+    return;
+  }
   if (url.pathname === "/pi/ticket-resolve" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -4095,6 +4998,10 @@ const server = http.createServer(async (req, res) => {
           sessionManager: SessionManager.inMemory(),
           agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
         });
+        attachSpendLedger(session, {
+          surface: "analyze", log, key: blob.purpose || "analyze",
+          actorUsername: blob.username || "",
+        });
         try {
           await session.prompt(String(blob.content || ""));
         } catch (e) {
@@ -4173,17 +5080,46 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   // Aggregated chat history across many agents (for client/site AI History review).
-  if (url.pathname === "/pi/history_bulk" && req.method === "GET") {
-    const ids = (url.searchParams.get("agent_ids") || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const sessions = [];
-    for (const aid of ids) {
-      for (const s of history.listSessions(aid)) sessions.push({ ...s, agent_id: aid });
+  // Which sessions are LIVE on the server right now, and who is driving each. The mobile
+  // inbox uses this to show "live - alice driving" next to a chat.
+  if (url.pathname === "/pi/live" && req.method === "GET") {
+    // One hub may sit under several keys (its id and the id it was resumed from). Report
+    // every key - the inbox may hold either - but say which is the canonical one.
+    const out = [];
+    for (const [key, hub] of LIVE) {
+      const [scope, session_id] = key.split("::");
+      out.push({
+        scope, session_id, canonical: key === hub.key, streaming: !!hub.streaming || false,
+        driver: hub.ownerDisplay(), viewers: hub.size,
+      });
     }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ sessions }));
+    res.end(JSON.stringify({ live: out }));
+    return;
+  }
+  // GET ?agent_ids=a,b,c  or  POST {"agent_ids":[...]}. POST exists because a role that can
+  // see the whole fleet (1,177 agents) does not fit in a URL - Node answered 431 and the
+  // phone inbox showed no device chats at all.
+  if (url.pathname === "/pi/history_bulk" && (req.method === "GET" || req.method === "POST")) {
+    const respond = (ids) => {
+      const sessions = [];
+      for (const aid of ids) {
+        for (const s of history.listSessions(aid)) sessions.push({ ...s, agent_id: aid });
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ sessions }));
+    };
+    if (req.method === "GET") {
+      respond((url.searchParams.get("agent_ids") || "").split(",").map((s) => s.trim()).filter(Boolean));
+      return;
+    }
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let ids = [];
+      try { ids = (JSON.parse(body || "{}").agent_ids || []).map((s) => String(s).trim()).filter(Boolean); } catch {}
+      respond(ids);
+    });
     return;
   }
   const histMatch = url.pathname.match(/^\/pi\/history\/([^/]+)\/?$/);
@@ -4317,6 +5253,9 @@ server.keepAliveTimeout = 0;
 
 server.listen(CONFIG.port, CONFIG.host, async () => {
   log(`pi-trmm-bridge listening on ${CONFIG.host}:${CONFIG.port}`);
+  // Retry any spend rows the API refused while it was down. Runs immediately, then on a
+  // timer: a charge that could not be written is owed, not forgotten. See spend-ledger.js.
+  startSpendOutbox(log);
   // Expire registered stubs the installed pi now defines itself, before any session
   // can pick up a shadowed (downgraded) model definition.
   try {

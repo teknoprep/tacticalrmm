@@ -256,3 +256,48 @@ check("truncated plain text says so", () => {
   assert.match(out, /TRUNCATED by pi-trmm-bridge/);
   assert.match(out, /Do NOT retry the same broad call/);
 });
+
+// ---------------------------------------------------------------------------
+// Regression 2026-09-22: the SAME class of bug, one surface over.
+//
+// The 2026-08-19 fix above covered the ticket/decision surface. The DEVICE chat's
+// helpdesk_call still returned `JSON.stringify(result)` with no cap, and on 2026-09-22 a
+// single list_closed_tickets (two months, full message bodies) put 2.96 MB - ~740k tokens
+// - into a 500k-token window. Every prompt after it was rejected with input_too_large AND
+// the harness refused to compact ("session too small", because the only thing after the
+// last cut point was that one result), so the window was a dead end for five minutes.
+//
+// Asserted on the SOURCE, because what matters is that no return path is left uncapped -
+// there is no point catching this a third time in a different function.
+// ---------------------------------------------------------------------------
+check("every helpdesk operation result is capped before it becomes a tool result", () => {
+  const src = fs.readFileSync(new URL("../src/tools.js", import.meta.url), "utf8");
+  const lines = src.split("\n");
+  const offenders = [];
+  lines.forEach((line, idx) => {
+    if (!/hd\.operations\[op\]\(/.test(line)) return;
+    // The return that carries this result back to the model: everything up to the catch.
+    const after = lines.slice(idx, idx + 25).join("\n");
+    const body = after.includes("} catch") ? after.slice(0, after.indexOf("} catch")) : after;
+    if (!/cap(String|Json)\s*\(/.test(body)) offenders.push(idx + 1);
+  });
+  assert.deepEqual(offenders, [], `uncapped helpdesk result at tools.js line(s): ${offenders.join(", ")}`);
+});
+
+check("a 2.96 MB ticket list - the real payload shape - lands inside the cap", () => {
+  // 400 tickets x 12 messages x 600 chars: what list_closed_tickets(since=2026-08-01)
+  // actually returned.
+  const real = Array.from({ length: 400 }, (_, i) => ({
+    ref: `TICKET/${61200 + i}`,
+    subject: "Fw: Another Scam Email",
+    company: "Lehigh Valley Zoo",
+    messages: Array.from({ length: 12 }, () => ({ author: "OdooBot", text: "X".repeat(600) })),
+  }));
+  assert.ok(bytes(JSON.stringify(real)) > 2_900_000, "fixture should be the ~3 MB shape");
+  const out = _capJson(real, { what: "helpdesk list_closed_tickets" });
+  assert.ok(bytes(out) <= CAP + 2048, `capped output was ${fmt(bytes(out))} bytes`);
+  // ...and it is still valid JSON, so the model can use what it did get.
+  const body = out.startsWith("NOTE:") ? out.slice(out.indexOf("\n\n") + 2) : out;
+  assert.ok(Array.isArray(JSON.parse(body)));
+  assert.match(out, /showing \d+ of 400 helpdesk list_closed_tickets entries/);
+});

@@ -12,6 +12,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { attachSpendLedger } from "./spend-ledger.js";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -32,7 +33,12 @@ const ROLE_TOOLS = {
 const THINK_ROLES = new Set(["orchestrator", "operator", "summarizer", "planner", "reviewer", "scout"]);
 
 export function makeGroupState(blob) {
-  return { current: blob?.agent_group || null, rt: null };
+  // `spend` is the accounting identity of the CONVERSATION that owns this group, set by
+  // the surface right after it builds the state. Specialists run in a temp directory that
+  // is deleted the moment they finish, so unless their turns are billed against the parent
+  // session here, that money leaves no trace anywhere at all - not in the ledger, not even
+  // in a transcript on disk. See spend-ledger.js.
+  return { current: blob?.agent_group || null, rt: null, spend: null };
 }
 
 export function mergeGroupKeys(keys, blob) {
@@ -156,7 +162,9 @@ function registerDelegateTool(pi, groupState) {
         };
       }
       try {
-        const text = await runSpecialist({ group, member, task, signal, rt: groupState.rt });
+        const text = await runSpecialist({
+          group, member, task, signal, rt: groupState.rt, spend: groupState.spend,
+        });
         return {
           content: [{ type: "text", text: text || "(specialist returned nothing)" }],
           details: { role, model: `${member.provider}/${member.model_id}` },
@@ -171,7 +179,14 @@ function registerDelegateTool(pi, groupState) {
   });
 }
 
-async function runSpecialist({ group, member, task, signal, rt }) {
+// Unique per delegate call. A plain counter is not enough: a bridge restart would reset
+// it, and a RESUMED chat would then re-issue `<parent>-g001` whose turn 1 already exists -
+// idempotency would read the new charge as a retry and drop it. The clock component makes
+// that impossible without needing any persisted state.
+let _delegateSeq = 0;
+const delegateSeq = () => `${(++_delegateSeq).toString(36)}${Date.now().toString(36).slice(-5)}`;
+
+async function runSpecialist({ group, member, task, signal, rt, spend = null }) {
   if (!rt) throw new Error("agent-group runtime is not ready");
   let model = rt.findModel(member.provider, member.model_id);
   if (!model) {
@@ -214,6 +229,23 @@ async function runSpecialist({ group, member, task, signal, rt }) {
   else opts.noTools = "all";
 
   const { session } = await createAgentSession(opts);
+  // Bill the specialist to the conversation that delegated to it. Same session_id as the
+  // parent chat, so "what did this chat cost" stays the true total; `surface: "group"`
+  // and the role in the log line say where inside it the money went.
+  if (spend) {
+    // A DERIVED session id, not the parent's own: ledger rows are idempotent on
+    // (session_id, turn_index), and a specialist counts its turns from 1 - which would
+    // collide with the parent chat's first turns and silently drop the charge (the
+    // duplicate is read as a retry). `<parent>-g<n>` keeps the money attributable to the
+    // conversation (everything asking "what did this chat cost" matches on the prefix)
+    // without ever colliding with it.
+    attachSpendLedger(session, {
+      ...spend,
+      sessionId: `${spend.sessionId || "nosid"}-g${delegateSeq()}`,
+      surface: "group",
+      key: `${spend.key || ""}${spend.key ? " " : ""}delegate:${member.role}`,
+    });
+  }
   if (signal?.aborted) throw new Error("aborted");
   const abort = () => { try { session.abort?.(); } catch { /* noop */ } };
   signal?.addEventListener?.("abort", abort, { once: true });

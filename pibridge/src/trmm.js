@@ -57,6 +57,10 @@ async function req(method, path, body, { timeoutMs = DEFAULT_TIMEOUT_MS, signal 
 }
 
 export const trmm = {
+  // Tickets held behind the one an unattended session is working. Read at the END of the
+  // run, because duplicates arrive WHILE it works (see core.views.AutoworkDuplicates).
+  autoworkDuplicates: (ticketRef, opts) =>
+    req("GET", `/core/ai/autowork/duplicates/${encodeURIComponent(ticketRef)}/`, null, opts),
   getAgent: (agentId, opts) => req("GET", `/agents/${agentId}/`, null, opts),
   // Agent LIST (TRMM's AgentTableSerializer). Unlike the agent DETAIL endpoint this
   // one carries `serial_number` and `make_model`, which TRMM derives from the agent's

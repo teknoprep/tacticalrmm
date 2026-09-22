@@ -230,6 +230,10 @@ function presenceFrame(p, ws) {
     })),
     you: me
       ? {
+          // Your own identity, so the window can tell YOUR rows in the queue history from
+          // a colleague's ("You asked" vs "Dan asked") without a second lookup.
+          username: me.username,
+          display: me.display,
           role: isOwner(p, ws) ? "owner" : "viewer",
           can_take_over: !!me.canTakeOver,
           // Only meaningful for a viewer: does pressing Take Over ask, or just do it?

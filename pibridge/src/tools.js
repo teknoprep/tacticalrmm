@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { trmm } from "./trmm.js";
 import { loadHelpdesk } from "./helpdesk-runtime.js";
 import { loadSales } from "./sales-runtime.js";
+import { BRAND } from "./brand.js";
 import { gateOp, allowedOps, CAPS_MODE } from "./capabilities.js";
 let operatorPlugin = null;
 try {
@@ -505,6 +506,62 @@ export function describeSecretFields(fields) {
  * Accepts the shapes the model actually sends: a named-column object under `row`
  * (preferred), `fields`, or a positional `values` array.
  */
+// Sales operations that produce or change a quotation the customer may see. Each one files
+// a branded copy into the opportunity's Internal Notes (see the sales_call wrapper).
+const QUOTE_OPS = new Set(["create_quotation", "update_quotation", "link_opportunity_quotation"]);
+
+/** A quotation as a reviewable, branded document for the opportunity's Internal Notes.
+ *
+ *  Deliberately self-contained: the header carries the facts a rep needs at a glance
+ *  (number, state, validity, total, who raised it, when) and the body is the EXACT HTML
+ *  the customer was given, so what is on file is what was sent - not a summary of it. */
+function quoteRecordHtml(out, args, operation, who) {
+  const b = BRAND;
+  const money = (v) => (v === undefined || v === null || v === "" ? "" : String(v));
+  const rows = [
+    ["Quotation", out.name || args.name || ""],
+    ["State", out.state || ""],
+    ["Total (untaxed)", money(out.amount_untaxed)],
+    ["Total", money(out.amount_total)],
+    ["Valid until", out.validity_date || ""],
+    ["Salesperson", Array.isArray(out.salesperson) ? out.salesperson[1] : (out.salesperson || "")],
+    ["Customer", Array.isArray(out.partner) ? out.partner[1] : (out.partner || "")],
+    ["Raised by", `${who || "Pi.dev AI"} (${operation.replace(/_/g, " ")})`],
+    ["Filed", new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC"],
+    ["In Odoo", out.url ? `<a href="${esc(out.url)}">${esc(out.url)}</a>` : ""],
+  ].filter(([, v]) => String(v || "").trim());
+  // The customer-facing body: whatever was actually put on the order.
+  const body = String(args.note_html || out.note || "").trim();
+  return (
+    `<div style="border:1px solid ${b.border};border-top:3px solid ${b.primary};background:${b.white};padding:12px;">` +
+    `<p style="margin:0 0 8px;font-size:15px;color:${b.primaryDark};"><b>QUOTATION ON FILE${out.name ? ` - ${esc(out.name)}` : ""}</b></p>` +
+    `<p style="margin:0 0 10px;color:${b.muted};font-size:12px;">` +
+    `Filed automatically by Pi.dev AI. This is the quote as issued - re-issuing replaces this block, so what you ` +
+    `are reading is the current one. Prices are Odoo's, from the order itself.</p>` +
+    `<table style="border-collapse:collapse;font-size:13px;margin-bottom:10px;">` +
+    rows.map(([k, v]) => `<tr><td style="padding:2px 10px 2px 0;color:${b.muted};white-space:nowrap;">${esc(k)}</td>` +
+      `<td style="padding:2px 0;color:${b.text};"><b>${k === "In Odoo" ? v : esc(v)}</b></td></tr>`).join("") +
+    `</table>` +
+    (body
+      ? `<div style="border-top:1px solid ${b.border};padding-top:10px;">${body}</div>`
+      : `<p style="color:${b.muted};font-size:12px;margin:0;">No customer-facing body was supplied with this ` +
+        `${operation === "link_opportunity_quotation" ? "link" : "quotation"} - open it in Odoo to review the lines.</p>`) +
+    `</div>`
+  );
+}
+
+// CRM operations whose subject is the opportunity this session is about.
+const LEAD_OPS = new Set(["get_opportunity", "add_opportunity_note"]);
+
+// HTML-escape. The scope document is built as HTML for the Odoo chatter, and every part
+// of it is model- or customer-supplied text: a stray "<" in a device name or a path must
+// not be able to break the markup (or inject any).
+function esc(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 export function notebookWriteSummary({ operation = "", args = {}, params = {}, ticketRef = "" } = {}) {
   const A = args || {};
   const P = params || {};
@@ -1363,7 +1420,19 @@ export function buildTools({
       }
       try {
         const result = await hd.operations[op](args);
-        let out = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+        // CAPPED. Every other tool on this surface caps its output; this one did not, and
+        // on 2026-09-22 a single `list_closed_tickets` (since=2026-08-01, full message
+        // bodies) returned 2.96 MB - about 740k tokens - straight into the context of a
+        // 500k-window model. Every following turn was rejected with input_too_large, and
+        // the conversation could not even be compacted out of it (the retained tail still
+        // held the monster). A tool result must never be able to do that again.
+        //
+        // capJson truncates ELEMENT-WISE for arrays (this operation returns a list), so
+        // the model still gets valid JSON plus "showing X of Y" and an instruction not to
+        // re-run the same broad call.
+        let out = typeof result === "string"
+          ? capString(result, MAX_TOOL_RESULT_BYTES, `helpdesk ${op} result`)
+          : capJson(result, { maxBytes: MAX_TOOL_RESULT_BYTES, what: `helpdesk ${op}` });
         if (hd.apiKey) out = out.split(hd.apiKey).join("***");
         return text(out || "(done)");
       } catch (e) {
@@ -1558,7 +1627,10 @@ export function buildTools({
           `Attached ${p.filename} to ${p.ticket} (${cap.bytes} bytes, ${cap.lines} lines, ` +
             `sha256 ${cap.sha256.slice(0, 16)}...). ` +
             (p.to_customer ? "Customer reply SENT with the file attached." : "Posted as a staff-only internal note.") +
-            ` Result: ${JSON.stringify(res)}`,
+            // Capped like every other helpdesk return: an acknowledgement is normally a
+            // few hundred bytes, but an error payload from the far end is not bounded by
+            // anything we control, and one runaway tool result can wedge a whole window.
+            ` Result: ${capString(JSON.stringify(res), 2000, "attach result")}`,
         );
       } catch (e) {
         return text(`attach failed: ${e?.message || e}`);
@@ -1921,6 +1993,28 @@ function isDestructive(cmd) {
 }
 
 export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate, surface = null,
+  // PRE-SALES DISCOVERY: the subject is a CRM opportunity, not a ticket. Passed instead
+  // of ticketRef (which stays empty on that surface, so nothing auto-injects a ticket
+  // that does not exist) and auto-injected into the CRM operations the same way.
+  leadRef = "",
+  // Passed through to the integration as `helpdesk.context`, the same way buildTools does
+  // it. The device surface has always had this; the decision surface silently did not, so
+  // an integration could not tell which conversation it was serving.
+  helpdeskContext = null,
+  // TICKETS THIS TOOLSET MAY TOUCH. Empty/null = only `ticketRef` matters and an explicit
+  // ticket argument is trusted (the interactive surfaces, where a human is driving).
+  //
+  // UNATTENDED work passes a whitelist: the ticket being worked plus the duplicates held
+  // behind it. That is what makes "handle your duplicates too" safe - the automation can
+  // reply to and close the tickets about THIS incident, and cannot reach any other
+  // customer's ticket even if a ticket body asks it to.
+  allowedTickets = null,
+  // Domains that count as OUR OWN people for the discovery email rule. Derived from the
+  // brand config rather than hardcoded, so this file carries no customer's domain.
+  internalDomains = [
+    String(BRAND.web || "").replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, ""),
+    String(BRAND.supportEmail || "").split("@")[1] || "",
+  ].map((d) => String(d || "").trim().toLowerCase()).filter(Boolean),
   creditActor = "", creditSession = "", globalKnowledgeAuthorisation = () => null,
   operatorPolicy = null, operatorActor = "",
   actorEmail = "", actorName = "",
@@ -1931,7 +2025,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   // Machines with a proper desktop-control plane - see GUI_DRIVING.
   const operatorAgentIds = operatorAgentIdSet(operatorPolicy);
   let hd = null, hdError = "";
-  try { hd = loadHelpdesk(helpdeskCode, helpdeskApi); }
+  try { hd = loadHelpdesk(helpdeskCode, helpdeskApi, helpdeskContext || { ticket_ref: ticketRef || "", lead_ref: leadRef || "" }); }
   catch (e) { hdError = e.message; }
   // Replaces the old `blockOps` name list (ISSUES.md I6): that hardcoded five
   // deployment-authored operation NAMES in product code, so a deployment naming its
@@ -2088,6 +2182,23 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         args[field] = String(args[field] || "") + stamp;
       }
       if (ticketRef && args.ticket === undefined && args.ticket_ref === undefined) args.ticket = ticketRef;
+      // The whitelist, when there is one. Checked AFTER injection so the default (this
+      // ticket) is always allowed, and refused by NAME so the model learns the boundary
+      // rather than silently acting on the wrong record.
+      if (allowedTickets && allowedTickets.size) {
+        const target = String(args.ticket || args.ticket_ref || "").trim();
+        if (target && !allowedTickets.has(target)) {
+          return text(
+            `Refused: ${target} is not part of the incident you are working. You may act on ` +
+            `${[...allowedTickets].join(", ")} only. If another ticket looks related, say so in ` +
+            `your verdict and a human will judge it.`,
+          );
+        }
+      }
+      // The opportunity under discussion, injected for the same reason the ticket is: the
+      // model should not have to restate which record it is working, and must not be able
+      // to wander onto a different customer's opportunity by mistyping an id.
+      if (leadRef && LEAD_OPS.has(p.operation) && args.lead === undefined) args.lead = leadRef;
       try {
         const out = await hd.operations[p.operation](args);
         // Record WHO drove this, as it happens. The helpdesk will log the API user as the
@@ -2416,6 +2527,24 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       ),
     }),
     execute: async (_id, p, signal) => {
+      // DISCOVERY (a CRM opportunity, no ticket): sending email IS allowed - a technician
+      // scoping a job needs to send themselves or a colleague what they found, and
+      // refusing that outright was wrong. It obeys the window's switches, so the toggles
+      // mean the same thing here as on a ticket:
+      //
+      //   our own people -> Write mode ON, or the technician approves the prompt.
+      //   anyone else    -> the "Allow customer email" switch AND an approval click. That
+      //                     recipient is a PROSPECT mid-deal and the sales rep owns the
+      //                     conversation, so it never leaves on the model's own say-so.
+      if (leadRef && gate) {
+        const rcpts = String(p.to || "").split(/[,;]/).map((x) => x.trim().toLowerCase()).filter(Boolean);
+        const external = rcpts.filter((r) => !internalDomains.some((d) => r.endsWith("@" + d)));
+        const what = `Email ${p.to}: "${p.subject}"\n\n${String(p.body || p.html || "").slice(0, 600)}`;
+        const g = external.length
+          ? await gate("email", `TO SOMEONE OUTSIDE ${internalDomains[0] || "the company"} (${external.join(", ")}) about opportunity ${leadRef}.\n${what}`)
+          : await gate("device", `Send internal email about opportunity ${leadRef}.\n${what}`);
+        if (!g.ok) return text("REFUSED: " + (g.reason || "the technician did not approve sending that email."));
+      }
       let att = null;
       if (p.attach_capture_name) {
         const cap = capStore.get(p.attach_capture_name);
@@ -2500,7 +2629,10 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           `Attached ${p.filename} to ${p.ticket} (${cap.bytes} bytes, ${cap.lines} lines, sha256 ` +
             `${cap.sha256.slice(0, 16)}...). ` +
             (p.to_customer ? "Customer reply SENT with the file attached." : "Posted as a staff-only internal note.") +
-            ` Result: ${JSON.stringify(res)}`,
+            // Capped like every other helpdesk return: an acknowledgement is normally a
+            // few hundred bytes, but an error payload from the far end is not bounded by
+            // anything we control, and one runaway tool result can wedge a whole window.
+            ` Result: ${capString(JSON.stringify(res), 2000, "attach result")}`,
         );
       } catch (e) { return text("attach failed: " + (e?.message || e)); }
     },
@@ -2591,6 +2723,108 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     },
   });
 
+  // ---- PRE-SALES DISCOVERY DELIVERABLE (CRM opportunities only) --------------------
+  //
+  // The hand-off artefact. A sales rep with no RMM access must be able to price the work
+  // from this alone, so the STRUCTURE is required rather than suggested: a transcript is
+  // not a scope, and "we had a look and it's fine" is not quotable.
+  //
+  // Money is deliberately absent. The model states HOURS and MATERIALS; the rate card,
+  // discounts and totals are the rep's decision - and a confident invented list price in
+  // front of a prospect is exactly the failure this guard exists to prevent. It is checked
+  // in code below, not merely asked for in the prompt.
+  const discoveryScope = { submitted: false, payload: null };
+  const MONEY_RE = /(?:[£$€]\s?\d|\b\d[\d,]*(?:\.\d+)?\s?(?:usd|gbp|eur|dollars?|pounds?|euros?)\b|\bper hour\b|\bhourly rate\b|\b(?:price[ds]?|cost[s]?|total)\s*(?:of|:)?\s*[£$€]?\s?\d)/i;
+  const submit_discovery_scope = defineTool({
+    name: "submit_discovery_scope",
+    label: "Submit discovery scope",
+    description:
+      "THE DELIVERABLE of a discovery session, and the ONLY place this work is recorded: it writes the " +
+      "scope document onto the CRM opportunity as an internal note, so a sales rep with no RMM access can " +
+      "build the quote from it. Nothing goes into the knowledge base from a discovery session - be complete " +
+      "here, because this note is the whole record. " +
+      "State EFFORT IN HOURS and MATERIALS only - never prices, rates, discounts or totals; those are the " +
+      "sales rep's. Every fact in current_state should name where it came from (a device, a ticket, a KB " +
+      "article). 'Unknown' belongs in open_questions, not dressed up as a finding.",
+    parameters: Type.Object({
+      title: Type.String({ description: "one line naming the work, e.g. 'Migrate Zoho CRM/Desk to Odoo with Infor Visual sync'" }),
+      summary: Type.String({ description: "what the customer wants, in two or three sentences, in their terms" }),
+      current_state: Type.Array(Type.String({ description: "a fact about what they have TODAY, with its source" })),
+      in_scope: Type.Array(Type.String()),
+      out_of_scope: Type.Array(Type.String()),
+      phases: Type.Array(Type.Object({
+        name: Type.String(),
+        hours: Type.Number({ description: "estimated engineering hours - NOT money" }),
+        detail: Type.String({ description: "what happens in this phase and why it takes that long" }),
+      })),
+      materials: Type.Optional(Type.Array(Type.String({ description: "licences/hardware/tooling needed, by name and quantity - no prices" }))),
+      assumptions: Type.Array(Type.String()),
+      risks: Type.Optional(Type.Array(Type.String())),
+      open_questions: Type.Array(Type.String({ description: "what must be confirmed with the customer before this can be quoted firm" })),
+    }),
+    execute: async (_id, p) => {
+      if (!leadRef) return text("submit_discovery_scope is only available in a discovery session on a CRM opportunity.");
+      const need = [];
+      if (!(p.phases || []).length) need.push("phases (at least one, with hours)");
+      if (!(p.current_state || []).length) need.push("current_state (what they have today, with sources)");
+      if (!(p.assumptions || []).length) need.push("assumptions");
+      if (!(p.open_questions || []).length) need.push("open_questions (write 'none' only if you truly have none)");
+      if (need.length) return text(`Incomplete scope - a rep cannot quote from this. Missing: ${need.join(", ")}.`);
+      // The money guard. Refuse rather than strip, so the model learns the boundary and
+      // the tech sees why nothing was posted.
+      const moneyIn = [];
+      const scan = (label, v) => { if (v && MONEY_RE.test(String(v))) moneyIn.push(label); };
+      scan("summary", p.summary);
+      (p.phases || []).forEach((ph, i) => { scan(`phases[${i}].detail`, ph.detail); scan(`phases[${i}].name`, ph.name); });
+      (p.materials || []).forEach((m, i) => scan(`materials[${i}]`, m));
+      (p.in_scope || []).forEach((m, i) => scan(`in_scope[${i}]`, m));
+      if (moneyIn.length) {
+        return text(
+          `Refused: pricing is the sales rep's decision, not yours, and a wrong number in front of a prospect ` +
+          `is expensive. Remove the money from ${moneyIn.join(", ")} and resubmit with hours and materials only.`,
+        );
+      }
+      const totalHours = (p.phases || []).reduce((n, ph) => n + (Number(ph.hours) || 0), 0);
+      const li = (arr) => (arr || []).map((x) => `<li>${esc(String(x))}</li>`).join("");
+      const html =
+        `<p><b>DISCOVERY SCOPE - ${esc(p.title)}</b><br/>` +
+        `<i>Prepared by Pi.dev AI with ${esc(actorName || creditActor || "an engineer")} from evidence gathered on the customer's estate. ` +
+        `Effort is engineering hours only - pricing is not included by design.</i></p>` +
+        `<p>${esc(p.summary)}</p>` +
+        `<p><b>Current state (evidence)</b></p><ul>${li(p.current_state)}</ul>` +
+        `<p><b>In scope</b></p><ul>${li(p.in_scope)}</ul>` +
+        `<p><b>Out of scope</b></p><ul>${li(p.out_of_scope)}</ul>` +
+        `<p><b>Phases - ${totalHours} engineering hours total</b></p><ul>` +
+        (p.phases || []).map((ph) => `<li><b>${esc(ph.name)} - ${Number(ph.hours) || 0}h</b><br/>${esc(ph.detail || "")}</li>`).join("") +
+        `</ul>` +
+        ((p.materials || []).length ? `<p><b>Materials / licences needed</b></p><ul>${li(p.materials)}</ul>` : "") +
+        `<p><b>Assumptions</b></p><ul>${li(p.assumptions)}</ul>` +
+        ((p.risks || []).length ? `<p><b>Risks</b></p><ul>${li(p.risks)}</ul>` : "") +
+        `<p><b>To confirm with the customer before quoting firm</b></p><ul>${li(p.open_questions)}</ul>`;
+      const out = { posted: false };
+      try {
+        const r = await hd.operations.add_opportunity_note({ lead: leadRef, message: html });
+        if (r && r.error) return text(`Could not post the scope to ${leadRef}: ${r.error}`);
+        out.posted = true; out.url = r && r.url;
+      } catch (e) {
+        return text(`Could not post the scope to ${leadRef}: ${String(e?.message || e).slice(0, 300)}`);
+      }
+      // NO KB ARTICLE. Owner's ruling 2026-09-16: everything discovered goes on the
+      // opportunity and nowhere else. A scope describes work that has not happened yet;
+      // filing it as knowledge would seed the KB with unverified proposals for deals that
+      // may never close. Knowledge is written when a TICKET does the work.
+      discoveryScope.submitted = true;
+      discoveryScope.payload = { ...p, total_hours: totalHours };
+      return {
+        content: [{ type: "text", text:
+          `Scope posted to ${leadRef}. ${totalHours} engineering hours across ` +
+          `${(p.phases || []).length} phase(s). The sales rep can now price it${out.url ? `: ${out.url}` : ""}. ` +
+          `If the tech asks for the quotation to be drafted in Odoo, use the sales tool - draft only, no prices from you.` }],
+        details: out,
+      };
+    },
+  });
+
   const operatorTools = operatorPlugin?.buildOperatorTools({
     Type, defineTool, text, operatorPolicy, operatorActor, surface: "ai-decision",
     // gate("device") already enforces read-only and the approval prompt here, so the
@@ -2608,6 +2842,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     try {
       sales = loadSales(salesCode, salesApi || helpdeskApi || null, {
         ticket_ref: ticketRef || "",
+        lead_ref: leadRef || "",
         actor_email: actorEmail || "",
         actor_name: actorName || "",
         actor_username: creditActor || "",
@@ -2662,7 +2897,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         // Mutating sales ops need the Sales/ERP role permission; whether the technician is
         // ALSO prompted per call is decided by Write mode + Auto-approve in gate("sales").
         if (sales.mutating.has(p.operation) && !dryRun) {
-          const summary = `Sales ERP: ${p.operation} on ${ticketRef || "(no ticket)"}\n` +
+          const summary = `Sales ERP: ${p.operation} on ${ticketRef || leadRef || "(no ticket)"}\n` +
             JSON.stringify({ lines: p.lines, partner_id: p.partner_id, order_id: p.order_id, args: p.args }, null, 0).slice(0, 600);
           const g = gate
             ? await gate("sales", summary)
@@ -2673,9 +2908,28 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         for (const k of ["lines", "partner_id", "note_html", "order_id", "name", "ticket_ref"])
           if (p[k] !== undefined && args[k] === undefined) args[k] = p[k];
         if (ticketRef && args.ticket_ref === undefined) args.ticket_ref = ticketRef;
+        // A quotation drafted from a discovery session belongs to the opportunity: that is
+        // how Odoo shows it on the CRM record and how the rep finds it.
+        if (leadRef && args.lead === undefined && args.opportunity_id === undefined) args.lead = leadRef;
         if (!args.salesperson_email && actorEmail) args.salesperson_email = actorEmail;
         try {
           const out = await sales.operations[p.operation](args);
+          // A QUOTE IS FILED IN THE OPPORTUNITY'S INTERNAL NOTES, ALWAYS - never the
+          // chatter (owner's ruling 2026-09-16). Notes about the work belong in the
+          // chatter where the conversation is; the QUOTE is a document the rep re-reads
+          // when the customer comes back in three weeks, and a chatter scroll is the
+          // wrong place for that. Section "quote", so re-issuing supersedes the previous
+          // one in place instead of leaving two near-identical quotes to choose between.
+          //
+          // Best-effort: filing the copy must never fail the quotation that was created.
+          if (leadRef && out && out.ok && QUOTE_OPS.has(p.operation) && hd?.operations?.update_opportunity_notes) {
+            try {
+              await hd.operations.update_opportunity_notes({
+                lead: leadRef, section: "quote",
+                html: quoteRecordHtml(out, args, p.operation, actorName || creditActor),
+              });
+            } catch { /* the quote exists in Odoo; the copy is a convenience */ }
+          }
           return text(typeof out === "string" ? capString(out, 20000) : capJson(out, { maxBytes: 20000, what: "helpdesk" }));
         } catch (e) {
           return text(`${p.operation} failed: ${e?.message || e}`);
@@ -2684,8 +2938,27 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     });
   }
 
-  const baseTools = [helpdesk_call, find_devices, deviceHardwareTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
+  let baseTools = [helpdesk_call, find_devices, deviceHardwareTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
   if (sales_call) baseTools.push(sales_call);
-  return { tools: baseTools, hd, hdError, sales, salesError };
+  if (leadRef) {
+    // DISCOVERY. Device tools stay - they obey Write mode and the approval prompt exactly
+    // as they do on a ticket. What is dropped is what this surface must never do, and a
+    // tool that cannot succeed should not be advertised at all (an offered tool reads as a
+    // permission and wastes the technician's time):
+    //   send_email / attach_capture - customer contact belongs to the sales rep.
+    //   schedule_action             - it would run a change LATER on a prospect's estate,
+    //                                 after this session and its oversight have ended.
+    //   save_procedure              - a procedure is knowledge for future work, and the same
+    //                                 ruling applies: nothing is written to our knowledge
+    //                                 stores from a pre-sales session.
+    // send_email STAYS (owner, 2026-09-16): it is the internal/staff/vendor email tool and
+    // it now gates itself on the window's switches (see its execute). attach_capture is
+    // still out - it attaches to a TICKET, and there is no ticket on this surface.
+    const drop = new Set(["attach_capture", "schedule_action", "cancel_scheduled_action",
+                          "save_procedure"]);
+    baseTools = baseTools.filter((t) => !drop.has(t.name));
+    baseTools.push(submit_discovery_scope);
+  }
+  return { tools: baseTools, hd, hdError, sales, salesError, discoveryScope };
 }
 
