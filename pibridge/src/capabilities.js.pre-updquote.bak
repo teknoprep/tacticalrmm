@@ -54,7 +54,7 @@ export const NAME_DEFAULTS = {
   release_ticket: "routing", add_follower: "routing", set_ticket_company: "routing",
   set_needs_input_tag: "routing", clear_needs_input_tag: "routing",
   // sales (decision chat only)
-  create_quotation: "sales", link_ticket_quotation: "sales", update_quotation: "sales",
+  create_quotation: "sales", link_ticket_quotation: "sales",
   get_quotation: "read", list_products: "read",
 };
 
