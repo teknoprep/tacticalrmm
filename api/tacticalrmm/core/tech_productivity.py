@@ -24,13 +24,64 @@ uniformly excellent or uniformly slipping, and only one of those two views notic
 ATTRIBUTION IS THE HARD PART, AND IT IS NOT GUESSWORK - it was derived by reading the CDRs:
 
   * OUTBOUND: `caller_id_number` is the shared company DID (14843351444) for everyone, so it
-    identifies nobody. `caller_id_name` carries the technician's name ("Cosmus Melly"), so
-    outbound is attributed by NAME.
-  * INBOUND ANSWERED: the answered leg has `direction IS NULL`, `last_app='intercept'` and an
-    internal destination like `9201214`. That is NOT `920`+extension: the trailing three digits
-    are the extension (214), so the destination is resolved by matching its last three digits
-    against the extensions that actually exist on the domain, and ignored if none match.
-    Attributed by EXTENSION.
+    identifies nobody, and since the Teams migration the `caller_id_name` COLUMN is rewritten to
+    "BlueCloud" before the trunk sees it, so that identifies nobody either. The person is in the
+    CHANNEL DUMP (`v_xml_cdr_json`): `variables.sip_from_user` carries the placing extension
+    ("+14843351444;ext=214") and `variables.caller_id_name` the technician's own name. Outbound
+    is attributed by EXTENSION from the former, which also sidesteps display-name differences
+    between the PBX and the helpdesk. See THE 2026-08-24 PBX CHANGE below.
+  * INBOUND ANSWERED: the answered leg has `direction IS NULL`, `last_app='intercept'` and a
+    destination that identifies the handset. Two forms exist and both are supported:
+    the old internal form `9201214` (the TRAILING digits are the extension - it is not a fixed
+    `920` prefix, so they are matched against the extensions that actually exist on the domain)
+    and the post-migration form `+14843351444;ext=214` (the DID with an `ext` parameter).
+    Anything that resolves to no real extension is dropped rather than credited to whoever
+    looks closest. Attributed by EXTENSION.
+
+THE 2026-08-24 PBX CHANGE (found 2026-09-22, after the report showed "0m on the phone")
+--------------------------------------------------------------------------------------
+The PBX was migrated in the week of 2026-08-24, and it moved BOTH of the keys this module was
+built on. Measured from the CDRs, per week:
+
+  * inbound answered destinations went from `bare-internal` (9201214) to `DID;ext=` - 100% of
+    the old form up to 2026-08-24, essentially 100% of the new form from 2026-08-31;
+  * outbound `caller_id_name` went from the technician's own name to the literal `BlueCloud`
+    on every leg (mixed in the changeover week, total from 2026-08-31).
+
+The consequence was silent: the inbound rows stopped matching the destination pattern in the
+SQL and the outbound rows stopped matching any technician's name, so real talk time (443
+minutes inbound + 454 minutes outbound in the seven days to 2026-09-22) was reported as ZERO
+rather than as missing.
+
+SO THE REPORT NO LONGER KNOWS WHAT THE PBX "SHOULD" LOOK LIKE (owner: "the report should do
+this on its own"). Four rules, each of which would have caught that week by itself:
+
+  1. NO FORMAT IN THE QUERY. The SQL asks for answered non-outbound legs and nothing else. It
+     used to filter on the dial-string shape, which is how rows were discarded before any code
+     could count them. Whether a destination is one of our handsets is a question about the
+     EXTENSION LIST, so `_resolve_ext()` answers it against the live list: an explicit
+     `;ext=`/`;user=` parameter, the whole string, any digit run inside it, or - only for short
+     internal dial strings, and only when exactly one extension can match - a trailing suffix.
+     `9201214`, `+14843351444;ext=214`, `sip:213@pbx...` and forms nobody has seen yet all
+     resolve; anything ambiguous resolves to nobody.
+  2. THE OUTBOUND KEY IS CHOSEN FROM THE DATA, per run (`choose_outbound_key`), strongest
+     evidence first: the placing extension from `variables.sip_from_user` in the channel dump
+     (what works today), then the caller-ID name column, then the name inside the channel dump,
+     then the placing handset's `extension_uuid` when it VARIES, then nothing. A CONSTANT
+     `extension_uuid` is refused - every outbound leg carries extension 201's uuid because that
+     is the outbound route, and believing it would hand one technician the whole desk's calls.
+     The `v_xml_cdr_json` join is optional: if that table cannot be read the report falls back
+     to the name keys rather than failing.
+  3. WHAT CANNOT BE ATTRIBUTED IS REPORTED, NOT DROPPED. Anything still unattributable is
+     desk-level "unattributed talk" on its own card with a blocker finding, and while that is
+     happening the Phone engagement SCORE is withheld from everybody rather than rated on
+     inbound alone - which would mark whoever dials out most as the least engaged on the phone.
+     With the channel-dump key in place nothing is unattributable, so the scale is scored
+     normally again.
+  4. IT SAYS WHAT IT SAW, EVERY RUN. The provenance box prints the dial-string forms found and
+     the outbound key used; a readable PBX with no attributed talk time, or 20+ minutes of
+     answered calls that match no extension, is a BLOCKER finding and a DebugLog warning - so
+     the next change is visible in the first email, not after four weeks.
   * DUPLICATE ANSWERED LEGS. A queue-recorded call is written twice - once as `last_app='bridge'`
     with the caller ID prefixed `TQ-`, once as `last_app='intercept'` - with different
     `bridge_uuid`s, so no UUID column collapses them. They are deduplicated on
@@ -56,6 +107,7 @@ import asyncio
 import json
 import re
 import statistics
+from urllib.parse import unquote_plus
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,6 +119,83 @@ CDR_DATABASE = "fusionpbx"
 STAFF_DOMAIN = "pbx.blueuc.com"
 # Internal dial prefix: extension 213 is reached as 9201213.
 EXT_PREFIX = "920"
+
+# A destination that can identify one of OUR handsets, in either of the two forms the PBX has
+# used (see "THE 2026-08-24 PBX CHANGE" in the module docstring): the old bare internal number
+# (9201213) and the current DID-with-parameter form (+14843351444;ext=213). Matching the SQL
+# and _resolve_ext() to the same two shapes is the whole fix for inbound talk time - the old
+# pattern silently rejected every post-migration row, which is how the report came to say
+# "0m on the phone" with 443 minutes of answered calls in the window.
+# Longest digit string still treated as an INTERNAL dial string (prefix + extension), for the
+# trailing-suffix rule in _resolve_ext. `9201214` is seven; a 10/11-digit E.164 number is not an
+# internal dial string however it ends.
+INTERNAL_DIAL_MAX_DIGITS = 8
+
+
+def _dest_form(dest: str) -> str:
+    """A LABEL for the shape of a dial string, so the report can report its own input.
+
+    Not used to decide anything - _resolve_ext() does that against the real extension list -
+    only to say "this is what the PBX is sending now" in the provenance box. The 2026-08-24
+    change would have been obvious on day one with this line in the email.
+    """
+    text = str(dest or "")
+    if not text:
+        return "(empty)"
+    if re.search(r"[;&](?:ext|user|extension)=\d+", text, re.I):
+        return "DID;ext=NNN"
+    if re.fullmatch(r"\d{2,7}", text):
+        return "bare internal"
+    if re.fullmatch(r"\+?\d{8,15}", text):
+        return "bare E.164/DID"
+    if "@" in text:
+        return "SIP URI"
+    return "other"
+
+# How far apart two unanswered legs from the same caller can start and still be ONE ring of the
+# ring group rather than two attempts. Observed spread within a burst: 0-6 seconds.
+RING_BURST_SECONDS = 15
+
+# Outbound caller-ID names that identify the COMPANY rather than a person. Since the migration
+# every outbound leg carries one of these, so outbound talk time cannot be attributed to a
+# technician at all (see the module docstring); it is reported as unattributed team time instead
+# of being silently dropped.
+COMPANY_CID_NAMES = {"bluecloud", "bluecloud llc", "blueuc", "bluecloud iaas"}
+
+
+def count_ring_bursts(legs: List[Tuple[str, int]], tolerance: int = RING_BURST_SECONDS) -> int:
+    """How many real CALLS do these unanswered legs represent?
+
+    `legs` is (caller number, start epoch). Inbound rings every extension at once and - since
+    the 2026-08-24 PBX change - each ringing handset is its own CDR with its own `sip_call_id`,
+    so counting rows (or distinct call ids) counts handsets. Legs of one ring share the caller
+    and start within a second or two, so they are clustered per caller.
+
+    The tolerance is small on purpose: two attempts by the same caller half a minute apart ARE
+    two missed calls, and hiding the second one would be a worse lie than counting a slow ring
+    group twice.
+    """
+    per_caller: Dict[str, List[int]] = {}
+    for caller, epoch in legs:
+        per_caller.setdefault(caller, []).append(epoch)
+    calls = 0
+    for epochs in per_caller.values():
+        last = None
+        for epoch in sorted(epochs):
+            if last is None or epoch - last > tolerance:
+                calls += 1
+            last = epoch
+    return calls
+
+
+def is_company_cid(name: str) -> bool:
+    """Is this outbound caller-ID name the company (or a bare number) rather than a person?"""
+    n = re.sub(r"^TQ-", "", str(name or "")).strip()
+    if not n:
+        return True
+    if n.lower() in COMPANY_CID_NAMES:
+        return True
+    return bool(re.fullmatch(r"[0-9+()\-. ]+", n))
 
 
 # --------------------------------------------------------------------------------------
@@ -119,21 +248,110 @@ def fetch_extensions(agent) -> Tuple[Dict[str, str], str]:
 
 
 def _resolve_ext(dest: str, extensions: Dict[str, str]) -> Optional[str]:
-    """'9201214' -> '214'. Only returns an extension that exists on the domain.
+    """Which of OUR handsets was this call addressed to? Extension, or None.
 
-    The internal dial string is not a fixed prefix plus the extension, so it is not parsed
-    arithmetically - the trailing digits are tested against reality. A destination we cannot tie
-    to a real extension is dropped rather than credited to whoever looks closest.
+    FORMAT-AGNOSTIC ON PURPOSE (2026-09-22). This used to know the PBX's dial-string format,
+    and that is exactly how the report broke: the format changed from `9201214` to
+    `+14843351444;ext=214` in the week of 2026-08-24 and every inbound call silently stopped
+    being attributed to anybody for four weeks. So nothing here is hard-coded to a shape. The
+    string is mined for every plausible candidate and each candidate is tested against the
+    extensions that ACTUALLY EXIST on the domain, in order of how explicit it is:
+
+      1. an explicit parameter - `;ext=214`, `&ext=214`, `;user=214` - which is the PBX stating
+         the answer rather than us inferring it;
+      2. the whole thing, as digits (`201`);
+      3. a digit RUN inside it (`214@pbx.blueuc.com`, `sip:214@...`, `214*2`);
+      4. failing all of that, a trailing digit suffix (`9201214` -> `214`), which is the weakest
+         rule and is therefore only accepted when exactly ONE extension can match it.
+
+    Anything that resolves to no extension, or to two different ones, is returned as None and
+    counted as unresolved - never credited to whoever looks closest.
     """
-    d = re.sub(r"\D", "", dest or "")
-    if not d:
+    text = str(dest or "")
+    if not text:
         return None
-    if d in extensions:
-        return d
-    for n in (3, 4, 2):
-        if len(d) >= n and d[-n:] in extensions:
-            return d[-n:]
+
+    # 1. The PBX said so.
+    for m in re.finditer(r"[;&](?:ext|user|extension)=(\d{2,7})", text, re.I):
+        if m.group(1) in extensions:
+            return m.group(1)
+
+    # 2. The whole string as digits.
+    digits = re.sub(r"\D", "", text)
+    if digits and digits in extensions:
+        return digits
+
+    # 3. Any self-contained run of digits. Exactly one match is the answer; TWO means the
+    #    string mentions two of our handsets ("transfer 212 to 213") and the honest answer is
+    #    "I do not know" - not the one that happens to be last.
+    runs = {r for r in re.findall(r"\d{2,7}", text) if r in extensions}
+    if len(runs) == 1:
+        return runs.pop()
+    if len(runs) > 1:
+        return None
+
+    # 4. A trailing suffix of the digit string - the weakest rule, and fenced in twice.
+    #
+    #    It exists for INTERNAL dial strings like `9201214` (prefix + extension). It is NOT
+    #    applied to a full external number: `+14843351444` ends in "444", and on a domain that
+    #    happens to have an extension 444 that would credit a stranger's DID to a technician.
+    #    So it only runs on short strings, and only when exactly one extension can match.
+    if digits and len(digits) <= INTERNAL_DIAL_MAX_DIGITS:
+        tails = {digits[-n:] for n in range(2, 8)
+                 if len(digits) >= n and digits[-n:] in extensions}
+        if len(tails) == 1:
+            return tails.pop()
     return None
+
+
+def _ext_by_uuid(agent) -> Dict[str, str]:
+    """{extension_uuid: extension} for the staff domain, for outbound attribution by handset."""
+    ok, raw = _psql(agent, (
+        "select e.extension_uuid::text, e.extension "
+        "from v_extensions e join v_domains d on d.domain_uuid=e.domain_uuid "
+        f"where d.domain_name='{STAFF_DOMAIN}'"
+    ))
+    if not ok:
+        return {}
+    return {r[0]: r[1] for r in _rows(raw) if len(r) > 1 and r[0] and r[1]}
+
+
+def choose_outbound_key(legs: List[Dict[str, Any]], ext_by_uuid: Dict[str, str]) -> str:
+    """Which field in these outbound legs identifies the technician? Decided from the DATA.
+
+    The report was built when the `caller_id_name` COLUMN carried the technician's own name. The
+    PBX now rewrites that to the company name before the call reaches the trunk, so that key
+    identifies nobody - and because the code knew only that one key, four weeks of outbound talk
+    time was reported as zero. The key is therefore chosen per run, strongest evidence first:
+
+      "sip_from_user"       - the channel's own From user, which carries the PLACING EXTENSION
+                              (`+14843351444;ext=214`). Checked against the live extension list,
+                              so it also survives a display-name difference between the PBX and
+                              the helpdesk ("Freddie Ortiz" vs "Fred Ortiz"). Best available:
+                              present on 130 of 130 legs in the week this was written.
+      "caller_id_name"      - the column names people (the pre-migration shape, and what a PBX
+                              fix would restore).
+      "json_caller_id_name" - the dialplan's own caller_id_name from the channel dump, for when
+                              the column has been rewritten but the JSON still names the person.
+      "extension_uuid"      - the PBX records WHICH HANDSET placed the call, and it VARIES. A
+                              CONSTANT value is rejected: every outbound leg currently carries
+                              extension 201's uuid because that is the outbound route, and
+                              believing it would credit one person with the whole desk's calls.
+      "none"                - nothing in the data identifies a person. The time is then reported
+                              as unattributed team time, loudly, rather than dropped.
+    """
+    talked = [l for l in legs if l.get("billsec", 0) > 0]
+    if {l.get("from_ext") for l in talked if l.get("from_ext")}:
+        return "sip_from_user"
+    if [l for l in talked if not is_company_cid(l.get("name"))]:
+        return "caller_id_name"
+    if [l for l in talked if not is_company_cid(l.get("json_name"))]:
+        return "json_caller_id_name"
+    mapped = {l.get("ext_uuid") for l in talked
+              if l.get("ext_uuid") and l["ext_uuid"] in ext_by_uuid}
+    if len(mapped) >= 2:
+        return "extension_uuid"
+    return "none"
 
 
 def fetch_calls(agent, hours: int, extensions: Dict[str, str]) -> Tuple[Dict[str, Any], str]:
@@ -146,7 +364,15 @@ def fetch_calls(agent, hours: int, extensions: Dict[str, str]) -> Tuple[Dict[str
     hours = max(1, int(hours or 24))
     window = f"now() - interval '{hours} hours'"
 
-    # Answered inbound: the intercepted leg, carrying real talk time, addressed to 920<ext>.
+    # Answered inbound: every answered non-outbound leg. NOTE WHAT IS NOT HERE - a pattern for
+    # the destination. The SQL used to filter on the dial-string format, so when the format
+    # changed (2026-08-24) the rows were discarded before Python ever saw them and the report
+    # said "0m on the phone" for four weeks. Whether a destination is one of our handsets is a
+    # question about the extension list, not about a string shape, so it is answered in
+    # _resolve_ext() where it can be tested against reality and counted when it fails.
+    #
+    # The volume this pulls is trivial (about 105 answered legs a week), so nothing is gained by
+    # pushing the guesswork into the database.
     ok, raw = _psql(agent, (
         "select c.destination_number, c.billsec, c.start_stamp, coalesce(c.caller_id_name,''), "
         "coalesce(c.caller_id_number,''), coalesce(c.waitsec,0), coalesce(c.hold_accum_seconds,0), "
@@ -155,18 +381,28 @@ def fetch_calls(agent, hours: int, extensions: Dict[str, str]) -> Tuple[Dict[str
         f"where d.domain_name='{STAFF_DOMAIN}' and c.start_stamp > {window} "
         "and c.billsec > 0 and coalesce(c.direction,'') <> 'outbound' "
         "and coalesce(c.direction,'') <> 'local' "
-        f"and c.destination_number ~ '^[0-9]{{3,7}}$' "
         "order by c.start_stamp"
     ))
     if not ok:
         return {}, raw
-    answered_in, seen, dropped_dest, dup_in = [], {}, 0, 0
+    answered_in, seen, dropped_dest, dup_in, dropped_secs = [], {}, 0, 0, 0
+    # What the dial strings LOOK like this week, counted. Printed in the report's provenance box
+    # so the next format change is visible the first time it happens instead of four weeks later.
+    dest_forms: Dict[str, int] = {}
+    unresolved_samples: List[str] = []
     for r in _rows(raw):
         if len(r) < 9:
             continue
+        dest_forms[_dest_form(r[0])] = dest_forms.get(_dest_form(r[0]), 0) + 1
         ext = _resolve_ext(r[0], extensions)
         if not ext:
             dropped_dest += 1
+            # The MINUTES matter more than the count: an IVR greeting and a fax tone are a
+            # handful of seconds a week, while a handset the report can no longer recognise is
+            # hours. The alarm is raised on time lost, not on rows skipped.
+            dropped_secs += int(float(r[1] or 0))
+            if len(unresolved_samples) < 5 and r[0] not in unresolved_samples:
+                unresolved_samples.append(r[0])
             continue
         billsec = int(float(r[1] or 0))
         key = (ext, r[7], billsec)          # extension, start_epoch, duration
@@ -183,14 +419,45 @@ def fetch_calls(agent, hours: int, extensions: Dict[str, str]) -> Tuple[Dict[str
         seen[key] = rec
         answered_in.append(rec)
 
-    # Outbound: attributed by caller_id_name, because every tech shares one outbound DID.
+    # Outbound. THE IDENTITY IS IN THE CDR JSON, NOT IN THE COLUMN (found 2026-09-22).
+    #
+    # `v_xml_cdr.caller_id_name` is what the TRUNK was shown, and since the Teams migration the
+    # dialplan rewrites it to the literal "BlueCloud" on every leg - which is why outbound talk
+    # time became unattributable and the Phone engagement scale read n/a. But FreeSWITCH keeps
+    # the whole channel in `v_xml_cdr_json`, and the dialplan's own values are still in it:
+    #
+    #   variables.sip_from_user   ->  "+14843351444;ext=214"    the PLACING EXTENSION
+    #   variables.caller_id_name  ->  "Zohaib%20Farooq"         the technician's own name
+    #
+    # Both were present on 130 of 130 outbound legs in the seven days to 2026-09-22, so outbound
+    # is attributable after all. `sip_from_user` is preferred: an extension is matched against
+    # the live extension list, which also survives a display-name difference between the PBX and
+    # the helpdesk ("Freddie Ortiz" vs "Fred Ortiz") that a name match loses.
+    #
+    # The join is by uuid over ~130 rows a week (~600 for a monthly window). It is OPTIONAL: if
+    # that table cannot be read the plain query still runs and attribution falls back to the
+    # names, so a heavy detail table can never take the whole report down.
     ok, raw = _psql(agent, (
         "select coalesce(c.caller_id_name,''), c.billsec, c.start_stamp, "
-        "coalesce(c.destination_number,''), (c.answer_stamp is null), c.start_epoch "
+        "coalesce(c.destination_number,''), (c.answer_stamp is null), c.start_epoch, "
+        "coalesce(c.extension_uuid::text,''), "
+        "coalesce(j.json->'variables'->>'sip_from_user',''), "
+        "coalesce(j.json->'variables'->>'caller_id_name','') "
         "from v_xml_cdr c join v_domains d on d.domain_uuid=c.domain_uuid "
+        "left join v_xml_cdr_json j on j.xml_cdr_uuid=c.xml_cdr_uuid "
         f"where d.domain_name='{STAFF_DOMAIN}' and c.start_stamp > {window} "
         "and c.direction = 'outbound' order by c.start_stamp"
-    ))
+    ), timeout=180)
+    json_available = ok
+    if not ok:
+        ok, raw = _psql(agent, (
+            "select coalesce(c.caller_id_name,''), c.billsec, c.start_stamp, "
+            "coalesce(c.destination_number,''), (c.answer_stamp is null), c.start_epoch, "
+            "coalesce(c.extension_uuid::text,''), '', '' "
+            "from v_xml_cdr c join v_domains d on d.domain_uuid=c.domain_uuid "
+            f"where d.domain_name='{STAFF_DOMAIN}' and c.start_stamp > {window} "
+            "and c.direction = 'outbound' order by c.start_stamp"
+        ))
     if not ok:
         return {}, raw
     outbound, seen_out, dup_out = [], set(), 0
@@ -204,27 +471,75 @@ def fetch_calls(agent, hours: int, extensions: Dict[str, str]) -> Tuple[Dict[str
             dup_out += 1
             continue
         seen_out.add(key)
+        # The channel dump URL-encodes its values ("Zohaib%20Farooq").
+        from_user = unquote_plus(r[7]) if len(r) > 7 else ""
+        json_name = re.sub(r"^TQ-", "", unquote_plus(r[8])) if len(r) > 8 else ""
         outbound.append({"name": name, "billsec": billsec, "at": r[2],
-                         "dest": r[3], "unanswered": (r[4] == "t")})
+                         "dest": r[3], "unanswered": (r[4] == "t"),
+                         "ext_uuid": (r[6] if len(r) > 6 else ""),
+                         "from_user": from_user, "json_name": json_name,
+                         # Resolved by the same format-agnostic rule the inbound side uses.
+                         "from_ext": _resolve_ext(from_user, extensions)})
+
+    # Which key identifies the person who placed these calls, decided from the rows themselves.
+    ext_by_uuid = _ext_by_uuid(agent)
+    outbound_key = choose_outbound_key(outbound, ext_by_uuid)
+    if outbound_key == "sip_from_user":
+        for leg in outbound:
+            if leg.get("from_ext"):
+                leg["ext"] = leg["from_ext"]
+    elif outbound_key == "extension_uuid":
+        for leg in outbound:
+            ext = ext_by_uuid.get(leg.get("ext_uuid") or "")
+            if ext:
+                leg["ext"] = ext
 
     # Calls nobody picked up, counted ONCE for the team (see module docstring).
+    #
+    # COUNTING THE CALL, NOT THE RINGING HANDSETS. Inbound rings every extension at once, and
+    # since the 2026-08-24 migration each of those legs is written as its own CDR with its own
+    # `sip_call_id` - so the old `count(distinct sip_call_id)` counts handsets, not calls. In the
+    # seven days to 2026-09-22 that was 303 "missed calls" for about 143 real ones.
+    #
+    # The legs of one ring share the caller's number and start within a second or two of each
+    # other (occasionally a later extension is added a few seconds in), so the legs are
+    # clustered per caller with a short tolerance. The tolerance is deliberately small: two
+    # separate attempts by the same caller 30 seconds apart ARE two missed calls, and a report
+    # that hides the second one is worse than one that counts a slow ring group twice.
     ok, raw = _psql(agent, (
-        "select count(distinct coalesce(nullif(c.sip_call_id,''), c.xml_cdr_uuid::text)) "
+        "select coalesce(c.caller_id_number,''), c.start_epoch, coalesce(c.destination_number,'') "
         "from v_xml_cdr c join v_domains d on d.domain_uuid=c.domain_uuid "
         f"where d.domain_name='{STAFF_DOMAIN}' and c.start_stamp > {window} "
         "and c.billsec = 0 and coalesce(c.direction,'') not in ('outbound','local') "
-        f"and c.destination_number ~ '^[0-9]{{3,7}}$'"
+        "order by c.start_epoch"
     ))
-    team_unanswered_legs = 0
+    team_unanswered, unanswered_legs = 0, 0
     if ok:
-        rr = _rows(raw)
-        if rr and rr[0] and rr[0][0].isdigit():
-            team_unanswered_legs = int(rr[0][0])
+        legs = []
+        for r in _rows(raw):
+            if len(r) < 3:
+                continue
+            # Same rule as the answered legs: ours if it resolves to a real extension.
+            if not _resolve_ext(r[2], extensions):
+                continue
+            try:
+                legs.append((r[0], int(float(r[1] or 0))))
+            except ValueError:
+                continue
+        unanswered_legs = len(legs)
+        team_unanswered = count_ring_bursts(legs)
 
     return {"answered_in": answered_in, "outbound": outbound,
-            "team_unanswered": team_unanswered_legs,
+            "team_unanswered": team_unanswered,
+            "team_unanswered_legs": unanswered_legs,
             "dedup_dropped": dup_in + dup_out,
-            "unresolved_destinations": dropped_dest}, ""
+            "unresolved_destinations": dropped_dest,
+            "unresolved_seconds": dropped_secs,
+            # Self-description, so the report can say what it found rather than assuming.
+            "dest_forms": dest_forms,
+            "unresolved_samples": unresolved_samples,
+            "outbound_key": outbound_key,
+            "cdr_json_available": json_available}, ""
 
 
 def collect_phone(hours: int) -> Dict[str, Any]:
@@ -299,6 +614,86 @@ def name_match_score(a: str, b: str) -> float:
         if len(short) >= 3 and long_.startswith(short):
             return 0.82
     return 0.0
+
+
+def fold_actor_aliases(actors: Dict[str, Any],
+                       overrides: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Merge duplicate identities of the SAME person into one technician.
+
+    WHY (owner, 2026-09-22: "why does Chris Rawlings - gmail keep showing up in this report").
+    The helpdesk has more than one contact record for the same human - a second Odoo partner
+    called "BlueCloud IAAS, LLC, Chris Rawlings - gmail" authored one message on TICKET/61435 -
+    and the actor rollup, which derives people from message authors, faithfully reported it as a
+    seventh technician with one ticket and eleven minutes. That is wrong three times over: it
+    invents a colleague, it takes that person's work off their real row, and - because the
+    desk's MEDIAN is what every "vs desk" score is measured against - a ghost row with one
+    ticket drags the comparison for everybody.
+
+    The rule is deliberately narrow, because merging two real people would be far worse than
+    listing one twice: fold B into A only when A's name tokens are a PROPER SUBSET of B's -
+    "chris rawlings" inside "chris rawlings gmail", "dan b" inside "dan b personal". The shorter
+    name is the canonical one and the longer is absorbed into it. Two people who merely resemble
+    each other ("Fred Ortiz" / "Freddie Ortiz") are NOT folded here: neither is a subset of the
+    other, and guessing on a fuzzy match is how one person's work lands on another's review.
+
+    `overrides` ({"Chris Rawlings - gmail": "Chris Rawlings"}) is honoured first, so an operator
+    can pin an alias the rule cannot see without a code change.
+    """
+    people = {n: a for n, a in actors.items()
+              if a.get("kind") in ("staff", "tech", "tech_via_ai")}
+    if not people:
+        return actors
+    canonical: Dict[str, str] = {}
+    for alias, target in (overrides or {}).items():
+        if alias in actors and target in actors and alias != target:
+            canonical[alias] = target
+    token_map = {n: set(_tokens(n)) for n in people if _tokens(n)}
+    # Every identity whose tokens nest inside another's, or contain another's.
+    related = {n: [o for o, o_toks in token_map.items()
+                   if o != n and (o_toks < toks or toks < o_toks)]
+               for n, toks in token_map.items()}
+    for name, mates in related.items():
+        if name in canonical or len(mates) != 1:
+            continue
+        other = mates[0]
+        # Checked from BOTH sides: "Chris" sitting inside two different Chrises is a question
+        # for a human, and it must not be resolved just because one of them sees only "Chris".
+        if len(related.get(other, [])) != 1:
+            continue
+        # The identity with the most recorded work is the real one and keeps its name; the thin
+        # duplicate is absorbed. Deciding by NAME LENGTH instead would rename the technician
+        # after their own stub ("Chris Rawlings" folded into a stray "Chris").
+        keep, drop = sorted((name, other),
+                            key=lambda n: (-(people[n].get("minutes") or 0), n))
+        canonical[drop] = keep
+    if not canonical:
+        return actors
+
+    merged = {n: a for n, a in actors.items() if n not in canonical}
+    for alias, target in canonical.items():
+        src, dst = actors[alias], merged.get(target)
+        if dst is None:                                # target itself was folded away
+            merged[alias] = src
+            continue
+        for key in ("minutes", "sessions", "closed", "off_ticket_minutes", "measured",
+                    "inferred"):
+            if isinstance(src.get(key), (int, float)) and isinstance(dst.get(key), (int, float)):
+                dst[key] = dst[key] + src[key]
+        for key in ("tickets", "companies", "ledger_only_tickets"):
+            if isinstance(src.get(key), (set, list)) and isinstance(dst.get(key), (set, list)):
+                if isinstance(dst[key], set):
+                    dst[key] |= set(src[key])
+                else:
+                    dst[key] = list(dst[key]) + [t for t in src[key] if t not in dst[key]]
+        for key in ("classes",):
+            if isinstance(src.get(key), dict) and isinstance(dst.get(key), dict):
+                for k, v in src[key].items():
+                    dst[key][k] = dst[key].get(k, 0) + v
+        if src.get("first") and (not dst.get("first") or src["first"] < dst["first"]):
+            dst["first"] = src["first"]
+        if src.get("last") and (not dst.get("last") or src["last"] > dst["last"]):
+            dst["last"] = src["last"]
+    return merged
 
 
 def match_pbx(tech_names: List[str], extensions: Dict[str, str],
@@ -800,7 +1195,7 @@ UNITS = {
     "documentation": "internal notes per ticket",
     "communication": "median minutes to first reply",
     "autonomy": "% of closes handled alone",
-    "phone": "talk minutes per active day",
+    "phone": "talk minutes per active day (total talk \u00f7 their active days)",
 }
 
 SCALE_WORDS = {1: "needs attention", 2: "below desk norm", 3: "solid / on par",
@@ -884,6 +1279,8 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
     # The actor rollup labels humans "staff" when it derives them from ticket messages and
     # "tech"/"tech_via_ai" once the work ledger has re-attributed them, so all three are people.
     # Matching only one of those labels silently produced an empty report.
+    actors = fold_actor_aliases(actors, (pbx_overrides or {}).get("aliases")
+                                if isinstance(pbx_overrides, dict) else None)
     techs = sorted([a for a in actors.values() if a["kind"] in ("staff", "tech", "tech_via_ai")],
                    key=lambda a: -a["minutes"])
     names = [a["name"] for a in techs]
@@ -903,6 +1300,48 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
     today = djangotime.localtime(djangotime.now()).date()
     days_in_window = max(1, int(round(hours / 24.0)))
     window_days = [today - timedelta(days=i) for i in range(days_in_window)]
+    window_day_set = set(window_days)
+
+    # THE PHONE WINDOW AND THE DAY WINDOW MUST BE THE SAME WINDOW.
+    #
+    # The CDR query asks for `now() - 168 hours`, which reaches back into the AFTERNOON of an
+    # eighth calendar day, while every day-based figure here counts seven whole days. Talk time
+    # from that extra afternoon was therefore in the TOTAL but its day was not in "active days",
+    # which quietly inflated "talk minutes per active day" - Zohaib showed six call days against
+    # five active ones. The calls are clamped to the same calendar days the rest of the report
+    # uses, so the total, the per-day figure and the divisor all describe one period.
+    def _in_window(call: Dict[str, Any]) -> bool:
+        at = _parse(call.get("at"))
+        return bool(at) and at.date() in window_day_set
+
+    if phone.get("ok"):
+        phone = dict(phone)
+        clipped_in = [c for c in (phone.get("answered_in") or []) if _in_window(c)]
+        clipped_out = [c for c in (phone.get("outbound") or []) if _in_window(c)]
+        phone["clipped_calls"] = ((len(phone.get("answered_in") or []) - len(clipped_in))
+                                  + (len(phone.get("outbound") or []) - len(clipped_out)))
+        phone["answered_in"], phone["outbound"] = clipped_in, clipped_out
+
+    # OUTBOUND: WHICH LEGS BELONG TO A PERSON, AND WHICH BELONG TO NOBODY.
+    #
+    # `outbound_key` is chosen from the rows themselves (choose_outbound_key): the technician's
+    # caller-ID name when the PBX sends it, the placing handset when it records one that varies,
+    # and otherwise nothing. Whatever is left over is real work that cannot be attributed - it is
+    # counted for the TEAM and named as unattributed, because dropping it silently is what made
+    # four weeks of "0m on the phone" look like a quiet desk.
+    outbound_key = phone.get("outbound_key") or "caller_id_name"
+
+    def _leg_is_attributable(leg: Dict[str, Any]) -> bool:
+        if outbound_key in ("sip_from_user", "extension_uuid"):
+            return bool(leg.get("ext"))
+        if outbound_key == "caller_id_name":
+            return not is_company_cid(leg.get("name"))
+        if outbound_key == "json_caller_id_name":
+            return not is_company_cid(leg.get("json_name"))
+        return False
+
+    out_unattributed = [c for c in (phone.get("outbound") or []) if not _leg_is_attributable(c)]
+    out_unattributed_secs = sum(c["billsec"] for c in out_unattributed)
 
     # Phone facts folded per technician.
     phone_by_tech: Dict[str, Dict[str, Any]] = {}
@@ -910,8 +1349,20 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
         ext_of = {tech: info["ext"] for tech, info in pbx["map"].items()}
         for tech, ext in ext_of.items():
             ins = [c for c in phone["answered_in"] if c["ext"] == ext]
-            outs = [c for c in phone["outbound"]
-                    if name_match_score(tech, c["name"]) >= 0.8]
+            # Matched on whichever key the PBX is actually providing (see above). A company
+            # caller-ID name matches nobody by design: "BlueCloud" must never score against a
+            # person's name.
+            if outbound_key in ("sip_from_user", "extension_uuid"):
+                outs = [c for c in phone["outbound"] if c.get("ext") == ext]
+            elif outbound_key == "caller_id_name":
+                outs = [c for c in phone["outbound"]
+                        if not is_company_cid(c["name"]) and name_match_score(tech, c["name"]) >= 0.8]
+            elif outbound_key == "json_caller_id_name":
+                outs = [c for c in phone["outbound"]
+                        if not is_company_cid(c.get("json_name"))
+                        and name_match_score(tech, c.get("json_name") or "") >= 0.8]
+            else:
+                outs = []
             talk = sum(c["billsec"] for c in ins) + sum(c["billsec"] for c in outs)
             answered_out = [c for c in outs if not c["unanswered"] and c["billsec"] > 0]
             longest = max([c["billsec"] for c in ins + outs] or [0])
@@ -1086,7 +1537,9 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
             ],
         })
 
-    _score(rows)
+    # Outbound cannot be attributed since the PBX change, so the phone DIMENSION is withheld
+    # rather than scored on inbound alone (see _score).
+    _score(rows, phone_partial=bool(out_unattributed_secs))
     _coach(rows)
 
     desk = {
@@ -1100,6 +1553,9 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
         "avg_complexity": round(statistics.mean([r["avg_complexity"] for r in rows]), 2) if rows else 0,
         "team_unanswered_calls": phone.get("team_unanswered", 0) if phone.get("ok") else None,
         "dormant_day_count": sum(len(r["dormant_days"]) for r in rows),
+        # Outbound talk time the PBX no longer attributes to anyone. Team-level, and named.
+        "unattributed_out_minutes": round(out_unattributed_secs / 60.0, 1) if phone.get("ok") else None,
+        "unattributed_out_calls": len(out_unattributed) if phone.get("ok") else None,
     }
     desk["specialist_categories"] = rating["specialist_categories"]
     desk["specialist_owners"] = {c: rating["category_closers"].get(c, [])
@@ -1109,6 +1565,12 @@ def build(data: Dict[str, Any], tickets: List[Dict[str, Any]], actors: Dict[str,
             "phone_ok": bool(phone.get("ok")),
             "phone_error": phone.get("error", ""),
             "phone_dedup_dropped": phone.get("dedup_dropped", 0),
+            "phone_unresolved_destinations": phone.get("unresolved_destinations", 0),
+            "phone_unresolved_minutes": round(phone.get("unresolved_seconds", 0) / 60.0, 1),
+            "phone_dest_forms": phone.get("dest_forms") or {},
+            "phone_clipped_calls": phone.get("clipped_calls", 0),
+            "phone_unresolved_samples": phone.get("unresolved_samples") or [],
+            "phone_outbound_key": phone.get("outbound_key") or "",
             "window_days": days_in_window}
 
 
@@ -1243,15 +1705,26 @@ MIN_TICKETS_TO_SCORE = 5
 MIN_MINUTES_TO_SCORE = 60
 
 
-def _score(rows: List[Dict[str, Any]]) -> None:
-    """Attach absolute and relative 1-5 scores, plus an overall, to every technician."""
+def _score(rows: List[Dict[str, Any]], phone_partial: bool = False) -> None:
+    """Attach absolute and relative 1-5 scores, plus an overall, to every technician.
+
+    `phone_partial` means the PBX can only be trusted for PART of each person's call work -
+    since the 2026-08-24 migration, inbound is attributable and outbound is not. Scoring
+    "phone engagement" on half the data would rate whoever dials out most as the least engaged
+    on the phone, which is the exact inversion this report exists to prevent. The talk minutes
+    that ARE known are still shown; the SCORE is withheld.
+    """
     for r in rows:
         # Rate the daily habit, not the size of the window: total talk time scored every
         # technician 5/5 over a month while discriminating fine over a week.
         talk = (r["phone"] or {}).get("talk_minutes", 0.0) if r["phone"] else None
         r["talk_minutes_total"] = talk
-        r["talk_minutes_per_active_day"] = (round(talk / max(1, r["active_days"]), 1)
-                                            if talk is not None else None)
+        per_day = round(talk / max(1, r["active_days"]), 1) if talk is not None else None
+        # The SCORE is withheld when attribution is partial; the FIGURE is not - hiding both
+        # would throw away the inbound talk time we do know.
+        r["talk_minutes_per_active_day"] = None if phone_partial else per_day
+        r["talk_in_per_active_day"] = per_day
+        r["phone_score_withheld"] = bool(phone_partial and talk is not None)
         r["insufficient_data"] = (r["tickets_touched"] < MIN_TICKETS_TO_SCORE
                                   or r["minutes"] < MIN_MINUTES_TO_SCORE)
 
@@ -1319,6 +1792,40 @@ def integrity_checks(payload: Dict[str, Any], hours: int) -> List[Dict[str, str]
                     "finding": f'Phone data could not be read ({payload.get("phone_error")}).',
                     "effect": "Phone columns are absent, not zero. Anyone whose day is mostly "
                               "calls will look inactive."})
+    # THE FAILURE THAT HID FOR FOUR WEEKS. The PBX was readable, the numbers were zero, and
+    # nothing said so - so the report quietly described a desk that took no calls. Either of
+    # these now speaks up.
+    desk_p = payload.get("desk") or {}
+    if payload.get("phone_ok") and not desk_p.get("talk_minutes"):
+        out.append({"severity": "blocker", "area": "phone",
+                    "finding": "The PBX answered, but not one minute of talk time was attributed "
+                               "to anybody. That is a data problem, not a quiet week.",
+                    "effect": "Treat every phone figure and the phone score as missing. The "
+                              "provenance box below names the dial-string forms and the outbound "
+                              "key detected this run - compare them with a week that worked. "
+                              "Both of those keys changed in the week of 2026-08-24, which is "
+                              "how this went unnoticed for four weeks."})
+    # Time that reached a destination this report cannot recognise. Judged in MINUTES, because
+    # IVR greetings and fax tones are always a few unresolved seconds a week, while a handset
+    # the resolver has stopped recognising is hours - which is precisely the 2026-08-24 failure
+    # (every answered leg unresolved, 443 minutes lost, and nothing said so).
+    if payload.get("phone_ok") and payload.get("phone_unresolved_minutes", 0) >= 20:
+        out.append({"severity": "blocker", "area": "phone attribution",
+                    "finding": f'{fmt_mins(payload["phone_unresolved_minutes"])} of answered '
+                               f'inbound talk time went to destinations this report cannot tie to '
+                               f'a current extension '
+                               f'({", ".join((payload.get("phone_unresolved_samples") or [])[:3])}).',
+                    "effect": "Those minutes are counted for nobody. Either the PBX changed its "
+                              "dial-string format again, or the extension list is out of step "
+                              "with the calls - the provenance box names the forms it saw."})
+    if desk_p.get("unattributed_out_minutes"):
+        out.append({"severity": "blocker", "area": "phone attribution",
+                    "finding": f'{fmt_mins(desk_p["unattributed_out_minutes"])} of outbound talk '
+                               f'time ({desk_p["unattributed_out_calls"]} calls) carries the '
+                               f'company caller-ID name, so the PBX does not say who placed it.',
+                    "effect": "That time is counted for the desk and for nobody in the table, so "
+                              "outbound-heavy technicians read as quieter than they are. The fix "
+                              "is on the PBX: present the placing extension's caller-ID name."})
     for who in (payload.get("pbx") or {}).get("unmatched", []):
         out.append({"severity": "blocker", "area": "phone attribution",
                     "finding": f"{who} could not be matched to a PBX extension.",
@@ -1708,6 +2215,11 @@ def _cards(desk: Dict[str, Any], payload: Dict[str, Any]) -> str:
     ]
     if payload.get("phone_ok"):
         cards.append(card(fmt_mins(desk["talk_minutes"]), "talk time", f'{desk["calls"]} calls'))
+        # Outbound the PBX cannot attribute. On its own tile rather than folded into the total:
+        # it is real talk time, but it belongs to the desk, not to anybody in the table.
+        if desk.get("unattributed_out_minutes"):
+            cards.append(card(fmt_mins(desk["unattributed_out_minutes"]), "unattributed talk",
+                              f'{desk["unattributed_out_calls"]} outbound calls', "ca"))
     if desk.get("dormant_day_count"):
         cards.append(card(desk["dormant_day_count"], "unaccounted days",
                           "open work, no activity", "ca"))
@@ -1742,6 +2254,38 @@ def _provenance(payload: Dict[str, Any], hours: int) -> str:
         if payload.get("phone_dedup_dropped"):
             bits.append(f'{payload["phone_dedup_dropped"]} duplicate call legs were discarded '
                         f"(queue-recorded calls are written twice by the PBX).")
+        if (payload.get("desk") or {}).get("unattributed_out_minutes"):
+            d = payload["desk"]
+            bits.append(
+                f'<b style="color:#b91c1c">{fmt_mins(d["unattributed_out_minutes"])} of outbound '
+                f'talk time ({d["unattributed_out_calls"]} calls) could not be attributed to '
+                f'anyone.</b> Since the PBX change in the week of 2026-08-24 every outbound leg '
+                f'presents the company caller-ID name ("BlueCloud") instead of the technician\'s, '
+                f'and the CDR carries no other per-person identity, so this time is shown for the '
+                f'desk and is NOT in anyone\'s row, and the Phone engagement SCORE is withheld '
+                f'for everybody rather than rated on inbound calls alone. Fixing it needs a PBX '
+                f'change: present the placing extension\'s caller-ID name on the outbound leg.')
+        # WHAT THE PBX IS ACTUALLY SENDING. Printed every run, because the report's own input
+        # changed shape on 2026-08-24 and nothing in the email said so - the figures just went
+        # to zero. A line here makes the next change visible the first week it happens.
+        forms = payload.get("phone_dest_forms") or {}
+        if forms:
+            shown = ", ".join(f"{esc(k)} &times;{v}" for k, v in
+                              sorted(forms.items(), key=lambda kv: -kv[1]))
+            bits.append(f"<b>Detected this run:</b> inbound dial-string forms {shown}; outbound "
+                        f"attributed by <code>{esc(payload.get('phone_outbound_key') or 'none')}</code>. "
+                        f"Destinations are matched against the live extension list, not against a "
+                        f"fixed format, so a PBX change moves this line rather than the figures.")
+        if payload.get("phone_unresolved_destinations"):
+            samples = ", ".join(esc(x) for x in (payload.get("phone_unresolved_samples") or [])[:5])
+            bits.append(f'{payload["phone_unresolved_destinations"]} answered inbound legs went to '
+                        f'a destination that is not a current extension (IVR, fax, a removed '
+                        f'handset) and are counted for nobody'
+                        + (f' &mdash; e.g. {samples}' if samples else '') + '.')
+        bits.append("Talk time covers the same calendar days as every other figure here; "
+                    f'{payload.get("phone_clipped_calls") or 0} call(s) from the part-day at the '
+                    "start of the rolling 168-hour CDR window were left out so that the totals, "
+                    "the per-active-day figures and the day counts all describe one period.")
         bits.append("Inbound rings every extension at once, so a call another tech answered is "
                     "<b>never</b> counted as this tech's missed call; unanswered inbound is "
                     "reported once for the team. Internal extension-to-extension calls are excluded.")
@@ -1810,10 +2354,20 @@ def _scorecard(rows: List[Dict[str, Any]]) -> str:
          "<tr>" + "".join('<th class="hd2 ctr">std</th><th class="hd2 ctr">desk</th>'
                           for _ in order) + "</tr>"]
 
+    # "n/a" with a description of what the scale measures reads as a broken report. When the
+    # phone scale is withheld, the row says so, on the row.
+    phone_withheld = any(r.get("phone_score_withheld") for r in rows)
+    phone_why = ("WITHHELD this period - outbound calls carry the company caller-ID name since "
+                 "the PBX change of 2026-08-24, so per-person talk time is incomplete and "
+                 "scoring it would understate whoever dials out most. Inbound talk time is "
+                 "measured and shown below, in each technician's section, and in the desk "
+                 "totals.")
+
     for i, (key, label, _f, _t, _hi, why) in enumerate(DIMENSIONS):
         cls = "sr" if i % 2 == 0 else "sr z"
+        text = phone_why if (key == "phone" and phone_withheld) else why
         h.append(f'<tr class="{cls}"><td class="sn"><b>{esc(label)}</b>'
-                 f'<div class="sub">{esc(why)}</div></td>')
+                 f'<div class="sub">{esc(text)}</div></td>')
         for r in order:
             sc = r["scores"][key]
             inv = (key == "complexity")
@@ -1841,10 +2395,14 @@ def _scorecard(rows: List[Dict[str, Any]]) -> str:
              + "</tr>")
     for i, (key, label, _f, _t, _hi, _why) in enumerate(DIMENSIONS):
         cls = "sr" if i % 2 == 0 else "sr z"
+        unit = UNITS.get(key, "")
+        if key == "phone" and phone_withheld:
+            unit = "talk minutes per active day - INBOUND ONLY, not scored"
         h.append(f'<tr class="{cls}"><td class="sn">{esc(label)}'
-                 f'<div class="sub">{esc(UNITS.get(key, ""))}</div></td>')
+                 f'<div class="sub">{esc(unit)}</div></td>')
         for r in order:
-            v = r["scores"][key]["value"]
+            v = (r.get("talk_in_per_active_day") if (key == "phone" and phone_withheld)
+                 else r["scores"][key]["value"])
             txt = "&ndash;" if v is None else f"{v:g}" if isinstance(v, (int, float)) else esc(str(v))
             h.append(f'<td class="ctr mv">{txt}</td>')
         h.append("</tr>")
@@ -1856,6 +2414,14 @@ def _scorecard(rows: List[Dict[str, Any]]) -> str:
                  f'{esc(", ".join(flatd))}</b> &mdash; the desk is tightly clustered there, so '
                  'every "desk" score on those scales is 3 by rule, not by measurement. Read the '
                  '"std" column for those.</div>')
+    if phone_withheld:
+        h.append('<div class="warn"><b>Phone engagement is not scored this period</b> &mdash; '
+                 'inbound calls are attributed per technician, but every outbound leg now '
+                 'presents the company caller-ID name, so the PBX cannot say who placed it. '
+                 'Rating the scale on inbound alone would mark the people who spend the day '
+                 'dialling out as the least engaged on the phone. <b>Overall</b> is therefore the '
+                 'mean of the other scales, and nobody is penalised for the gap. The desk total '
+                 'and the unattributed outbound figure are both in the headline cards.</div>')
     if any(r.get("insufficient_data") for r in rows):
         who = ", ".join(esc(r["name"]) for r in rows if r.get("insufficient_data"))
         h.append(f'<div class="warn"><b>Overall score withheld for {who}</b> &mdash; fewer than '
@@ -1970,9 +2536,20 @@ def _tech_block(r: Dict[str, Any], narrative: str = "") -> str:
     if ph:
         h.append(group("Phone", [
             kv("talk time", fmt_mins(ph.get("talk_minutes")),
-               f'{ph.get("calls_in", 0)} answered in, {ph.get("calls_out", 0)} out'),
+               # Say WHICH calls this figure is, whenever it is only half of them: an
+               # inbound-only number read as "their phone work" understates anyone who
+               # spends the day dialling out.
+               (f'{ph.get("calls_in", 0)} answered in &middot; outbound not attributable '
+                f'(see the note above)')
+               if r.get("phone_score_withheld")
+               else f'{ph.get("calls_in", 0)} answered in, {ph.get("calls_out", 0)} out'),
             kv("avg call", fmt_mins(ph.get("avg_call_minutes")),
                f'longest {fmt_mins(ph.get("longest_call_minutes"))}'),
+            # The scored figure, with its own arithmetic on show. "82.9" on its own invites
+            # "that cannot be right" - and the answer is always which divisor was used.
+            kv("per active day", fmt_mins(r.get("talk_in_per_active_day")),
+               f'{fmt_mins(ph.get("talk_minutes"))} over {r["active_days"]} active day'
+               f'{"s" if r["active_days"] != 1 else ""}'),
             kv("total accounted", fmt_mins(r["minutes_incl_phone"]), "tickets + phone"),
         ]))
     else:
