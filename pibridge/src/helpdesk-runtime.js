@@ -30,6 +30,52 @@
 //                         cancel_ticket: "close", add_note: "note", ... };  // optional but recommended
 import vm from "node:vm";
 
+// PASSWORDS NEVER REACH A MODEL (owner, 2026-09-26). get_partner_credentials used to hand
+// the IT Notebook's passwords, keys and secret columns straight to the model, and from there
+// into transcripts and logs (TICKET/61824, TICKET/61857). Every surface that exposes helpdesk
+// operations to a model goes through this loader, so the masking is done HERE, once: the
+// model gets labels, links and usernames, and "[stored]" for everything else. Brokered tools
+// (run_device_command_with_credential, the authorizer's label lookup) read the real values
+// through hd.readNotebookValues, which is not an operation and cannot be called by a model.
+const SHOW_COLUMN = /^(info|label|name|system|description|service|link|url|portal|address|host|site|user|username|user ?name|login|email|e-?mail|admin user|account)$/i;
+function maskNotebooks(result) {
+  if (!result || typeof result !== "object" || !Array.isArray(result.notebooks)) return result;
+  const notebooks = result.notebooks.map((nb) => {
+    if (!nb || !Array.isArray(nb.columns) || !Array.isArray(nb.rows)) return nb;
+    const show = nb.columns.map((c) => SHOW_COLUMN.test(String(c || "").trim()));
+    // A secret typed into a visible column (a password pasted into Link, seen on BlueCloud's
+    // notebook) is blanked there too: every value of a masked column, 6+ real characters,
+    // is scrubbed from every visible cell of the notebook.
+    const secrets = new Set();
+    for (const row of nb.rows) {
+      if (!Array.isArray(row)) continue;
+      row.forEach((cell, i) => { const v = String(cell ?? "").trim(); if (!show[i] && v.length >= 6) secrets.add(v); });
+    }
+    const bySize = [...secrets].sort((x, y) => y.length - x.length);
+    const scrub = (cell) => {
+      let v = String(cell ?? "");
+      for (const sec of bySize) if (v.includes(sec)) v = v.split(sec).join("[stored]");
+      return v;
+    };
+    const rows = nb.rows.map((row) => (Array.isArray(row)
+      ? row.map((cell, i) => (show[i] ? scrub(cell) : (String(cell ?? "").trim() ? "[stored]" : "")))
+      : row));
+    return { ...nb, rows, masked_columns: nb.columns.filter((_, i) => !show[i]) };
+  });
+  return {
+    partner_id: result.partner_id, notebooks, read_only: true, values_masked: true,
+    ...(result.note ? { note: result.note } : {}),
+    ...(result.error ? { error: result.error } : {}),
+    handling:
+      "Passwords, keys and other secret columns are shown as [stored] - by design, you never see them. " +
+      "To USE a login, pass it BY REFERENCE (company + the row's Info label, exactly as shown): " +
+      "run_device_command_with_credential (any RMM agent; the command reads $PI_USER/$PI_PASS/$PI_URL), " +
+      "operator_desktop_fill_secret (a sign-in page on the Operator desktop), run_script_with_credential " +
+      "(PowerShell on the Operator workstation). If the technician asks you for a password, tell them it is " +
+      "in the IT Notebook row <label> in Odoo - you cannot read it out.",
+  };
+}
+
 export function loadHelpdesk(code, config, context) {
   if (!code || !code.trim()) return null;
   const exportsObj = {};
@@ -67,8 +113,19 @@ export function loadHelpdesk(code, config, context) {
   const operations = ex.operations || {};
   const names = Object.keys(operations).filter((k) => typeof operations[k] === "function");
   if (!names.length) throw new Error("helpdesk.js defined no exports.operations functions");
+  // The model-facing operations get the masked notebook read; the raw one stays server-side.
+  const rawCredentials = typeof operations.get_partner_credentials === "function"
+    ? operations.get_partner_credentials.bind(operations) : null;
+  const exposed = { ...operations };
+  if (rawCredentials) {
+    exposed.get_partner_credentials = async (args = {}) =>
+      // Labels of privileged rows are included too: the row is still only usable through a
+      // brokered tool, which has its own gate.
+      maskNotebooks(await rawCredentials({ ...(args || {}), include_privileged: true }));
+  }
   return {
-    operations,
+    operations: exposed,
+    readNotebookValues: rawCredentials,
     names,
     meta: ex.meta || {},
     mutating: new Set(ex.mutating || names), // default: treat all as mutating (safe)

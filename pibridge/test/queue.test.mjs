@@ -135,7 +135,7 @@ test("answering IN THE QUEUE runs the reply as that item and tracks the exchange
     autoClear: false,
     prompt: async (text, q) => {
       if (text === "set up the share") { asks++; q.pauseByModel("Which drive letter?"); }
-      if (text === "use Z:") { asks++; q.pauseByModel("Read-only for Everyone, or read-write?"); }
+      if (text.endsWith("\nuse Z:")) { asks++; q.pauseByModel("Read-only for Everyone, or read-write?"); }
       // "read-write" -> finishes without a question
     },
   });
@@ -157,7 +157,7 @@ test("answering IN THE QUEUE runs the reply as that item and tracks the exchange
     "operator: use Z:",
     "assistant: Read-only for Everyone, or read-write?",
   ]);
-  assert.deepEqual(h.ran, ["set up the share", "use Z:"]);
+  assert.deepEqual(h.ran, ["set up the share", "(Answering your question: \"Which drive letter?\")\nuse Z:"]);
   assert.equal(h.state().items[1].status, "pending", "the second item is still waiting its turn");
 
   assert.equal(h.state().questions.length, 1, "the follow-up replaced the first card");
@@ -166,7 +166,8 @@ test("answering IN THE QUEUE runs the reply as that item and tracks the exchange
   it = h.state().items[0];
   assert.equal(it.status, "done");
   assert.equal(it.thread.length, 4);
-  assert.deepEqual(h.ran, ["set up the share", "use Z:", "read-write", "then email the customer"],
+  assert.deepEqual(h.ran, ["set up the share", "(Answering your question: \"Which drive letter?\")\nuse Z:",
+    "(Answering your question: \"Read-only for Everyone, or read-write?\")\nread-write", "then email the customer"],
     "once answered, the queue carries on by itself");
   // The reply frames are announced like any queued prompt, flagged as replies.
   const started = h.frames.filter((f) => f.type === "queue_started");
@@ -221,7 +222,7 @@ test("a question asked in ordinary chat (nothing queued) becomes a standalone ca
   // Answered in the panel: runs as the next thing said, card gone, pause gone.
   await h.q.handle({ type: "queue_answer", id: s.questions[0].id, text: "Exeter" });
   await settle(5);
-  assert.deepEqual(h.ran, ["Exeter"]);
+  assert.deepEqual(h.ran, ["(Answering your question: \"Which site is this for?\")\nExeter"]);
   assert.equal(h.state().questions.length, 0);
   assert.equal(h.state().paused, null);
   const started = h.frames.filter((f) => f.type === "queue_started").at(-1);
@@ -428,7 +429,7 @@ test("history records what was done and how, for the human - and is not context 
   assert.equal(answered.detail, "the second");
   // The answer itself reached the model (it is the operator's reply); the HISTORY did not:
   // nothing but the prompts the operator wrote ever went through runPrompt.
-  assert.deepEqual(h.ran, ["plain", "ask", "the second"]);
+  assert.deepEqual(h.ran, ["plain", "ask", "(Answering your question: \"Which one?\")\nthe second"]);
   // Cleared items are still in the history, and the history survives a reopen.
   assert.equal(h.state().items.length, 0);
   h.q.detach();
@@ -702,4 +703,22 @@ test("reopening a window with Auto-clear on clears what finished while it was cl
   await q.handle({ type: "queue_history" });
   const hist = frames.filter((f) => f.type === "queue_history").at(-1).history;
   assert.equal(hist.filter((e) => e.event === "auto_cleared").length, 1);
+});
+
+// 2026-09-30, TICKET/61934: a message typed while the assistant was busy went to the queue
+// and sat "pending" forever - Auto-Next was off and the assistant had a question open.
+test("a message typed while busy runs when the turn settles, even with Auto-Next off", async () => {
+  const h = harness({ prompt: async (text, q) => { if (text === "fix it") q.pauseByModel("Which box?"); } });
+  await h.q.handle({ type: "queue_add", text: "queued work for later" });   // panel work, Auto-Next off
+  await h.q.handle({ type: "queue_add", text: "fix it", next: true });
+  await settle(10);
+  assert.deepEqual(h.ran, ["fix it"], "the typed message runs; panel work still waits for Auto-Next");
+  assert.equal(h.state().questions.length, 1);
+  // typed again while a question is open (bridge path) -> it is the answer, and it runs
+  assert.ok(h.q.addTyped("the second box", { user: "chris", display: "Chris" }));
+  await h.q.advance("turn settled");
+  await settle(10);
+  assert.deepEqual(h.ran, ["fix it", "the second box"]);
+  assert.equal(h.state().questions.length, 0, "typing in the chat answers the open question");
+  assert.equal(h.state().items.find((i) => i.text === "queued work for later").status, "pending");
 });

@@ -65,6 +65,14 @@ const CATALOG = [
     desc: "Auto-credential - use stored IT Notebook logins without asking. Privileged rows still ask every time.",
   },
   {
+    name: "totp",
+    aliases: ["autototp", "auto-totp", "2fa", "mfa"],
+    kind: "switch",
+    switchKey: "totp",
+    usage: "/totp [on|off]",
+    desc: "Auto-TOTP - save new TOTP authenticators and use live TOTP codes to sign in without asking. The judge still reviews each save.",
+  },
+  {
     name: "email",
     aliases: ["customeremail", "customer-email", "mail"],
     kind: "switch",

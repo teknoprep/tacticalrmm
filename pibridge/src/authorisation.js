@@ -95,6 +95,25 @@ export function privilegedCredentialAuthorisation(techTurns) {
 // out-voted by something they said earlier; and a refusal ENDS the search rather than
 // skipping the line, so "don't use the admin account" cannot be overridden by an older
 // "get the admin password".
+// ADDING A TOTP CODE (helpdesk add_totp, gate kind "totp_write"). Its own test, because the
+// notebook test above needs the words "IT Notebook" and nobody says that when they mean
+// "put TOTP on every client" - which left a bulk enrolment job asking for a click per
+// company. Same shape as the others: the technician's own words authorise it, anything
+// else prompts, and a later "don't" cancels it.
+const TOTP_TARGET = String.raw`(?:totp|2fa|mfa|authenticator(?:\s+app)?|one[\s-]?time\s+(?:code|password)s?|otp)`;
+const TOTP_ACTION = String.raw`(?:add|create|set\s*up|setup|enrol+|register|configure|store|save|record|put|switch|move|update)`;
+const TOTP_MENTION = new RegExp(String.raw`\b${TOTP_TARGET}\b`, "i");
+const TOTP_ACTION_THEN_TARGET = new RegExp(String.raw`\b${TOTP_ACTION}\b[^.!?]{0,60}\b${TOTP_TARGET}\b`, "i");
+const TOTP_TARGET_THEN_ACTION = new RegExp(String.raw`\b${TOTP_TARGET}\b[^.!?]{0,40}\b${TOTP_ACTION}\b`, "i");
+const TOTP_NEGATED =
+  /\b(do ?n'?t|dont|do not|never|no need|hold off|not yet|don'?t yet|wait|just show|only show|show me|stop)\b[^.!?]{0,80}\b(add|creat|set\s*up|setup|enrol|regist|configur|stor|sav|record|put|switch|mov|updat)/i;
+
+/** @returns { at, text } of the technician's sentence that asked for TOTP codes to be added, or null */
+export function totpWriteAuthorisation(techTurns) {
+  return scanNewestFirst(techTurns, TOTP_MENTION, TOTP_NEGATED,
+    (line) => TOTP_ACTION_THEN_TARGET.test(line) || TOTP_TARGET_THEN_ACTION.test(line));
+}
+
 function scanNewestFirst(techTurns, mentions, negated, matches) {
   if (!Array.isArray(techTurns)) return null;
   for (let i = techTurns.length - 1; i >= 0; i--) {

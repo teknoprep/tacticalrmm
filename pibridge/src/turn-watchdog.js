@@ -104,9 +104,26 @@ export function makeTurnWatchdog({
 
     if (quietMs !== null) {
       const elapsedMs = liveness.elapsedMs?.() ?? 0;
-      if (quietMs > deadStreamMs) {
-        silentFor = Math.round(quietMs / 1000);
-        reason = `no bytes from the provider for ${silentFor}s ` +
+      // TOOL TIME IS NOT PROVIDER SILENCE (2026-09-30). `quietMs` is the time since the last
+      // byte from the provider - and while a tool runs there is no provider stream at all.
+      // The check above skips while the tool is in flight, but the FIRST check after it
+      // ends used to find "no bytes for <whole tool runtime>" and abort a healthy turn:
+      // 52 of the 56 stall aborts logged 2026-09-25..30 fired 0-50s after a tool returned,
+      // each one throwing the turn away, re-running (and re-paying for) it, and leaving a
+      // "Request was aborted" in the chat. Silence is measured from whichever is later:
+      // the last byte, or the last agent event (tool_execution_end is one).
+      const sinceEventMs = Date.now() - Math.max(lastActivityAt() || 0, baselineAt);
+      const quiet = Math.min(quietMs, sinceEventMs);
+      // No response open = the next request has been sent and the provider has not started
+      // answering. On a large context that first byte can legitimately take over a minute,
+      // so it gets the (wider) event budget, not the missed-heartbeat rule.
+      const awaitingFirstByte = (liveness.openStreams ?? 1) === 0;
+      const limitMs = awaitingFirstByte ? Math.max(deadStreamMs, budgetMs || 0) : deadStreamMs;
+      if (quiet > limitMs) {
+        silentFor = Math.round(quiet / 1000);
+        reason = (awaitingFirstByte
+          ? `provider has not started answering after ${silentFor}s `
+          : `no bytes from the provider for ${silentFor}s `) +
                  `(${liveness.bytes}B in ${liveness.chunks} chunks this turn) - stream is dead`;
       } else if (maxTurnMs > 0 && elapsedMs > maxTurnMs) {
         silentFor = Math.round(elapsedMs / 1000);

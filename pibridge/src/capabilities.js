@@ -45,7 +45,7 @@ export const NAME_DEFAULTS = {
   get_ticket: "read", get_ticket_stages: "read", list_open_tickets: "read",
   list_closed_tickets: "read", find_company: "read", resolve_customer: "read",
   resolve_client_by_domain: "read", check_support_authorization: "read",
-  get_kb_article: "read", list_kb_articles: "read", get_global_kb: "read",
+  get_kb_article: "read", list_kb_articles: "read", get_global_kb: "read", search_kb: "read",
   // create
   create_ticket: "create", submit_report: "create",
   // note
@@ -59,6 +59,7 @@ export const NAME_DEFAULTS = {
   reply_to_ticket: "customer",
   // secret  (customer credentials - decision window only, always prompts)
   get_partner_credentials: "secret", get_credentials: "secret", read_secure_notes: "secret",
+  get_totp_code: "secret", list_totp: "read", add_totp: "secret_write",
   // secret_write  (RECORDING a credential / IT Notebook row - decision window only, and
   // only on a technician's instruction or an approval click). Named defaults are a
   // convenience for conventional names; a deployment that calls it something else must

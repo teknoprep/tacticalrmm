@@ -28,6 +28,7 @@
 import {
   newPresence, join, leave, canDrive as presenceCanDrive, isOwner,
   requestTakeover, markPending, respondTakeover, presenceFrame, CONSENT_TIMEOUT_MS,
+  grantSeat, revokeSeatGrant, seatRoster,
 } from "./live-presence.js";
 
 export const LIVE = new Map(); // key -> hub
@@ -88,6 +89,25 @@ export function liveKey(scope, sessionId) {
  * @param {function} o.onDispose  tear the AI session down (abort, dispose, queue.detach...)
  * @param {function} [o.onOwnerChange] (ownerIdentOrNull, reason) -> void
  */
+/**
+ * The approvals a session is waiting on: id -> resolve, plus `.asks` (id -> the question).
+ *
+ * A REFRESH MUST NOT EAT AN APPROVAL (2026-09-30, TICKET/62044 11:06). Only the resolver used
+ * to be kept, so a window that reloaded while "approve this?" was on screen came back without
+ * it - and the tool call waited for an answer nobody could give, the turn hung. The question
+ * is kept with it and re-sent to every socket that attaches (see replayState).
+ */
+export function makePendingApprovals() {
+  const m = new Map();
+  m.asks = new Map();
+  const del = m.delete.bind(m);
+  const clr = m.clear.bind(m);
+  m.delete = (k) => { m.asks.delete(k); return del(k); };
+  m.clear = () => { m.asks.clear(); clr(); };
+  m.replayFrames = () => [...m.asks].map(([id, summary]) => ({ type: "approval_request", id, summary }));
+  return m;
+}
+
 export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}, aliases = [] }) {
   const sockets = new Set();
   // ALIASES: every key that refers to THIS conversation. A session resumed from disk gets a
@@ -136,7 +156,9 @@ export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}
       for (const provide of this.stateProviders) {
         let frame;
         try { frame = provide(); } catch { frame = null; }
-        if (frame) this.sendTo(ws, frame);
+        // A provider may hand back several frames (e.g. every approval still waiting).
+        if (Array.isArray(frame)) for (const f of frame) { if (f) this.sendTo(ws, f); }
+        else if (frame) this.sendTo(ws, frame);
       }
       // ...and the part of the CURRENT turn that already happened (see noteTurnEvent).
       for (const frame of turnBuffer) {
@@ -295,6 +317,34 @@ export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}
       return r;
     },
 
+    /**
+     * HAND THE SEAT TO A NAMED PERSON (owner, 2026-09-27). The driver can give control back
+     * to someone they took it from - no take-over request, no consent prompt, and no need for
+     * that person to hold can_take_over_ai_session. Attached right now: they drive at once and
+     * the previous driver drops to read-only. Not attached: a single-use grant, honoured the
+     * moment they next attach. Only usernames that have been in this session are accepted.
+     */
+    grantDrive(ws, username) {
+      const r = grantSeat(presence, ws, username);
+      if (r.ok) {
+        log?.(r.promoted ? "live_seat_given" : "live_seat_granted_offline", key, r.username,
+             r.promoted ? "now driving" : "will drive when they next attach");
+        onOwnerChange(presence.owner, `seat handed to ${r.display || r.username}`);
+        hub.broadcastPresence();
+      }
+      return r;
+    },
+
+    /** Take back a grant that has not been used yet. */
+    dropGrant(ws, username) {
+      const r = revokeSeatGrant(presence, ws, username);
+      if (r.ok) { log?.("live_seat_grant_revoked", key, r.username); hub.broadcastPresence(); }
+      return r;
+    },
+
+    /** Who has the seat, who is watching, who has had access. */
+    roster() { return seatRoster(presence); },
+
     dispose(reason) {
       if (disposed) return;
       disposed = true;
@@ -313,7 +363,7 @@ export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}
 
 /** Frames that DRIVE the session. Everything else (queue_history, takeover...) is a viewer's right. */
 export const DRIVING_FRAMES = new Set([
-  "prompt", "steer", "abort", "approve", "deny", "compact",
+  "prompt", "steer", "abort", "approve", "deny", "compact", "compact_cancel",
   "set_autoapprove", "set_readonly", "set_model", "set_group", "set_label",
   "set_autocredential", "set_allow_email",
   "queue_add", "queue_edit", "queue_remove", "queue_run_next", "queue_set_auto",

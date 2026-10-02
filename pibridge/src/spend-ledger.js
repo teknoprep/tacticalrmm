@@ -158,6 +158,7 @@ export function attachSpendLedger(session, ctx = {}) {
     ledger: ledgerSink(log),
     context: {
       surface: ctx.surface || "other",
+      role: ctx.role || "",
       actorUsername: ctx.actorUsername || "",
       agentId: ctx.agentId || "",
       agentHostname: ctx.agentHostname || "",
@@ -170,6 +171,7 @@ export function attachSpendLedger(session, ctx = {}) {
     if (event?.type === "message_end" && event.message?.role === "assistant") {
       // record() ignores messages with no usage (user turns, tool results, aborts).
       meter.record(event.message);
+      try { ctx.parentMeter?.absorb?.(event.message, ctx.role || "specialist"); } catch { /* the chip must not break the coder */ }
     }
   });
   return () => { try { unsubscribe(); } catch { /* already gone */ } };

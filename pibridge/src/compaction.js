@@ -26,6 +26,10 @@
 
 /** Compaction has an LLM call of its own, so it is not free. Below this, don't bother. */
 export const MIN_TOKENS_TO_COMPACT = 20000;
+// A summary that has not finished in this long is abandoned (owner, 2026-09-30: TICKET/60765
+// sat behind the "Summarizing" overlay for 5+ minutes on a slow model with no way out).
+// Nothing is lost - an abandoned compaction leaves the conversation exactly as it was.
+export const COMPACT_TIMEOUT_MS = Math.max(30000, Number(process.env.PI_COMPACT_TIMEOUT_MS || 0) || 5 * 60 * 1000);
 
 /**
  * Is compacting this session worth doing right now?
@@ -102,15 +106,21 @@ export async function runCompaction(session, { reason = "requested", instruction
   }
   const started = Date.now();
   const steer = handoffInstructions(instructions);
+  // The model that writes the summary (the group summarizer, swapped in just before this).
+  const summarizer = session.model ? { provider: session.model.provider, id: session.model.id, name: session.model.name || session.model.id } : null;
   try {
     const res = await session.compact(steer);
     const before = Number(res?.tokensBefore || 0);
     // estimatedTokensAfter is the harness's own estimate; it is not always present.
     const after = Number(res?.estimatedTokensAfter || 0);
     const saved = before && after ? Math.max(0, before - after) : 0;
+    // What the summary call itself cost, as the provider billed it (pi puts the priced
+    // usage on the compaction result). Shown under the summary in the window.
+    const summaryCost = Number(res?.usage?.cost?.total);
     log?.("compacted", key, sessionId,
       `${reason}: ${before.toLocaleString("en-US")} -> ${after ? after.toLocaleString("en-US") : "?"} tokens ` +
       `in ${Math.round((Date.now() - started) / 1000)}s` +
+      (Number.isFinite(summaryCost) ? ` cost=$${summaryCost.toFixed(4)} via ${summarizer ? `${summarizer.provider}/${summarizer.id}` : "?"}` : "") +
       (steer ? ` note=${JSON.stringify(String(instructions).trim().slice(0, 80))}` : ""));
     return {
       ok: true,
@@ -119,6 +129,8 @@ export async function runCompaction(session, { reason = "requested", instruction
       saved,
       summary: String(res?.summary || ""),
       usage: res?.usage || null,
+      summaryCost: Number.isFinite(summaryCost) ? summaryCost : null,
+      summarizer,
     };
   } catch (e) {
     const why = String(e?.message || e);
@@ -169,10 +181,24 @@ export function makeCompactCommand({
   prepareSummarizer = null,
   restoreAfter = null,
 }) {
+  // CANCEL (owner, 2026-09-30). The one compaction in flight, so the window's Cancel button and
+  // the time limit can stop it. session.abortCompaction() is the harness's own abort; the
+  // summary is only written back when it completes, so stopping it changes nothing.
+  let active = null;
+  const abortActive = (why) => {
+    if (!active || active.stop) return false;
+    active.stop = why;
+    try { session?.abortCompaction?.(); } catch { /* not compacting yet, or already done */ }
+    log?.("compact_cancel", key, sessionId, why);
+    return true;
+  };
   return {
     isCommand: (text) => parseCompactCommand(text) !== null,
+    /** Stop the running summary. Returns false when none is running. */
+    cancel(by = "the technician") { return abortActive(`cancelled by ${by}`); },
+    get running() { return !!active; },
 
-    async run(text, { reason = "technician asked", clear = false, instructions } = {}) {
+    async run(text, { reason = "technician asked", clear = false, instructions, note = "" } = {}) {
       const parsed = parseCompactCommand(text) || {};
       if (instructions !== undefined && instructions !== null && String(instructions).trim()) {
         parsed.instructions = String(instructions).trim();
@@ -210,17 +236,29 @@ export function makeCompactCommand({
         type: "working", elapsed_ms: 0, quiet_ms: 0, alive: true, last_byte_ms: null,
         bytes: 0, tools_in_flight: 0,
         note: "Compacting the conversation...",
+        // For the window's blocking overlay: why, and how much is being summarized.
+        compact_reason: reason,
+        compact_auto: !!note,
+        compact_tokens: before,
+        compact_clear: !!clear,
       });
 
       // Compaction is itself an LLM call, so run it inside the liveness context - it is
       // exactly the kind of long quiet request the stall watchdog used to kill.
       let res;
+      const run = active = { stop: "" };
+      const limit = setTimeout(() => {
+        if (active === run) abortActive(`stopped after ${Math.round(COMPACT_TIMEOUT_MS / 60000)} minutes without finishing`);
+      }, COMPACT_TIMEOUT_MS);
       try {
-        if (typeof prepareSummarizer === "function") await prepareSummarizer();
-        res = await inTurn(() => runCompaction(session, {
+        if (typeof prepareSummarizer === "function") await prepareSummarizer({ tokens: before });
+        // Cancelled while the summarizer model was being switched in: do not start it.
+        res = run.stop ? { ok: false, error: run.stop } : await inTurn(() => runCompaction(session, {
           reason, instructions: parsed.instructions, log, key, sessionId,
         }));
       } finally {
+        clearTimeout(limit);
+        if (active === run) active = null;
         if (typeof restoreAfter === "function") {
           try { await restoreAfter(); } catch (e) {
             log?.("compact_restore_error", key, sessionId, String(e?.message || e).slice(0, 200));
@@ -228,6 +266,14 @@ export function makeCompactCommand({
         }
       }
 
+      if (!res.ok && run.stop) {
+        send({
+          type: "error",
+          message: `Summary ${run.stop}. Nothing was changed - the conversation is exactly as it was, ` +
+            `and your next message runs with the full history.`,
+        });
+        return { ...res, cancelled: true, trimmed: trimmed.trimmed };
+      }
       if (!res.ok) {
         // "Nothing to compact (session too small)" from the harness means there is no cut
         // point it is willing to use - NOT that the conversation is small. Saying "too
@@ -277,13 +323,19 @@ export function makeCompactCommand({
         tokens_after: after,
         saved: res.saved,
         detail,
-        message: cleared
+        auto: !!note,
+        // Cost of producing this summary (the summarizer call only - not the later turns).
+        summary_cost: res.summaryCost,
+        summary_tokens_in: Number(res.usage?.input || 0) + Number(res.usage?.cacheRead || 0) + Number(res.usage?.cacheWrite || 0),
+        summary_tokens_out: Number(res.usage?.output || 0),
+        summarizer: res.summarizer?.name || "",
+        message: (note ? note + " " : "") + (cleared
           ? `Conversation summarised and history cleared: ${detail || `${res.tokensBefore.toLocaleString("en-US")} tokens summarised`}. ` +
             `Pi keeps working from the summary in this same window; the full transcript is ` +
             `still on disk and in AI History.`
           : `Conversation compacted: ${detail || `${res.tokensBefore.toLocaleString("en-US")} tokens summarised`}. ` +
             `Everything above is still readable here; the model now starts from a summary, so ` +
-            `following turns cost far less.`,
+            `following turns cost far less.`),
       });
       // Refresh the meter so the header stops showing the pre-compaction size.
       if (costMeter?.snapshot) send(costMeter.snapshot());

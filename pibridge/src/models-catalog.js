@@ -76,13 +76,109 @@ async function fetchProviderModels(prov) {
     groq: "https://api.groq.com/openai/v1",
     mistral: "https://api.mistral.ai/v1",
   };
-  const root = base || defaults[name];
+  // NATIVE PI PROVIDERS (2026-09-27): with no base_url typed in, use the endpoint pi itself
+  // uses for this provider (passed in by buildCatalog), so any provider pi supports natively
+  // is discoverable without a hand-maintained table. Templated endpoints (Cloudflare's
+  // {ACCOUNT_ID}, Vertex's {location}) need real values, so those still ask for a base_url.
+  const nativeBase = String(prov.native_base_url || "").replace(/\/+$/, "");
+  const root = base || defaults[name] || (nativeBase && !nativeBase.includes("{") ? nativeBase : "");
   if (!root) return { error: `no base_url known for provider "${prov.name}" - set one to enable discovery` };
   const url = root.endsWith("/v1") || /\/v\d/.test(root) ? root + "/models" : root + "/v1/models";
   const { data, error } = await getJson(url, { Authorization: "Bearer " + key });
   if (error) return { error };
   const rows = data?.data || data?.models || [];
-  return { models: rows.map((m) => ({ id: m.id || m.name, name: m.name || m.display_name || m.id })).filter((m) => m.id) };
+  return {
+    models: rows.map((m) => {
+      const id = m.id || m.name;
+      if (!id) return null;
+      // xAI (and any gateway that copies its shape) publishes the rate card on the
+      // model itself. The unit is 1/10000 of a dollar per million tokens — 20000 is
+      // $2/M, which is exactly what pi's calculateCost expects in model.cost. We do
+      // not keep a price table: this is the provider's number, handed to pi.
+      const cost = providerCost(m);
+      return { id, name: m.name || m.display_name || id, ...(cost ? { cost } : {}) };
+    }).filter(Boolean),
+  };
+}
+
+function perMillion(raw) {
+  const n = Number(raw);
+  return Number.isFinite(n) ? n / 10000 : 0;
+}
+
+function providerCost(m) {
+  if (m?.prompt_text_token_price == null && m?.completion_text_token_price == null) return null;
+  const cost = {
+    input: perMillion(m.prompt_text_token_price),
+    output: perMillion(m.completion_text_token_price),
+    cacheRead: perMillion(m.cached_prompt_text_token_price),
+    cacheWrite: 0,
+  };
+  const above = Number(m.long_context_threshold);
+  if (Number.isFinite(above) && above > 0 && m.prompt_text_token_price_long_context != null) {
+    cost.tiers = [{
+      inputTokensAbove: above,
+      input: perMillion(m.prompt_text_token_price_long_context),
+      output: perMillion(m.completion_text_token_price_long_context ?? m.completion_text_token_price),
+      cacheRead: perMillion(m.cached_prompt_text_token_price_long_context ?? m.cached_prompt_text_token_price),
+      cacheWrite: 0,
+    }];
+  }
+  return cost;
+}
+
+function sameCost(a, b) {
+  return JSON.stringify(a || null) === JSON.stringify(b || null);
+}
+
+/**
+ * Write the provider's published rate card onto the model pi already prices with.
+ *
+ * pi's calculateCost is the only arithmetic. It reads model.cost. A model the
+ * installed package does not know (grok-4.7 yesterday, grok-4.8 the day it ships)
+ * is registered as a stub with no cost, calculateCost throws, and the zero
+ * placeholder that was allocated first is what we booked — a confident $0.00.
+ *
+ * This does not invent a price and it is not a table we maintain. On every catalog
+ * probe we copy the rate card the provider just returned into the two places pi
+ * reads: the stub's own `cost` (models the package does not know) and
+ * `modelOverrides` (so a bundled card that has gone stale is replaced without
+ * shadowing the rest of the built-in definition). A human never edits it.
+ */
+export function writeProviderCosts(providerName, published) {
+  const priced = (published || []).filter((m) => m.cost);
+  if (!priced.length || !fs.existsSync(MODELS_JSON)) return [];
+  let conf;
+  try { conf = JSON.parse(fs.readFileSync(MODELS_JSON, "utf-8")); }
+  catch { return []; }
+  if (!conf.providers || typeof conf.providers !== "object") conf.providers = {};
+  if (!conf.providers[providerName] || typeof conf.providers[providerName] !== "object") {
+    conf.providers[providerName] = {};
+  }
+  const pconf = conf.providers[providerName];
+  if (!Array.isArray(pconf.models)) pconf.models = [];
+  if (!pconf.modelOverrides || typeof pconf.modelOverrides !== "object") pconf.modelOverrides = {};
+  const changed = [];
+  for (const m of priced) {
+    const stub = pconf.models.find((row) => row && row.id === m.id);
+    if (stub && !sameCost(stub.cost, m.cost)) {
+      stub.cost = m.cost;
+      changed.push(m.id);
+    }
+    // Built-ins are not in the stub list. An override is the only way to refresh
+    // their card without replacing the whole definition (which would drop compat).
+    if (!stub && !sameCost(pconf.modelOverrides[m.id]?.cost, m.cost)) {
+      pconf.modelOverrides[m.id] = { ...(pconf.modelOverrides[m.id] || {}), cost: m.cost };
+      changed.push(m.id);
+    }
+  }
+  if (!Object.keys(pconf.modelOverrides).length) delete pconf.modelOverrides;
+  if (changed.length) {
+    const tmp = MODELS_JSON + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(conf, null, 2) + "\n");
+    fs.renameSync(tmp, MODELS_JSON);
+  }
+  return changed;
 }
 
 // ALIAS AWARENESS. Providers publish undated aliases that their /models endpoint does
@@ -112,11 +208,17 @@ export async function buildCatalog(providers, registry) {
   const live = {};
   for (const prov of providers || []) {
     const pname = prov.name;
-    const res = await fetchProviderModels(prov);
+    let nativeBase = "";
+    try { nativeBase = registry.raw?.getProvider?.(pname)?.baseUrl || ""; } catch { /* older runtime */ }
+    const res = await fetchProviderModels({ ...prov, native_base_url: nativeBase });
     if (res.error) errors[pname] = res.error;
     const provList = res.models || [];
     const provIds = new Set(provList.map((m) => m.id));
     live[pname] = [...provIds].sort();
+    // Refresh pi's rate cards from what the provider just published. A model released
+    // today arrives with a price; we do not wait for a package upgrade or a hand edit.
+    try { writeProviderCosts(pname, provList); }
+    catch (e) { errors[pname] = (errors[pname] ? errors[pname] + "; " : "") + `price sync: ${e?.message || e}`; }
 
     // Everything pi knows for this provider.
     const builtinIds = [...known.keys()]
@@ -130,6 +232,7 @@ export async function buildCatalog(providers, registry) {
       // When discovery failed we must not claim anything about provider liveness -
       // an outage would otherwise look like a mass retirement.
       const liveAtProv = res.error ? null : isLiveAtProvider(id, provIds);
+      const knownRow = known.get(`${pname}/${id}`);
       out.push({
         provider: pname,
         model_id: id,
@@ -137,6 +240,11 @@ export async function buildCatalog(providers, registry) {
         source: inBuiltin && inProvider ? "both" : inProvider ? "provider" : "builtin",
         usable: known.has(`${pname}/${id}`),
         live_at_provider: liveAtProv,
+        // null when pi does not know the model, so the settings UI does not invent a
+        // thinking level the runtime would clamp away.
+        thinking_levels: knownRow?.thinking_levels || null,
+        // What pi will charge per million tokens for this model; null = unpriced.
+        cost: knownRow?.cost || null,
       });
     };
     for (const m of provList) push(m.id, m.name, known.has(`${pname}/${m.id}`), true);
@@ -257,6 +365,7 @@ export async function registerModels(providers, registry, wanted) {
       if (!offered.has(id)) { skipped.push({ ...w, reason: "provider does not offer this id" }); continue; }
       if (registry.findModel(pname, id)) { skipped.push({ ...w, reason: "pi already knows this model" }); continue; }
       if (pconf.models.some((m) => m && m.id === id)) { skipped.push({ ...w, reason: "already in models.json" }); continue; }
+      const published = (res.models || []).find((row) => row.id === id);
       pconf.models.push({
         id,
         name: w.display_name || offered.get(id) || id,
@@ -267,6 +376,9 @@ export async function registerModels(providers, registry, wanted) {
         input: ["text", "image"],
         contextWindow: w.context_window || 200000,
         maxTokens: w.max_tokens || 64000,
+        // The provider's rate card, if it published one. Without this, pi's calculator
+        // has nothing to multiply and the turn is booked at $0.
+        ...(published?.cost ? { cost: published.cost } : {}),
         ...providerCompat(pname, id),
       });
       registered.push({ provider: pname, model_id: id, display_name: w.display_name || offered.get(id) || id });

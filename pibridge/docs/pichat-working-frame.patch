@@ -1,0 +1,66 @@
+diff --git a/src/views/PiChat.vue b/src/views/PiChat.vue
+index d6da271..6c3f7d7 100644
+--- a/src/views/PiChat.vue
++++ b/src/views/PiChat.vue
+@@ -682,6 +682,11 @@ export default {
+     const streamStartAt = ref(0);
+     const lastActivityAt = ref(0);
+     const nowTick = ref(Date.now());
++    // Liveness as MEASURED by the bridge at the provider socket, not inferred here.
++    // null = no transport signal available for this turn, so we fall back to the old
++    // time-based guess rather than pretending to know.
++    const liveAlive = ref(null);
++    const liveLastByteMs = ref(null);
+     let tickTimer = null;
+     function markActivity() {
+       lastActivityAt.value = Date.now();
+@@ -696,11 +701,25 @@ export default {
+         ? Math.floor((nowTick.value - lastActivityAt.value) / 1000)
+         : 0,
+     );
+-    // "stalled" = no events at all for 45s while supposedly working
+-    const stalled = computed(() => staleSec.value >= 45);
++    // "stalled" = the bridge measured the stream as dead. Quiet is NOT stuck: a model can
++    // spend minutes assembling one large tool call while its stream keeps heartbeating
++    // underneath (measured: 74,850ms between parsed events vs 14,474ms longest gap on the
++    // wire, because xAI sends `: keepalive` every 15s and SSE comments are dropped).
++    // Only with no measurement at all do we time events, and then patiently.
++    const stalled = computed(() => {
++      if (!streaming.value) return false;
++      if (liveAlive.value === true) return false;
++      if (liveAlive.value === false) return true;
++      return staleSec.value >= 240;
++    });
+     const workingText = computed(() => {
+       if (stalled.value)
+-        return `No response for ${staleSec.value}s — it may be stuck or the provider/device is slow. You can keep waiting or Stop.`;
++        return `No response from the provider for ${
++          liveLastByteMs.value != null ? Math.round(liveLastByteMs.value / 1000) : staleSec.value
++        }s — the connection looks dead. You can keep waiting or Stop.`;
++      // Quiet but confirmed alive: say so, so a long think does not read as a crash.
++      if (liveAlive.value === true && staleSec.value >= 20)
++        return `still working… (${elapsedSec.value}s) — composing a long answer, connection confirmed alive`;
+       return `working… (${elapsedSec.value}s)`;
+     });
+ 
+@@ -794,6 +813,8 @@ export default {
+         case "agent_start":
+           streaming.value = true;
+           streamStartAt.value = Date.now();
++          liveAlive.value = null;
++          liveLastByteMs.value = null;
+           markActivity();
+           break;
+         case "auto_retry_start":
+@@ -1016,6 +1037,11 @@ export default {
+               // is on the record, not just a toast that disappears.
+               messages.value.push({ role: "system", text: `\u26a0 ${m.message}` });
+               scrollToBottom();
++            } else if (m.type === "working") {
++              // The bridge measured the provider socket. Believe it over our own timers.
++              liveAlive.value = m.alive;
++              liveLastByteMs.value = m.last_byte_ms;
++              if (m.alive === true) markActivity();
+             } else if (m.type === "error") {
+               notifyError(m.message);
+               messages.value.push({ role: "system", text: `\u26a0 ${m.message}` });

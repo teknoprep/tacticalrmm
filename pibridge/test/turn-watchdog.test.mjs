@@ -234,7 +234,11 @@ test("a genuinely dead stream is caught, and faster than the old guess", async (
   const r = rig({ silentForever: false });
   const w = makeTurnWatchdog({
     session: r.session, recovery: r.recovery, log: (...a) => r.logs.push(a[0]),
-    lastActivityAt: () => Date.now(),             // events look recent; the wire is dead
+    // Events AND wire both silent for 61s. (Before 2026-09-30 this test used a fresh
+    // event with a dead wire - a shape a real stream cannot produce, because every agent
+    // event comes off that wire. What it CAN produce is a tool that just returned after
+    // minutes with no stream open, which is exactly what the old rule killed; see below.)
+    lastActivityAt: () => Date.now() - 61_000,
     liveness: livenessAt(61_000),
     deadStreamMs: 60_000, stallMs: 180_000,       // old rule would still be waiting
     timers: { setInterval: () => 1, clearInterval: () => {} },
@@ -298,4 +302,40 @@ test("an abort that fails is logged, and the re-run still happens", async () => 
   assert.equal(await r.watchdog.check(), true);
   assert.ok(r.logs.includes("turn_stall abort error"));
   assert.equal(r.session.continues, 1, "a failed abort must not lose the recovery");
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-30: tool runtime was being counted as provider silence. 52 of 56 stall aborts
+// in five days fired 0-50s after a tool returned.
+// ---------------------------------------------------------------------------
+
+test("a tool that just returned after minutes is NOT a dead stream", async () => {
+  const r = rig({ silentForever: false });
+  const w = makeTurnWatchdog({
+    session: r.session, recovery: r.recovery, log: () => {},
+    lastActivityAt: () => Date.now() - 800,        // tool_execution_end, under a second ago
+    liveness: livenessAt(300_000),                 // last provider byte was before the tool
+    deadStreamMs: 60_000, stallMs: 180_000,
+    timers: { setInterval: () => 1, clearInterval: () => {} },
+  });
+  assert.equal(await w.check(), false, "the tool's runtime is not the provider's silence");
+  assert.equal(r.session.aborts, 0);
+});
+
+test("waiting for the first byte of the next request gets the wider budget", async () => {
+  const waiting = (sinceEvent) => {
+    const r = rig({ silentForever: false });
+    const lv = { ...livenessAt(sinceEvent + 400_000), openStreams: 0 };
+    return { r, w: makeTurnWatchdog({
+      session: r.session, recovery: r.recovery, log: () => {},
+      lastActivityAt: () => Date.now() - sinceEvent,
+      liveness: lv, deadStreamMs: 60_000, stallMs: 180_000,
+      timers: { setInterval: () => 1, clearInterval: () => {} },
+    }) };
+  };
+  const slow = waiting(90_000);                    // big context, slow first token
+  assert.equal(await slow.w.check(), false, "90s to first byte is slow, not dead");
+  const dead = waiting(200_000);
+  assert.equal(await dead.w.check(), true, "past the event budget it is still caught");
+  assert.equal(dead.r.session.aborts, 1);
 });

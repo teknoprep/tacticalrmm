@@ -127,6 +127,9 @@ function sanitize(raw, autoClearDefault = true) {
       by: typeof it.by === "string" ? it.by.slice(0, ACTOR_MAX) : "",
       user: typeof it.user === "string" ? it.user.slice(0, ACTOR_MAX) : "",
       compact_first: !!it.compact_first,
+      // Typed in the chat while the assistant was busy: runs as soon as the turn settles,
+      // whatever Auto-Next says (see advance()).
+      next: !!it.next,
       status: STATUSES.has(it.status) ? it.status : "pending",
       added_at: it.added_at || null,
       started_at: it.started_at || null,
@@ -177,9 +180,14 @@ function sanitize(raw, autoClearDefault = true) {
 /** Prompt paragraph that tells the model the queue exists and how to stop it. */
 export function queuePromptSection() {
   return (
-    "\n\nQUESTIONS FOR THE OPERATOR: whenever you cannot continue without a decision or a piece " +
-    "of information from the operator, call pause_queue with the exact question (one call per " +
-    "question). It posts the question to the operator's Queue panel, where they answer it in a " +
+    "\n\nQUESTIONS FOR THE OPERATOR: call pause_queue when you genuinely cannot continue without " +
+    "a decision or a piece of information the operator has. BEFORE you do, check whether the " +
+    "ticket, this conversation, the IT Notebook / knowledge base or a read-only probe already " +
+    "answers it - if it does, use that and keep working. Never ask again for something the " +
+    "operator has already answered or approved in this conversation. Put EVERYTHING you need " +
+    "into ONE call, as a short numbered list: one call per question means several cards and " +
+    "several pauses for the same thing, and each one has to be cleared before the queue runs " +
+    "again. It posts the question to the operator's Queue panel, where they answer it in a " +
     "form, and it holds any queued follow-up prompts until they do. Still state the question " +
     "in your reply as well. Do not call it when you have simply finished; do not call it for " +
     "rhetorical or optional offers (\"want me to also...\")."
@@ -230,6 +238,8 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       auto_clear_done: st.auto_clear_done,
       paused: st.paused,
       running_id: runningId,
+      // The run in flight when no QUEUE item owns it (a prompt typed in the chat).
+      working_on: runningId ? null : workingOn,
       pending,
       items: st.items.map(({ pending_question, ...i }) => ({ ...i })),
       questions: st.questions.map((q) => ({ ...q })),
@@ -283,12 +293,48 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     if (st.history.length > QUEUE_MAX_HISTORY) st.history.splice(0, st.history.length - QUEUE_MAX_HISTORY);
   }
 
+  /**
+   * WHAT THE CURRENT RUN IS WORKING ON (owner, 2026-09-27).
+   *
+   * The Queue panel listed only QUEUED prompts, and the running one was tracked by `runningId` -
+   * so when the technician typed (or answered) in the CHAT, there was no item at all and the panel
+   * showed nothing while the assistant worked. The client asked "what is being worked on is still
+   * not in the queue". Every run goes through runPrompt(), so the text is recorded here regardless
+   * of origin and published as `working_on` until a queue item takes over.
+   */
+  let workingOn = null;         // { text, origin, at } for the run in flight
+
+  function noteRun(text, origin = "browser") {
+    const t = String(text || "").trim();
+    workingOn = t ? { text: t.slice(0, 4000), origin, at: now() } : null;
+    publish();
+  }
+
+  function clearRun() {
+    if (!workingOn) return;
+    workingOn = null;
+    publish();
+  }
+
   function pause(reason, by = "system", actor = null) {
     if (st.paused && !(by === "assistant" && st.paused.by === "assistant")) return;
     const who = actorOf(actor);
     st.paused = { reason: String(reason || "paused").slice(0, 1000), at: now(), by, who: who ? who.display : "" };
     log?.("queue_paused", key(), `${who ? who.display : by}: ${st.paused.reason.slice(0, 200)}`);
     if (by !== "assistant") record("paused", { text: st.paused.reason, detail: `by ${who ? who.display : by}`, actor: who });
+  }
+
+  // RESUME AFTER STOP (owner, 2026-09-26: "resume doesn't allow resume after a stop, I have
+  // to requeue the prompt first"). Stop marks the running item failed and pauses; Resume
+  // only ever looked for PENDING items, so there was nothing to resume. It now re-runs the
+  // item Stop (or a provider error) interrupted, told to pick up where it left off.
+  let lastInterruptedId = null;
+  const RESUME_NOTE =
+    "[Resumed by the technician after a Stop] Continue this from where you were stopped. " +
+    "Do not redo steps that already completed - check what was done, then carry on:\n\n";
+  function interruptedItem() {
+    const it = lastInterruptedId && st.items.find((i) => i.id === lastInterruptedId);
+    return it && it.status === "failed" ? it : null;
   }
 
   function nextPending() {
@@ -378,8 +424,22 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
    */
   async function advance(trigger = "") {
     if (detached || engineBusy) return false;
-    if (!st.auto_next || st.paused) return false;
     if (typeof isStreaming === "function" && isStreaming()) return false;
+    // A MESSAGE TYPED WHILE THE ASSISTANT WAS BUSY RUNS NEXT (2026-09-30). It is the
+    // operator talking in the chat, not queued work: it used to steer the running turn, and
+    // when it moved to the queue it was held behind Auto-Next (off on most tickets) and
+    // behind the assistant's own question - so it sat "pending" forever and would have run
+    // later, out of context (TICKET/61934, 10:56). It runs now, and like any chat message it
+    // counts as the operator's reply to an open question.
+    const typedNext = st.items.find((i) => i.status === "pending" && i.next);
+    if (typedNext) {
+      if (trigger) log?.("queue_advance", key(), `${trigger} (typed while busy)`);
+      queue.noteOperatorReply(typedNext.text, typedNext.user ? { user: typedNext.user, display: typedNext.by } : null);
+      await runItem(typedNext);
+      setImmediate(() => { advance("chain").catch(() => {}); });
+      return true;
+    }
+    if (!st.auto_next || st.paused) return false;
     const item = nextPending();
     if (!item) return false;
     if (trigger) log?.("queue_advance", key(), trigger);
@@ -577,6 +637,48 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       return item.id;
     },
 
+    /**
+     * PUT A TYPED PROMPT ON THE QUEUE.
+     *
+     * Called when the operator sends a message while the assistant is still busy. Before
+     * this, that message went straight to session.prompt() and - in the window where the
+     * harness is between runs (post-turn recovery, stall-continue, the queue chaining the
+     * next item) but the agent still holds its active run - the SDK threw its raw
+     * "Agent is already processing a prompt. Use steer() or followUp() to queue messages,
+     * or wait for completion." and the operator's words were LOST.
+     *
+     * The queue is the one place that knows how to wait, so the words are kept exactly as
+     * typed and run when the current turn settles. Returns the new item id ("" if it could
+     * not be queued).
+     */
+    addTyped(text, actor = null, images = []) {
+      const body = String(text || "").trim().slice(0, QUEUE_MAX_TEXT);
+      if (!body) return "";
+      if (st.items.length >= QUEUE_MAX_ITEMS) {
+        send({ type: "error", message: `The queue is full (${QUEUE_MAX_ITEMS} items). Clear finished items first.` });
+        return "";
+      }
+      const who = actorOf(actor);
+      const item = {
+        id: randomUUID(), text: body, compact_first: false, status: "pending", next: true,
+        added_at: now(), started_at: null, ended_at: null, note: "", thread: [],
+        by: who ? who.display : "", user: who ? who.user : "", attachments: [],
+      };
+      if ((images || []).length) {
+        try {
+          fs.writeFileSync(attachPath(root, scopeKey, sessionId, item.id), JSON.stringify(images));
+          item.images = images.length;
+        } catch (e) {
+          item.images = 0;
+          item.note = "images could not be stored: " + String(e?.message || e).slice(0, 120);
+        }
+      }
+      st.items.push(item);
+      record("added", { text: body, detail: "typed while the assistant was busy", item, actor: who });
+      publish();
+      return item.id;
+    },
+
     /** The typed turn finished (or died). Settles the item the chat was running. */
     settleTypedItem(id, ok, note = "") {
       if (!id) return;
@@ -625,6 +727,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       if (!st.auto_next && !runningId) return;
       const who = actorOf(actor);
       const it = st.items.find((i) => i.id === runningId);
+      if (it) lastInterruptedId = it.id;
       // The STOP belongs to whoever pressed it, which is not necessarily the person whose
       // prompt was running - that is exactly the kind of thing an admin is looking for.
       if (it) { it.status = "failed"; it.note = `stopped by ${who ? who.display : "operator"}`; record("stopped", { text: it.text, detail: `by ${who ? who.display : "operator"}`, item: it, actor: who }); }
@@ -636,10 +739,14 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     noteError(why) {
       if (!st.auto_next && !runningId) return;
       const it = st.items.find((i) => i.id === runningId);
+      if (it) lastInterruptedId = it.id;
       if (it) { it.status = "failed"; it.note = String(why || "error").slice(0, 300); record("failed", { text: it.text, detail: String(why || "error"), item: it }); }
       pause(`Provider error: ${String(why || "unknown").slice(0, 300)}`, "system");
       publish();
     },
+
+    noteRun,
+    clearRun,
 
     /** Model asked to stop (pause_queue tool). Returns the tool's reply text. */
     pauseByModel(raw) {
@@ -715,6 +822,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           }
           const added = {
             id: randomUUID(), text, compact_first: !!msg.compact_first, status: "pending",
+            next: msg.next === true,
             added_at: now(), started_at: null, ended_at: null, note: "", thread: [],
             // Stamped now, so when this runs in an hour the history still knows whose
             // work it was (see sanitize()).
@@ -781,15 +889,23 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           if (!st.questions.length) st.paused = null;   // the answer is what the pause was waiting for
           const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
           rec("answered", { text: q.text, detail: text, item: it });
+          // THE ANSWER TRAVELS WITH ITS QUESTION (2026-09-30). "yes" / "ok that works" on
+          // its own is what reached the judge's TECHNICIAN SAID list, so it refused the very
+          // step the technician had just approved ("the technician only said..."). Quoting
+          // the question makes the approval legible to every reviewer downstream.
+          const qText = String(q.text || "").replace(/\s+/g, " ").trim();
+          const said = qText
+            ? `(Answering your question: "${qText.length > 400 ? qText.slice(0, 400) + "..." : qText}")\n${text}`
+            : text;
           if (it) {
             it.thread.push({ role: "operator", text, at: now(), by: who ? who.display : undefined });
-            await runItem(it, text, { isReply: true });
+            await runItem(it, said, { isReply: true });
           } else {
             engineBusy = true;
             publish();
             try {
               send({ type: "queue_started", id: null, text, reply: true });
-              await runPrompt(text);
+              await runPrompt(said);
             } catch (e) {
               pause(`answer failed: ${String(e?.message || e).slice(0, 200)}`);
             } finally {
@@ -870,11 +986,28 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           // work sat there pending with no way to start it but a second, differently
           // named button. Pressing Resume IS the instruction to continue, whatever
           // Auto-Next is set to.
+          // A Stop is still unwinding for a moment after the click: wait for it (max 15s).
+          for (let i = 0; i < 30 && (engineBusy || (typeof isStreaming === "function" && isStreaming())); i++) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+          // What Stop interrupted goes first - that is what "resume" means.
+          const again = interruptedItem();
+          if (again && !engineBusy && !(typeof isStreaming === "function" && isStreaming())) {
+            lastInterruptedId = null;
+            again.status = "pending";
+            again.note = "";
+            rec("retried", { text: again.text, detail: "resumed after Stop" });
+            await runItem(again, RESUME_NOTE + again.text);
+            setImmediate(() => { advance("chain").catch(() => {}); });
+            break;
+          }
           if (!(await advance("resume"))) {
             const item = nextPending();
             if (item && !engineBusy && !(typeof isStreaming === "function" && isStreaming())) {
               await runItem(item);
               setImmediate(() => { advance("chain").catch(() => {}); });
+            } else if (!item) {
+              send({ type: "system_note", text: "Nothing to resume - the queue is empty. Type what the AI should do next." });
             }
           }
           break;

@@ -340,3 +340,36 @@ test("the harness giving up stands down the stall path too", () => {
   r.noteWatchdogStall(208);
   assert.equal(r.consider(watchdogAbort), false);
 });
+
+// 2026-09-30, TICKET/62044: xAI "at capacity" was logged "will re-run silently", then the
+// fallback path found no backup model and returned false with no retry and no word.
+const capacity = { ...xaiBlank, errorMessage: "The model is currently at capacity due to high demand. Please try again in a few minutes" };
+const fakeSession = () => {
+  const s = { continues: 0, agent: { state: { messages: [{ role: "user" }, capacity] }, continue: async () => { s.continues++; } } };
+  return s;
+};
+
+test("capacity with NO backup model retries the same model instead of dying silently", async () => {
+  const logs = [];
+  const r = makeLlmRecovery({ log: (...a) => logs.push(a.join(" ")), baseDelayMs: 0, onPermanentFailure: async () => null });
+  r.beginTurn();
+  assert.equal(r.consider(capacity), true);
+  const s = fakeSession();
+  assert.equal(await r.run(s), true, "a re-run was actually performed");
+  assert.equal(s.continues, 1);
+  assert.ok(logs.some((l) => l.includes("llm_fallback_unavailable") && l.includes("retrying the same model")));
+  // It fails again: one more plain retry, then the budget is spent and the tech is told.
+  assert.equal(r.consider(capacity), true);
+  assert.equal(await r.run(fakeSession()), true);
+  assert.equal(r.consider(capacity), false, "budget exhausted - surface the error");
+});
+
+test("a permanent refusal with no backup model is logged, not silently dropped", async () => {
+  const logs = [];
+  const r = makeLlmRecovery({ log: (...a) => logs.push(a.join(" ")), baseDelayMs: 0, onPermanentFailure: async () => null });
+  r.beginTurn();
+  const quota = { ...xaiBlank, errorMessage: "insufficient_quota: you exceeded your current quota" };
+  assert.equal(r.consider(quota), true, "offered to the backup path");
+  assert.equal(await r.run(fakeSession()), false);
+  assert.ok(logs.some((l) => l.includes("not transient - not retrying")));
+});

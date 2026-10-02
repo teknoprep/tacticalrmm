@@ -93,7 +93,9 @@ export const trmm = {
       { timeoutMs: (timeout + 30) * 1000, ...opts },
     ),
   // Run a saved script by pk. TRMM: POST /agents/<id>/runscript/
-  runScript: (agentId, { script, args = [], timeout = 90, output = "wait" }, opts) =>
+  // TRMM's run_script view reads run_as_user and env_vars unconditionally (KeyError -> 500
+  // when absent), so they are always sent.
+  runScript: (agentId, { script, args = [], timeout = 90, output = "wait", env_vars = [], run_as_user = false }, opts) =>
     req(
       "POST",
       `/agents/${agentId}/runscript/`,
@@ -102,10 +104,12 @@ export const trmm = {
         args,
         timeout,
         output,
+        env_vars,
+        run_as_user,
       },
       { timeoutMs: (timeout + 30) * 1000, ...opts },
     ),
-  listScripts: (opts) => req("GET", `/scripts/`, null, opts),
+  listScripts: (opts = {}) => req("GET", `/scripts/${opts.query ? "?" + opts.query : ""}`, null, opts),
   listProcesses: (agentId, opts) => req("GET", `/agents/${agentId}/processes/`, null, opts),
   killProcess: (agentId, pid, opts) =>
     req("DELETE", `/agents/${agentId}/processes/${pid}/`, null, opts),
@@ -164,6 +168,9 @@ export const trmm = {
     req("GET", `/core/ai/device-note/?agent_id=${encodeURIComponent(agentId)}`, null, opts),
   // Link an Odoo company (domain/name) + optional requester username to the RMM
   // client and the user's device(s). (TRMM: POST /core/ai/resolve-devices/)
+  // Every RMM client with site/device counts and totals. TRMM: GET /core/ai/rmm-clients/
+  listClients: ({ query } = {}, opts) =>
+    req("GET", `/core/ai/rmm-clients/${query ? `?q=${encodeURIComponent(query)}` : ""}`, undefined, opts),
   resolveDevices: ({ domain, company_name, username, person_name, hostname }, opts) =>
     req("POST", `/core/ai/resolve-devices/`, { domain, company_name, username, person_name, hostname }, opts),
   // Schedule a future AI action (runs once at run_at). TRMM: POST /core/ai/schedule-action/

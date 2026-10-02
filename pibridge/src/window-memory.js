@@ -77,7 +77,27 @@ export function rememberSwitch(scopeKey, name, value, by = "") {
 // FINISHED queue item disappears from the list) and it defaults ON, so it is recalled
 // through recallSwitch() rather than chooseSwitches(). It is in this list because
 // rememberSwitch() refuses to store a name it does not know.
-export const SWITCHES = ["write", "auto_approve", "auto_credential", "allow_email", "auto_clear"];
+export const SWITCHES = ["write", "auto_approve", "auto_credential", "allow_email", "auto_clear", "auto_summarize"];
+
+// Per-window NUMBERS (not on/off). Same rule as auto_clear: no permission attached, a
+// default applies until someone changes it in THIS window, and then that window keeps it.
+export const VALUES = ["auto_summarize_tokens"];
+
+export function rememberValue(scopeKey, name, value, by = "") {
+  if (!scopeKey || !VALUES.includes(name)) return;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return;
+  const rec = readRecord(scopeKey);
+  rec.values = { ...(rec.values || {}), [name]: n };
+  rec.by = by || rec.by || "";
+  rec.at = new Date().toISOString();
+  writeRecord(scopeKey, rec);
+}
+
+export function recallValue(scopeKey, name, dflt) {
+  const v = (readRecord(scopeKey).values || {})[name];
+  return Number.isFinite(Number(v)) ? Number(v) : dflt;
+}
 
 /**
  * One remembered switch, for the ones that need no permission check.

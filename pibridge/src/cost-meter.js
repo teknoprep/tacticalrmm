@@ -67,6 +67,34 @@ export function cacheRewriteCost(model, contextTokens) {
  * @param {object}   [o.context]    - identity for ledger rows: {surface, actorUsername,
  *                                    agentId, agentHostname, client, site, ticketRef}
  */
+/**
+ * DESKTOP WORK ALREADY IN A TRANSCRIPT (owner, 2026-09-27).
+ *
+ * The meter is rebuilt with the session on every bridge restart and reconnect, and it derives
+ * desktop spend from the messages it sees - so a chat resumed mid-life would report $0.00 of
+ * desktop work however many screen actions it had already made. On TICKET/61884 (the chat that
+ * motivated the figure) that is ~15 actions. This walks the branch a session resumed and seeds
+ * the counters from the operator tool calls already in it; the billed cost of each such turn is
+ * on the assistant message itself.
+ *
+ * Session cost is deliberately untouched - hydrate()/record() own that number.
+ */
+export function seedDesktopFromBranch(branch, meter) {
+  let turns = 0, calls = 0, cost = 0;
+  for (const entry of Array.isArray(branch) ? branch : []) {
+    if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
+    const content = entry.message.content;
+    if (!Array.isArray(content)) continue;
+    const n = content.filter((c) => c?.type === "toolCall" && /^operator_/.test(String(c?.name || ""))).length;
+    if (!n) continue;
+    const c = Number(entry.message?.usage?.cost?.total || 0);
+    meter.noteDesktopTurn(c, Number(entry.message?.usage?.totalTokens || 0));
+    for (let i = 1; i < n; i++) meter.noteDesktopCall();
+    turns += 1; calls += n; cost += c;
+  }
+  return { turns, calls, cost };
+}
+
 export function makeCostMeter({
   send, visible, log, key, sessionId, contextWindow = 0, rateLookup = null,
   ledger = null, context = {},
@@ -76,6 +104,16 @@ export function makeCostMeter({
   // `pricingKnown` stays false otherwise so the UI can show "-" instead of lying.
   const spend = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const byModel = new Map();          // "provider/model_id" -> {turns, cost, cacheWrite}
+  // Which ROLE spent it (owner, 2026-09-26: "see which role was used for each agent"). One
+  // model can fill several roles (Luna = chat + summarizer + researcher; Opus 5 = judge +
+  // authorizer), so the model alone does not say what the money bought.
+  const byRole = new Map();           // "role|provider/model_id" -> {role, model, turns, cost}
+  const addRole = (role, modelKey, cost) => {
+    const k = `${role}|${modelKey}`;
+    const e = byRole.get(k) || { role, model: modelKey, turns: 0, cost: 0 };
+    e.turns += 1; e.cost += cost;
+    byRole.set(k, e);
+  };
   let pricingKnown = true;
   let sessionCost = 0;
   let turns = 0;
@@ -87,6 +125,15 @@ export function makeCostMeter({
   let ledgerTurnIndex = 0;
   let lastTurnCost = 0;
   let contextTokens = 0;
+  // DESKTOP OPERATIONS (owner, 2026-09-27). Driving the Operator desktop is not billed by the
+  // provider as a separate product - its cost IS the turns it consumes: every desktop tool call
+  // is a model call that re-reads the whole conversation, and the flaky ones ("the desktop
+  // changed since that screenshot; observe again") multiply that. TICKET/61884 spent ~15
+  // desktop calls and far more model turns on one mailbox grant that PowerShell would have done
+  // in one. Screenshots do NOT enter the model's context (operator tools return text), so this
+  // counter is about turns and their cost, not image tokens.
+  const desktop = { calls: 0, turns: 0, cost: 0, tokens: 0 };
+  const isDesktopCall = (name) => /^operator_/.test(String(name || ""));
   let nextSessionWarn = SESSION_COST_WARN;
   let lastModelKey = null;
   let modelSwitches = 0;
@@ -148,6 +195,22 @@ export function makeCostMeter({
       return meter.snapshot();
     },
 
+    /**
+     * Seed the DESKTOP counters from a transcript we just resumed. The meter is rebuilt on every
+     * bridge restart / reconnect, so without this a long chat would report $0.00 of desktop work
+     * even after 15 screen actions - the very ticket that motivated the figure (TICKET/61884).
+     * This deliberately does NOT touch session cost: hydrate()/record() own that number.
+     */
+    noteDesktopTurn(cost, totalTokens = 0) {
+      desktop.calls += 1;   // corrected by the caller when a turn made several calls
+      desktop.turns += 1;
+      desktop.cost += num(cost);
+      desktop.tokens += num(totalTokens);
+      return meter.snapshot();
+    },
+    /** One desktop action inside an already-counted turn (seed path only). */
+    noteDesktopCall() { desktop.calls += 1; return meter.snapshot(); },
+
     snapshot() {
       return {
         type: "cost_update",
@@ -161,6 +224,10 @@ export function makeCostMeter({
           ? Object.fromEntries(CLASSES.map((c) => [c, Number(spend[c].toFixed(6))]))
           : null,
         pricing_known: pricingKnown,
+        by_role: [...byRole.values()].map((v) => ({
+          role: v.role, model: v.model, turns: v.turns,
+          cost: Number(v.cost.toFixed(6)),
+        })).sort((a, b) => b.cost - a.cost),
         by_model: [...byModel.entries()].map(([model, v]) => ({
           model,
           turns: v.turns,
@@ -170,6 +237,13 @@ export function makeCostMeter({
         model_switches: modelSwitches,
         switch_spend: pricingKnown ? Number(switchSpend.toFixed(6)) : null,
         context_tokens: contextTokens,
+        // What the desktop operations in THIS conversation have cost (turns + calls).
+        desktop: {
+          calls: desktop.calls,
+          turns: desktop.turns,
+          cost: Number(desktop.cost.toFixed(6)),
+          context_tokens: desktop.tokens,
+        },
         context_window: contextWindow || 0,
         // Lifetime spend for the device/ticket this chat belongs to. `null` when we
         // could not read the ledger, so the UI can stay silent instead of showing $0.
@@ -243,10 +317,53 @@ export function makeCostMeter({
      * permanently marked the session's pricing unknown, which blanked the meter's
      * per-class split. Ignore anything with no usage.
      */
+    /**
+     * A specialist (the coder) bills its own ledger row. That must also move THIS
+     * window's meter, or the technician sees the coder run and the grok-build count
+     * stay put. No second ledger write — the specialist already posted its row.
+     */
+    absorb(message, role = "specialist") {
+      const u = message?.usage;
+      if (!u || typeof u !== "object") return meter.snapshot();
+      const cost = num(u?.cost?.total);
+      sessionCost += cost;
+      turns += 1;
+      for (const c of CLASSES) tokens[c] += num(u[c]);
+      tokens.reasoning += num(u.reasoning);
+      const provider = message?.provider || "";
+      const modelId = message?.model || "";
+      const modelKey = modelId ? `${provider}/${modelId}` : "unknown";
+      const agg = byModel.get(modelKey) || { turns: 0, cost: 0, cacheWrite: 0 };
+      agg.turns += 1;
+      agg.cost += cost;
+      agg.cacheWrite += num(u.cacheWrite);
+      byModel.set(modelKey, agg);
+      addRole(String(role || "specialist"), modelKey, cost);
+      const costObj = u?.cost;
+      if (costObj && typeof costObj === "object") {
+        for (const c of CLASSES) spend[c] += num(costObj[c]);
+      }
+      if (visible) send(meter.snapshot());
+      return meter.snapshot();
+    },
+
     record(message) {
       const u = message?.usage;
       if (!u || typeof u !== "object") return meter.snapshot();
       const cost = num(u?.cost?.total);
+      // A model call that requested a desktop action is desktop work: count the TURN (its whole
+      // cost) and the calls it made, so "what did the desktop cost" has a real answer.
+      const desktopCalls = (Array.isArray(message?.content) ? message.content : [])
+        .filter((c) => c?.type === "toolCall" && isDesktopCall(c?.name)).length;
+      if (desktopCalls > 0) {
+        desktop.calls += desktopCalls;
+        desktop.turns += 1;
+        desktop.cost += cost;
+        desktop.tokens += num(u?.totalTokens);
+        // Deliberately NOT added as a by_role row: the same turn is also a chat turn, and a
+        // second row would make the role breakdown sum to more than the session total. The
+        // desktop figure is a SUBSET, reported as its own line.
+      }
       lastTurnCost = cost;
       sessionCost += cost;
       turns += 1;
@@ -267,6 +384,7 @@ export function makeCostMeter({
       agg.cost += cost;
       agg.cacheWrite += num(u.cacheWrite);
       byModel.set(modelKey, agg);
+      addRole(context.role || "chat", modelKey, cost);
 
       const switched = lastModelKey !== null && lastModelKey !== modelKey;
       if (switched) modelSwitches += 1;
@@ -319,6 +437,7 @@ export function makeCostMeter({
             session_id: sessionId,
             turn_index: ledgerTurnIndex,
             surface: context.surface || "device_chat",
+            role: context.role || "",
             provider,
             model_id: modelId,
             actor_username: context.actorUsername || "",
@@ -344,7 +463,12 @@ export function makeCostMeter({
                   total: num(costObj.total),
                 }
               : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            priced: !!(costObj && typeof costObj === "object"),
+            // A cost OBJECT is not a price. pi allocates {total:0} before calculateCost,
+            // and calculateCost throws when the model has no rate card — leaving the
+            // zeros in place. Booking that as priced is how grok-4.7 showed $0.00.
+            // Tokens with a zero total means the card was missing, not that it was free.
+            priced: !!(costObj && typeof costObj === "object")
+              && !(num(costObj.total) === 0 && (num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite)) > 0),
             context_tokens: contextTokens,
             was_model_switch: switched,
             at: new Date().toISOString(),

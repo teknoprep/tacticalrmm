@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
   makeCostMeter,
+  seedDesktopFromBranch,
   silentStopMessage,
   cacheRewriteCost,
   TURN_COST_WARN,
@@ -444,6 +445,73 @@ console.log("\nspend ledger rows");
   // would silently DROP the charge, because get_or_create returns the existing row.
   assert.equal(rows.at(-1).turn_index, 58, "ledger continues past the highest existing index");
   ok("a resumed chat restocks only its own spend and cannot collide with its old ledger rows");
+}
+
+// ---------------------------------------------------------------------------------------
+// DESKTOP OPERATIONS (owner, 2026-09-27). "What did the desktop cost me?" has a real answer
+// even though the provider bills nothing for it: each desktop action is a model call that
+// re-reads the whole conversation, and the flaky ones retry ("the desktop changed since that
+// screenshot; observe again"). TICKET/61884 spent ~15 desktop calls on one mailbox grant.
+// The figure must be a SUBSET of the session total, never an extra charge, and it must not
+// appear as a second row in the role breakdown (that would sum past the total).
+{
+  const { meter } = harness();
+  const call = (name, cost, tokens) => ({
+    role: "assistant", provider: "deepseek", model: "deepseek-flash",
+    content: [{ type: "toolCall", id: "t", name, arguments: {} }],
+    usage: { input: 0, output: 10, cacheRead: tokens, cacheWrite: 0, totalTokens: tokens,
+             cost: { input: 0, output: cost, cacheRead: 0, cacheWrite: 0, total: cost } },
+  });
+  meter.record(call("operator_desktop_observe", 0.002, 100000));
+  meter.record(call("operator_desktop_click_label", 0.003, 105000));
+  meter.record(call("run_device_command", 0.001, 106000));   // not desktop
+  let d = meter.snapshot().desktop;
+  assert.equal(d.calls, 2, "counts the desktop actions, not every tool call");
+  assert.equal(d.turns, 2, "counts the turns that requested them");
+  assert.equal(Number(d.cost.toFixed(6)), 0.005, "the cost of those turns");
+  ok("desktop work is counted as actions + the turns that drove the screen");
+
+  const total = meter.snapshot().session_cost;
+  assert.ok(d.cost < total, "the desktop figure is a SUBSET of the session, not an addition");
+  const roleSum = meter.snapshot().by_role.reduce((a, r) => a + Number(r.cost || 0), 0);
+  assert.ok(Math.abs(roleSum - total) < 1e-9, `role rows must still sum to the total (got ${roleSum} vs ${total})`);
+  ok("the desktop figure does not double-count in the role breakdown");
+
+  // a chat that never touches the desktop reports zero, so the UI stays quiet
+  const clean = harness();
+  clean.meter.record(call("run_device_command", 0.004, 50000));
+  assert.equal(clean.meter.snapshot().desktop.calls, 0);
+  assert.equal(clean.meter.snapshot().desktop.cost, 0);
+  ok("a chat with no desktop work reports zero");
+}
+
+// A RESUMED chat must not report $0.00 of desktop work: the meter is rebuilt with the session,
+// so the counters are seeded from the transcript it resumed (TICKET/61884: ~15 actions).
+{
+  const { meter } = harness();
+  const branch = [
+    { type: "message", message: { role: "user", content: "grant the mailbox" } },
+    { type: "message", message: { role: "assistant", provider: "deepseek", model: "deepseek-flash",
+      content: [{ type: "toolCall", id: "a", name: "operator_desktop_observe", arguments: {} },
+                { type: "toolCall", id: "b", name: "operator_desktop_inspect", arguments: {} }],
+      usage: { totalTokens: 120000, cost: { total: 0.004 } } } },
+    { type: "message", message: { role: "assistant", provider: "deepseek", model: "deepseek-flash",
+      content: [{ type: "toolCall", id: "c", name: "run_device_command", arguments: {} }],
+      usage: { totalTokens: 121000, cost: { total: 0.001 } } } },
+    { type: "message", message: { role: "assistant", provider: "deepseek", model: "deepseek-flash",
+      content: [{ type: "toolCall", id: "d", name: "operator_desktop_click_label", arguments: {} }],
+      usage: { totalTokens: 122000, cost: { total: 0.002 } } } },
+  ];
+  const r = seedDesktopFromBranch(branch, meter);
+  assert.equal(r.calls, 3, "counts the desktop calls, not the device one");
+  assert.equal(r.turns, 2, "two turns drove the screen");
+  const d = meter.snapshot().desktop;
+  assert.equal(d.calls, 3);
+  assert.equal(Number(d.cost.toFixed(6)), 0.006, "cost comes from the turns' own billed usage");
+  assert.equal(meter.snapshot().session_cost, 0, "seeding must not invent session cost");
+  ok("a resumed chat is seeded with the desktop work already in its transcript");
+  assert.deepEqual(seedDesktopFromBranch(null, harness().meter), { turns: 0, calls: 0, cost: 0 });
+  ok("seeding an empty/absent transcript is a no-op");
 }
 
 console.log(`\n${pass} assertions passed.\n`);

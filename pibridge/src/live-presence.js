@@ -54,7 +54,92 @@ function newPresence() {
     reclaimTimer: null,
     members: new Map(),   // ws -> ident
     pending: null,        // { from: ident, ws, timer }
+    // EVERYONE WHO HAS ATTACHED to this session, and how much they drove it. This is the
+    // record the driver needs to hand the seat BACK to someone they took it from
+    // (owner, 2026-09-27): without it, a demoted user had no route back - rule 3 needs
+    // can_take_over_ai_session and rule 5 makes an admin owner's seat consent-only.
+    history: new Map(),   // username -> { username, display, first, last, drives, isAdmin }
+    // A standing "you may take the seat without asking", granted by the CURRENT driver.
+    // Single use: it is spent when that person takes the seat, so the two of them do not
+    // bounce the seat back and forth. Only usernames already in `history` can be granted.
+    grants: new Map(),    // username -> { by, at, display }
   };
+}
+
+/** Record that someone has (had) access to this session. */
+function noteAccess(p, ident, { drove = false } = {}) {
+  if (!ident?.username) return;
+  const h = p.history.get(ident.username) ||
+    { username: ident.username, display: ident.display, first: Date.now(), drives: 0 };
+  h.display = ident.display;
+  h.last = Date.now();
+  h.isAdmin = ident.isAdmin;
+  if (drove) h.drives += 1;
+  p.history.set(ident.username, h);
+}
+
+/** The seat, and everyone who has had access to it. Sent to every attached socket. */
+function seatRoster(p) {
+  const connected = new Set([...p.members.values()].map((m) => m.username));
+  const people = [...p.history.values()].map((h) => ({
+    username: h.username,
+    display: h.display,
+    is_admin: !!h.isAdmin,
+    connected: connected.has(h.username),
+    driving: !!p.owner && p.owner.username === h.username,
+    drives: h.drives,
+    last_seen: h.last,
+  }));
+  // A viewer who attached before this feature existed, or before a name was known.
+  for (const m of p.members.values()) {
+    if (!people.some((x) => x.username === m.username)) {
+      people.push({ username: m.username, display: m.display, is_admin: !!m.isAdmin,
+                    connected: true, driving: !!p.owner && p.owner.username === m.username,
+                    drives: 0, last_seen: Date.now() });
+    }
+  }
+  people.sort((a, b) => Number(b.driving) - Number(a.driving) || a.display.localeCompare(b.display));
+  return {
+    owner: p.owner ? { username: p.owner.username, display: p.owner.display } : null,
+    people,
+    grants: [...p.grants.entries()].map(([username, g]) => ({
+      username, display: g.display, by: g.by, at: g.at,
+      connected: connected.has(username),
+    })),
+  };
+}
+
+/**
+ * Hand the driving seat to a named person (owner-only; checked again in the hub).
+ * Attached right now -> they drive immediately. Not attached -> a single-use grant, so the
+ * seat is theirs the moment they next attach. Only someone in `history` may be chosen.
+ */
+function grantSeat(p, byWs, username) {
+  const by = p.members.get(byWs);
+  if (!isOwner(p, byWs)) return { ok: false, reason: "only the current driver can hand over the seat" };
+  const want = String(username || "").toLowerCase();
+  if (!want) return { ok: false, reason: "no username given" };
+  if (p.owner && p.owner.username === want) return { ok: false, reason: "they are already driving" };
+  const target = [...p.members.entries()].find(([, id]) => id.username === want);
+  if (target) {
+    const [targetWs, ident] = target;
+    noteAccess(p, ident, { drove: true });
+    const g = grant(p, targetWs, ident, `seat handed over by ${by?.display || "the driver"}`);
+    p.grants.delete(want);
+    return { ok: true, promoted: true, username: want, display: ident.display, previous: g.previous };
+  }
+  const h = p.history.get(want);
+  if (!h) return { ok: false, reason: "that user has never had access to this session" };
+  p.grants.set(want, { by: by?.display || "the driver", at: Date.now(), display: h.display });
+  return { ok: true, promoted: false, username: want, display: h.display };
+}
+
+/** Take back a grant that has not been used yet. */
+function revokeSeatGrant(p, byWs, username) {
+  if (!isOwner(p, byWs)) return { ok: false, reason: "only the current driver can change this" };
+  const want = String(username || "").toLowerCase();
+  const had = p.grants.delete(want);
+  return { ok: had, username: want, reason: had ? "" : "no such grant" };
 }
 
 /**
@@ -79,8 +164,22 @@ function join(p, ws, blob) {
     }
     p.owner = ident;
     p.ownerSocket = ws;
+    noteAccess(p, ident, { drove: true });
     return { role: "owner", owner: p.owner, reclaimed: !!isReclaim };
   }
+
+  // HANDED TO THEM: the driver gave this person the seat earlier (they were not attached).
+  // The grant is spent here, so the seat does not ping-pong between them.
+  const handed = p.grants.get(ident.username);
+  if (handed) {
+    p.grants.delete(ident.username);
+    noteAccess(p, ident, { drove: true });
+    const g = grant(p, ws, ident, `seat handed over by ${handed.by}`);
+    noteAccess(p, ident, {});
+    return { role: "owner", owner: p.owner, handedOver: true, previous: g.previous };
+  }
+
+  noteAccess(p, ident, {});
   return { role: "viewer", owner: p.owner };
 }
 
@@ -91,6 +190,27 @@ function isOwner(p, ws) {
 /** The authority check for every inbound message that would drive the session. */
 function canDrive(p, ws) {
   return isOwner(p, ws);
+}
+
+/**
+ * WHO MAY ANSWER AN APPROVAL PROMPT (owner, 2026-09-27). Only the technician holding the seat.
+ *
+ * Any attached socket used to be able to answer one, which contradicted the read-only model: a
+ * viewer could not type a prompt into someone else's session, but could authorise a device
+ * change, a customer email or the hand-over of a stored credential. The person at the keyboard is
+ * the approver (TECH_AUTHORITY_POLICY), and the person at the keyboard is whoever drives.
+ *
+ * An admin who wants to approve takes the seat first: the button is right there, and for an admin
+ * that is immediate unless the current driver is also an admin (rules 3-5).
+ */
+function mayAnswerApproval(p, ws) {
+  if (isOwner(p, ws)) return { ok: true };
+  return {
+    ok: false,
+    reason: p.owner
+      ? `Only ${p.owner.display} - who is driving this session - can answer that. Ask them, or press Take over to drive it yourself.`
+      : "Nobody is driving this session, so there is nothing to approve yet. Press Take over to drive it.",
+  };
 }
 
 /**
@@ -243,11 +363,15 @@ function presenceFrame(p, ws) {
     pending_from: p.pending
       ? { username: p.pending.from.username, display: p.pending.from.display }
       : null,
+    // Who holds the seat, who is watching, and everyone who has had access - so the driver can
+    // give the seat back to someone they took it from, or promote a viewer.
+    roster: seatRoster(p),
   };
 }
 
 export {
   newPresence, identOf, join, leave, isOwner, canDrive,
   requestTakeover, markPending, respondTakeover, presenceFrame,
+  noteAccess, seatRoster, grantSeat, revokeSeatGrant, mayAnswerApproval,
   CONSENT_TIMEOUT_MS, OWNER_RECLAIM_GRACE_MS,
 };

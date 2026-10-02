@@ -134,6 +134,30 @@ function tokensUsed(message) {
  * Is this the "provider dropped it on the floor" shape?
  * Content-free, token-free, ended in error, and not permanently broken.
  */
+/**
+ * Would a DIFFERENT provider survive this? Only the provider-level refusals count: quota, billing,
+ * auth, a retired model. A 500 or a stall is the same everywhere, and a bad request would be bad
+ * for every model, so those keep their existing handling.
+ */
+const FALLBACK_TRIGGER = new RegExp([
+  "insufficient_quota", "quota", "out of budget", "credits", "billing", "available balance",
+  "usagelimiterror", "spending limit", "monthly usage limit", "rate.?limit", "429",
+  "api.?key", "unauthorized", "unauthorised", "forbidden", "403", "401",
+  "model.?not.?found", "does not exist", "no such model", "unsupported model",
+  "overloaded", "capacity", "temporarily unavailable", "503",
+].join("|"), "i");
+
+/** Refusals that are about the provider's load right now, not about us. */
+const TRANSIENT_LOAD = /overloaded|capacity|temporarily unavailable|high demand|\b503\b|\b529\b|rate.?limit|\b429\b|try again/i;
+
+export function couldBeAnotherProvider(message) {
+  if (!message || message.role !== "assistant" || message.stopReason !== "error") return false;
+  const why = String(message.errorMessage || "");
+  if (!why) return false;
+  if (ABORTED.test(why)) return false;      // a Stop, or our own stall claim handled elsewhere
+  return FALLBACK_TRIGGER.test(why);
+}
+
 export function isBlankProviderFailure(message) {
   if (!message || message.role !== "assistant" || message.stopReason !== "error") return false;
   const why = String(message.errorMessage || "");
@@ -180,12 +204,14 @@ export function isWatchdogStallAbort(message) {
  * @param baseDelayMs       exponential backoff base
  */
 export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, maxStallAttempts = 1,
-                                  baseDelayMs = 1500 } = {}) {
+                                  baseDelayMs = 1500, onPermanentFailure = null,
+                                  onUnrecovered = null } = {}) {
   let armed = null;        // { message, kind } awaiting a re-run
   let attempts = 0;        // blank-rejection re-runs used within the current turn
   let stallAttempts = 0;   // watchdog-abort re-runs used within the current turn
   let stall = null;        // { silentFor } while an abort of OURS is unclaimed
   let harnessGaveUp = false;
+  let fallbackTried = false;   // the backup model is tried at most once per turn
 
   /** An abort is only ours if the watchdog said so before aborting. */
   const ownStallAbort = (message) => !!stall && isWatchdogStallAbort(message);
@@ -203,6 +229,7 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, maxStall
       stallAttempts = 0;
       stall = null;
       harnessGaveUp = false;
+      fallbackTried = false;   // a new turn may use the backup model once again
     },
 
     /**
@@ -236,6 +263,14 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, maxStall
         armed = { message, kind: "stall" };
         return true;
       }
+      // A provider that refuses outright. Retrying the SAME model is pure cost, so if this group
+      // named a backup, use it - once per turn, and only if the failure is one a different
+      // provider could actually survive.
+      if (onPermanentFailure && !fallbackTried && couldBeAnotherProvider(message)) {
+        fallbackTried = true;
+        armed = { message, kind: "fallback" };
+        return true;
+      }
       if (attempts >= maxAttempts) return false;
       if (!isBlankProviderFailure(message)) return false;
       armed = { message, kind: "blank" };
@@ -266,9 +301,51 @@ export function makeLlmRecovery({ log, key, sessionId, maxAttempts = 2, maxStall
       } else {
         attempts += 1;
       }
+      if (kind === "fallback") {
+        // Switch to the group's backup model, then carry on with the SAME conversation.
+        let switched = null;
+        try { switched = await onPermanentFailure(message); }
+        catch (e) { log?.("llm_fallback_error", key, sessionId, String(e?.message || e).slice(0, 200)); }
+        if (switched) {
+          log?.("llm_fallback", key, sessionId,
+            `provider refused (${why.slice(0, 80)}) - switched to ${switched.provider}/${switched.model_id}`);
+          armed = null;
+          try {
+            const messages = session.agent?.state?.messages;
+            if (Array.isArray(messages) && messages.length
+                && messages[messages.length - 1]?.role === "assistant") {
+              session.agent.state.messages = messages.slice(0, -1);
+            }
+          } catch { return false; }
+          try {
+            await session.agent.continue();
+            return true;
+          } catch (e) {
+            log?.("llm_recover_error", key, sessionId, `continue() after fallback failed: ${String(e?.message || e).slice(0, 200)}`);
+            return false;
+          }
+        }
+        // NO BACKUP MODEL (2026-09-30). This used to `return false` in silence, after
+        // consider() had already told the log "will re-run silently" - so an xAI "at
+        // capacity" (TICKET/62044) ended the turn with no retry, no note, and the
+        // technician retyping. A load refusal is transient: wait longer and try the SAME
+        // model. Anything else (quota, auth, retired model) is not, and is said so.
+        if (!TRANSIENT_LOAD.test(why) || !isBlankProviderFailure(message)) {
+          log?.("llm_fallback_unavailable", key, sessionId,
+            `no backup model for this group, and "${why.slice(0, 80)}" is not transient - not retrying`);
+          // consider() held this error back from the technician on the promise of a
+          // backup model. There is none, so hand it to them now.
+          try { onUnrecovered?.(why); } catch { /* socket gone */ }
+          return false;
+        }
+        log?.("llm_fallback_unavailable", key, sessionId,
+          `no backup model for this group - retrying the same model after "${why.slice(0, 80)}"`);
+      }
       const used = stalled ? stallAttempts : attempts;
       const budget = stalled ? maxStallAttempts : maxAttempts;
-      const delayMs = baseDelayMs * 2 ** (used - 1);
+      // A provider turning us away for load needs more than 1.5s to recover.
+      const loadFactor = !stalled && TRANSIENT_LOAD.test(why) ? 4 : 1;
+      const delayMs = baseDelayMs * loadFactor * 2 ** (used - 1);
       log?.("llm_recover", key, sessionId,
         `attempt ${used}/${budget} after ${stalled ? "" : "unrecognised provider error "}` +
         `"${why.slice(0, 80)}" - waiting ${delayMs}ms`);

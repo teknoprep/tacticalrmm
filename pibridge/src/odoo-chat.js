@@ -402,6 +402,7 @@ export async function startOdooChat(ws, blob) {
       });
     },
     context: {
+      role: "chat",
       surface: "odoo",
       // The meter reads actorUsername (camelCase). Passing `username` meant every
       // Odoo row landed with a blank actor, so the spend report could not attribute

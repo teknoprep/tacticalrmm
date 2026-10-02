@@ -24,6 +24,18 @@ try {
 // (actionable fields first) and HARD-CAPS the bytes it may return.
 const MAX_TOOL_RESULT_BYTES = Number(process.env.PI_MAX_TOOL_RESULT_BYTES || 60000);
 
+function totpAsk(op, args, actorEmail) {
+  const a = args || {};
+  const who = actorEmail || "the signed-in user";
+  const which = a.name || a.issuer || a.query || a.id || "a TOTP code";
+  if (op === "add_totp") {
+    return `Add a TOTP code "${a.name || a.issuer || "unnamed"}" as ${who}. ` +
+      `Required group: ${a.view_group || "(missing)"}. The secret is not shown here.`;
+  }
+  return `Reveal the live TOTP code for "${which}" as ${who}. ` +
+    `The AI will see the 6-digit code. It will not be written to a ticket, email, or note.`;
+}
+
 /** Truncate a string to a byte budget with an explicit, model-readable marker. */
 function capString(s, maxBytes = MAX_TOOL_RESULT_BYTES, what = "output") {
   const str = String(s ?? "");
@@ -163,6 +175,30 @@ async function fleetAgents(signal) {
  * hardware-bearing tools required an ONLINE device (run_device_command) or a
  * device-scoped session (get_device_details).
  */
+/** List / count RMM clients. Read-only; one call instead of paging 1,000+ devices. */
+function rmmClientsTool() {
+  const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
+  return defineTool({
+    name: "list_rmm_clients",
+    label: "List RMM clients",
+    description:
+      "List every client (company) in the RMM with its site count and device count " +
+      "(servers / workstations), plus totals: how many clients, sites and devices exist. " +
+      "READ-ONLY. Use this to answer 'how many clients' or to get the full client list for a " +
+      "bulk job - do NOT page through get_device_hardware for that. Optional query filters " +
+      "by client name (substring). To map a client to its Odoo company use find_company.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ description: "Client name contains (optional)" })),
+    }),
+    execute: async (_id, p) => {
+      try {
+        const out = await trmm.listClients({ query: p.query });
+        return text(capJson(out, { what: "RMM clients", maxBytes: 120000 }));
+      } catch (e) { return text(`list_rmm_clients failed: ${e?.message || e}`); }
+    },
+  });
+}
+
 function deviceHardwareTool() {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
   return defineTool({
@@ -280,11 +316,13 @@ async function _webSearch(query, n = 6) {
   while ((m = snipRe.exec(html))) snips.push(_stripHtml(m[1]));
   return links.slice(0, n).map((l, i) => ({ ...l, snippet: snips[i] || "" }));
 }
-async function _webFetch(url) {
+export async function webSearchRaw(query, n = 6) { return _webSearch(query, n); }
+export async function webFetchRaw(url, max = 9000) { return _webFetch(url, max); }
+async function _webFetch(url, max = 9000) {
   const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; PiDevAI/1.0)" }, redirect: "follow" });
   let html = await res.text();
   html = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
-  return _stripHtml(html).slice(0, 9000);
+  return _stripHtml(html).slice(0, max);
 }
 export function webTools() {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
@@ -295,7 +333,13 @@ export function webTools() {
       "Search the web for how-to steps, vendor documentation, or error lookups (e.g. 'how to " +
       "accept a Google Drive shared link'). Returns top results with titles, URLs and snippets; " +
       "use web_fetch to read a promising page before you write instructions.",
-    parameters: Type.Object({ query: Type.String({ description: "Search query" }) }),
+    parameters: Type.Object({
+      query: Type.String({ description: "Search query" }),
+      question: Type.Optional(Type.String({
+        description: "What you actually need to know (e.g. 'how to set a per-client 15 Mbps limit on one UniFi SSID, Network 9.x'). " +
+          "In an agent group with a researcher, the researcher answers this with sources.",
+      })),
+    }),
     execute: async (_id, p) => {
       try {
         const r = await _webSearch(p.query);
@@ -307,7 +351,11 @@ export function webTools() {
     name: "web_fetch",
     label: "Fetch web page",
     description: "Fetch a URL and return its readable text (to read a how-to/doc page found via web_search).",
-    parameters: Type.Object({ url: Type.String({ description: "URL to fetch" }) }),
+    parameters: Type.Object({
+      url: Type.String({ description: "URL to fetch" }),
+      question: Type.Optional(Type.String({ description: "What you need from this page. The researcher (if any) returns only that." })),
+      verbatim: Type.Optional(Type.Boolean({ description: "true = return the page text itself (up to 9000 chars) - only when you must follow its exact wording." })),
+    }),
     execute: async (_id, p) => {
       try { return text(await _webFetch(p.url)); }
       catch (e) { return text("web_fetch failed: " + (e?.message || e)); }
@@ -444,7 +492,7 @@ function operatorAgentIdSet(operatorPolicy) {
   return out;
 }
 
-function mutatingMatch(command, isWindows) {
+export function mutatingMatch(command, isWindows) {
   for (const re of isWindows ? WIN_MUTATE : NIX_MUTATE) {
     const m = command.match(re);
     if (m) return m[0];
@@ -687,6 +735,161 @@ function captureReceipt(rec, extra = "") {
   );
 }
 
+
+// RMM AGENTS FIRST, THE DESKTOP LAST (owner, 2026-09-26, TICKET/61857). The model read the
+// `unifi` agent's device notes - which say exactly how UniFi work is done on that host -
+// and then opened https://unifi.blueuc.com:11443 on the Operator desktop to click through
+// the web UI. When the URL's host IS an online RMM agent, the work goes through that agent
+// (CLI, local API with curl to localhost, its database), not a browser on another machine.
+// A lookup failure never blocks; the technician asking for the browser always wins.
+const DESKTOP_ASKED = /\b(use|open|via|through|in|on)\b.{0,25}\b(desktop|browser|gui|web ?ui|operator|screen)\b|\bclick (it|through)\b/i;
+function techAskedForDesktop(turns) {
+  return (Array.isArray(turns) ? turns : []).slice(-4).some((t) => DESKTOP_ASKED.test(String(t?.text || "")));
+}
+// THE TECHNICIAN IS THE APPROVER in an interactive window (owner, 2026-09-26, TICKET/61820).
+// The support-contact gate protects UNATTENDED work, where only the customer's email is
+// asking. When a BlueCloud technician at the keyboard says "approved, go ahead", that is
+// the approval - re-running check_support_authorization and demanding a customer contact
+// was the bug. Write mode, per-action approval and the judge still apply.
+const TECH_APPROVES = /\b(approved?|authori[sz]ed?|go ahead|go for it|proceed|do it|do that|make the change|you have (my )?(approval|permission|the ok)|i approve|yes,? (do|go|please|proceed)|(it'?s|that'?s) (ok|fine))\b/i;
+export function techApproved(turns) {
+  const NOT = /\b(don'?t|do not|not|never|no|stop|wait|hold( off)?|until)\b[^.!,;]{0,20}\b(approv|authori|go ahead|proceed|do it|do that|make the change)/i;
+  return (Array.isArray(turns) ? turns : []).slice(-3).some((t) => {
+    const x = String(t?.text || "").trim();
+    return TECH_APPROVES.test(x) && !NOT.test(x) && !/^\S+( \S+)?\?$/.test(x);
+  });
+}
+
+/**
+ * CLOUD ADMIN PORTALS (owner, 2026-09-27). Everything done in these has a PowerShell / Graph
+ * equivalent that runs from ANY RMM agent with the customer's stored IT Notebook credential, so
+ * driving them on screen is strictly worse: it is slower, it needs a workstation, it needs a
+ * human to read a code off a screen, and nothing about it is auditable. TICKET/61884 was
+ * changing an M365 password by clicking through the portal while `run_script_with_credential`
+ * could have done the same job in one call.
+ *
+ * These hosts are refused to operator_desktop_open_url unless the technician explicitly asked
+ * for the browser - see the desktop instructions in server.js. `mysignins.microsoft.com` is
+ * deliberately NOT here: the authenticator (TOTP) enrollment flow still reads a secret out of
+ * that page, and it moves to Graph when that path is built.
+ */
+export const CLOUD_ADMIN_PORTAL =
+  /^(admin|security|purview|compliance|intune|endpoint|entra|aad|portal|partner|domains|account)\.(microsoft|microsoftonline|azure)\.(com|us)$|^portal\.azure\.(com|us)$|^(admin|portal)\.office\.com$|^(admin|teams|ediscovery)\.(exchange|teams|microsoft)\.microsoft\.com$|^(outlook|exchange)\.office\.com$|^admin\.cloud\.microsoft$/i;
+
+export function cloudPortalMessage(host) {
+  return (
+    `BLOCKED - ${host} is a cloud admin portal, and doing M365 work by hand here is the slow, ` +
+    `unauditable way. Everything that page does has a PowerShell/Graph equivalent that runs on ANY ` +
+    `RMM agent with the customer's stored login:\n` +
+    `  1. find_devices for an ONLINE machine of that client (any one - the module talks to the ` +
+    `cloud, not to that machine).\n` +
+    `  2. run_script_with_credential with company='<client>' and the exact IT Notebook row label ` +
+    `(helpdesk_call get_partner_credentials lists the labels). It injects $env:PI_USER / ` +
+    `$env:PI_PASS / $env:PI_URL; the password is never shown to you.\n` +
+    `  3. In that script (PowerShell):\n` +
+    `     $sec = ConvertTo-SecureString $env:PI_PASS -AsPlainText -Force\n` +
+    `     $cred = New-Object System.Management.Automation.PSCredential($env:PI_USER, $sec)\n` +
+    `     Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force   # once per machine\n` +
+    `     Connect-ExchangeOnline -Credential $cred            # mailboxes, groups, Teams, mail flow\n` +
+    `     Connect-MgGraph   / Connect-MsolService             # users, licences, passwords, devices\n` +
+    `       Get-MgUser, Update-MgUser, Update-MgUserPassword, Get-MgUserAuthenticationMethod\n` +
+    `  4. Report the exact commands and their output to the technician.\n` +
+    `If the job genuinely has no CLI/API route (a website-only vendor console), say which and why, ` +
+    `then use the desktop. If the technician explicitly asks for the browser, it is allowed.`
+  );
+}
+
+/**
+ * MFA HANDSHAKE, ENFORCED (owner, 2026-09-27). Asking the technician in the chat before a phone
+ * rings cannot be left to the prompt: a model that clicks "Call me" unprompted makes Microsoft
+ * phone somebody who is not ready, and every failed attempt counts against the account -
+ * TICKET/60427 locked a tenant admin out with AADSTS50053 x4 that way.
+ *
+ * So the MFA-REQUESTING clicks are gated in code. Until the technician has actually said yes in
+ * this chat, the click is refused and the refusal tells the model to ask with pause_queue and
+ * end its turn. Coming back to the button AFTER their yes works normally.
+ *
+ * What is NOT gated: typing a code (that is the TOTP path, and for a stored code there is no
+ * human step at all) and every ordinary click. Only the buttons that make a phone or a push
+ * happen: "Call me", "Text me", "Send notification", "Verify", "Use another method"...
+ */
+export const MFA_TRIGGER = /\b(call me|text me|call my|phone me|send (me )?(a )?(code|text|push|notification)|get a code|verify (now|my|me)|approve (the )?(sign[- ]?in|request)|use another (method|way)|i can'?t use my|another way to sign in|send (a )?request)\b/i;
+
+const MFA_YES = /\b(yes|yeah|yep|yup|ok|okay|ready|go|go ahead|do it|call me|text me|send it|ring me|i'?m ready|ready now|sure)\b/i;
+const MFA_NO = /\b(no|not yet|wait|hold on|hold off|don'?t|do not|stop|later|give me a (sec|minute)|busy|in a call)\b/i;
+
+/** Did the technician just say yes, in their most recent turn? */
+export function techReadyForMfa(techTurns) {
+  const t = (Array.isArray(techTurns) ? techTurns : []).map((x) => String(x?.text || "")).filter(Boolean);
+  const last = t[t.length - 1] || "";
+  if (!last) return false;
+  if (MFA_NO.test(last)) return false;
+  return MFA_YES.test(last);
+}
+
+export function mfaPhoneGate(operatorTools, { techTurns = null, text }) {
+  const triggers = (operatorTools || []).filter((t) =>
+    ["operator_desktop_click_label", "operator_desktop_click"].includes(String(t?.name || "")));
+  for (const tool of triggers) {
+    if (tool.execute?.__mfaGate) continue;
+    const original = tool.execute;
+    const wrapped = async (id, params, ...rest) => {
+      const label = String(params?.targetLabel || params?.label || params?.text || "");
+      if (label && MFA_TRIGGER.test(label) && !techReadyForMfa(techTurns)) {
+        return text(
+          `HELD - "${label}" makes Microsoft contact the technician, and they have not agreed yet. ` +
+          `Do NOT click it again in this turn. Ask first with pause_queue, naming the account, the client ` +
+          `and (if the page shows it) the phone number that will ring - e.g. "Microsoft needs to verify ` +
+          `<account> for <client>: <number> is about to ring - ready?" - say the same in your reply, and end ` +
+          `your turn. Their answer arrives as your next turn: click "${label}" then. ` +
+          `If the account has a TOTP code in the IT Notebook, use helpdesk_call get_totp_code instead - ` +
+          `that needs nobody's permission.`,
+        );
+      }
+      return original(id, params, ...rest);
+    };
+    wrapped.__mfaGate = true;
+    tool.execute = wrapped;
+  }
+  return operatorTools;
+}
+
+export function agentFirstDesktop(operatorTools, { techTurns = null, text }) {
+  const tool = (operatorTools || []).find((t) => t?.name === "operator_desktop_open_url");
+  if (!tool || tool.execute?.__agentFirst) return;
+  const original = tool.execute;
+  const wrapped = async (id, params, ...rest) => {
+    try {
+      const host = new URL(String(params?.url || "")).hostname.toLowerCase();
+      // Cloud admin portal: refuse the GUI route outright (a handler the technician asked for is
+      // still honoured below, and a website-only vendor console is not matched here at all).
+      if (host && CLOUD_ADMIN_PORTAL.test(host) && !techAskedForDesktop(techTurns)) {
+        return text(cloudPortalMessage(host));
+      }
+      if (host && !techAskedForDesktop(techTurns)) {
+        const first = host.split(".")[0];
+        for (const h of [...new Set([host, first])]) {
+          const r = await trmm.resolveDevices({ hostname: h }, { timeoutMs: 8000 });
+          const hit = (r?.hostname_matches || []).find((a) => a && a.online !== false
+            && [host, first].includes(String(a.hostname || "").toLowerCase()));
+          if (hit) {
+            return text(
+              `BLOCKED - ${host} is served by the RMM agent "${hit.hostname}" (agent_id ${hit.agent_id}, client ${hit.client}). ` +
+              `Do this work THROUGH THAT AGENT with run_device_command: the service's own CLI, its local API with curl ` +
+              `to localhost/127.0.0.1, or its database. Read get_device_notes for that agent first - they record how this ` +
+              `was done before. The Operator desktop is the last resort for things no agent can reach (e.g. a customer ` +
+              `Microsoft portal needing MFA), never a shortcut. If the technician explicitly asks for the browser, it is allowed.`,
+            );
+          }
+        }
+      }
+    } catch { /* never block on a lookup failure */ }
+    return original(id, params, ...rest);
+  };
+  wrapped.__agentFirst = true;
+  tool.execute = wrapped;
+}
+
 export function buildTools({
   machines: machinesIn,
   // legacy single-machine call shape
@@ -722,6 +925,8 @@ export function buildTools({
   // Absent, a `secret` operation is refused outright rather than falling back to `gate` -
   // a missing credential policy must not silently downgrade to the device one.
   secretGate = null,
+  // Why the last approval was refused, when it was not a person (the judge). Read once.
+  denialNote = null,
   // Product code verifies the technician's OWN chat text before global/shared KB
   // authoring. The model cannot grant this to itself by claiming it was asked.
   globalKnowledgeAuthorisation = () => null,
@@ -729,6 +934,8 @@ export function buildTools({
   // global machine allowlist and this technician's per-agent permissions.
   operatorPolicy = null,
   operatorActor = "",
+  // The technician's own recent messages (server's techSaid), for agentFirstDesktop.
+  techTurns = null,
   // Session tech identity — used by send_email so SMTP From can be the human, not a bot.
   actorEmail = "",
   actorName = "",
@@ -777,7 +984,8 @@ export function buildTools({
 
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
   const denied = () =>
-    text("The operator DENIED this action. Do not retry it; ask what to do instead.");
+    text((typeof denialNote === "function" && denialNote()) ||
+      "The operator DENIED this action. Do not retry it; ask what to do instead.");
   // Read-only is a DEVICE control only: it never blocks ticket work (reply, note,
   // create, KB) - those have their own approval + customer-email controls.
   const roDenied = () =>
@@ -887,7 +1095,21 @@ export function buildTools({
         }),
       ),
       timeout: Type.Optional(
-        Type.Number({ description: "Max seconds to wait (default 60, max 900)" }),
+        Type.Number({
+          description:
+            "Max seconds to wait before the command is terminated (default 60, max 900). " +
+            "DO NOT sit inside this tool call waiting on long work. For anything that can run " +
+            "for more than about two minutes - package installs, database dump/restore, image " +
+            "builds, snapshots, reboots, big file copies - start it DETACHED and poll instead: " +
+            "`nohup <cmd> >/tmp/job.log 2>&1 & echo started $!`, then check it with short " +
+            "commands (`tail -n 40 /tmp/job.log`, `ps -p <pid>`). Polling costs a few seconds " +
+            "each time; a timeout costs the whole command. " +
+            "AND NEVER SEND THE SAME COMMAND TWICE. If this call times out, or you have not " +
+            "seen its result, the command may still be running - re-sending it duplicates the " +
+            "work (a second pg_restore, a second migrate container, a second reboot) and the " +
+            "safety reviewer will refuse it as a race or a loop. Check whether it is still " +
+            "running and wait for it.",
+        }),
       ),
       capture_as: Type.Optional(
         Type.String({
@@ -1299,8 +1521,8 @@ export function buildTools({
   // documents WHEN to use each operation and with what args.
   // Single-device sessions expose a deep link to the device so the integration
   // can put a "jump to device" link in the ticket (multi-device -> ambiguous, omit).
-  const hdContext =
-    machines.length === 1
+  const hdContext = {
+    ...(machines.length === 1
       ? {
           deviceUrl: machines[0]?.facts?.device_url || "",
           hostname: machines[0]?.hostname || machines[0]?.facts?.hostname || "",
@@ -1308,7 +1530,11 @@ export function buildTools({
           site: machines[0]?.facts?.site || "",
           agentId: machines[0]?.agentId || "",
         }
-      : {};
+      : {}),
+    // Bound here, never taken from the model's arguments. TOTP ops refuse if this is empty.
+    actorEmail: actorEmail || "",
+    actorName: actorName || "",
+  };
   let hd = null, hdError = "";
   try { hd = loadHelpdesk(helpdeskCode, helpdeskApi, hdContext); }
   catch (e) { hdError = e.message; }
@@ -1374,13 +1600,23 @@ export function buildTools({
       // NOT routed through `gate`: a credential read is not a mutating operation, so the
       // mutating check below would let it straight through, and `gate` would honour
       // Auto-approve even if it did catch it. It gets its own policy or it does not run.
-      if (cap.cls === "secret") {
+      // get_partner_credentials returns MASKED values (helpdesk-runtime.js): labels, links and
+      // usernames only, so it is not a credential read and asks nobody.
+      if (cap.cls === "secret" && op !== "get_partner_credentials") {
         if (!secretGate)
           return text(
             "Not permitted: this surface has no credential-approval channel, so stored " +
               "logins cannot be read here. Do not retry, and do not ask the customer for " +
               "their password.",
           );
+        if (op === "get_totp_code") {
+          const g = await secretGate(totpAsk(op, args, actorEmail), { privileged: false });
+          if (!g.ok)
+            return text(
+              (g.reason || "Revealing that TOTP code was not permitted.") +
+                " Do not retry it and do not ask the customer for their code.",
+            );
+        } else {
         const who = args.company_name || args.partner_id || "this company";
         const wantsPriv = !!args.include_privileged;
         // The privileged flag travels as DATA, not as a phrase in the summary: it decides
@@ -1399,6 +1635,7 @@ export function buildTools({
             (g.reason || "Reading the stored credentials was not permitted.") +
               " Do not retry it and do not ask the customer for their password.",
           );
+        }
       }
       let globalKnowledgeAuth = null;
       if (op === "create_global_kb_article") {
@@ -1646,6 +1883,8 @@ export function buildTools({
     isReadonly,
     mutatingMatch,
   }) || [];
+  agentFirstDesktop(operatorTools, { techTurns, text });
+  mfaPhoneGate(operatorTools, { techTurns, text });
 
   let tools = [
     get_device_details,
@@ -1653,6 +1892,7 @@ export function buildTools({
     // works for devices this session cannot reach, so an inventory report no longer
     // has a hole where every offline machine should be.
     deviceHardwareTool(),
+    rmmClientsTool(),
     run_command_on_device,
     list_scripts,
     run_script_on_device,
@@ -1695,7 +1935,7 @@ export function buildTools({
     "cancel_scheduled_action",
   ]);
 
-  return { tools, mutating, verdict, machines, helpdeskState };
+  return { tools, mutating, verdict, machines, helpdeskState, hd };
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,6 +2169,18 @@ export function buildTicketTriageTools({ helpdeskCode, helpdeskApi } = {}) {
     execute: async (_id, p) => hdcall("get_kb_article", { id: p.id }),
   });
 
+  // Content search across this company's KB, BlueCloud's internal KB and the global KB
+  // (owner, 2026-09-30) - the title list alone missed our own app documentation.
+  const search_kb = defineTool({
+    name: "search_kb",
+    label: "Search the KB",
+    description: "Search our knowledge base by WORDS in titles AND content - this company's KB, BlueCloud's internal KB " +
+      "(our own apps, infrastructure and runbooks) and the global KB. Returns the matching sections. Use it before " +
+      "proposing steps, with the product/app name and what the ticket asks for.",
+    parameters: Type.Object({ query: Type.String(), partner_id: Type.Optional(Type.Number()) }),
+    execute: async (_id, p) => hdcall("search_kb", { query: p.query, partner_id: p.partner_id }),
+  });
+
   const submit_triage = defineTool({
     name: "submit_triage",
     label: "Submit triage verdict",
@@ -1963,8 +2215,8 @@ export function buildTicketTriageTools({ helpdeskCode, helpdeskApi } = {}) {
   });
 
   return {
-    tools: [get_ticket, resolve_client, find_company, find_devices, deviceHardwareTool(),
-            list_kb_articles, get_kb_article, ...webTools(), submit_triage],
+    tools: [get_ticket, resolve_client, find_company, find_devices, deviceHardwareTool(), rmmClientsTool(),
+            list_kb_articles, get_kb_article, ...(hd?.operations?.search_kb ? [search_kb] : []), ...webTools(), submit_triage],
     verdict, hd, hdError,
   };
 }
@@ -2019,13 +2271,25 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   operatorPolicy = null, operatorActor = "",
   actorEmail = "", actorName = "",
   salesCode = "", salesApi = null, salesEnabled = false,
+  // CONTEXT TRIM (2026-09-27): helpdesk operations matching any of these patterns are left
+  // out of the helpdesk_call CATALOG (still callable - authority is capabilities.js's job).
+  // See lazy-capabilities.js TICKET_CHAT_UNADVERTISED.
+  unadvertised = [],
+  // When set, the desktop refusals below also tell the model how to load the Operator tools
+  // (they start hidden in a ticket chat - see lazy-capabilities.js).
+  desktopLoadHint = "",
+  techTurns = null,
 } = {}) {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
   const capStore = makeCaptureStore();
   // Machines with a proper desktop-control plane - see GUI_DRIVING.
   const operatorAgentIds = operatorAgentIdSet(operatorPolicy);
   let hd = null, hdError = "";
-  try { hd = loadHelpdesk(helpdeskCode, helpdeskApi, helpdeskContext || { ticket_ref: ticketRef || "", lead_ref: leadRef || "" }); }
+  try { hd = loadHelpdesk(helpdeskCode, helpdeskApi, {
+    ...(helpdeskContext || { ticket_ref: ticketRef || "", lead_ref: leadRef || "" }),
+    actorEmail: actorEmail || "",
+    actorName: actorName || "",
+  }); }
   catch (e) { hdError = e.message; }
   // Replaces the old `blockOps` name list (ISSUES.md I6): that hardcoded five
   // deployment-authored operation NAMES in product code, so a deployment naming its
@@ -2033,7 +2297,12 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   const hdVisible = hd
     ? allowedOps({ surface, names: hd.names, opClasses: hd.opClasses, mutating: hd.mutating })
     : [];
-  const opList = hd ? hdVisible.map((n) => `  - ${n}${hd.meta[n] ? ": " + hd.meta[n] : ""}`).join("\n") : "";
+  const opLine = (n) => `  - ${n}${hd.meta[n] ? ": " + hd.meta[n] : ""}`;
+  const advertised = hdVisible.filter((n) => !(unadvertised || []).some((re) => re.test(n)));
+  const opList = hd ? advertised.map(opLine).join("\n") : "";
+  // Catalog lines for the ops NOT advertised, so a capability that owns them can list them
+  // when it loads (e.g. the TOTP ops in the "totp" capability).
+  const unadvertisedOpLines = hd ? hdVisible.filter((n) => !advertised.includes(n)).map(opLine) : [];
 
   const helpdesk_call = defineTool({
     name: "helpdesk_call",
@@ -2045,17 +2314,20 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       "\n\nThis chat is already bound to this ticket - you do NOT need to pass a ticket id; it is added " +
       "automatically. Field names: add_note and reply_to_ticket use 'message'; resolve_ticket uses " +
       "'internal_note' (review note) + 'customer_html' (the HTML customer reply); close_ticket uses " +
-      "'reason'; set_ticket_company uses 'company_partner_id'; KB ops use 'partner_id'/'title'/'content'.",
+      "'reason'; set_ticket_company uses 'company_partner_id'; KB ops use 'partner_id'/'title'/'content'; " +
+      "search_kb uses 'query' (search our KB BEFORE planning or changing anything); get_kb_article takes 'article_id' plus 'query' or 'offset' for long articles.",
     parameters: Type.Object({
       operation: Type.String({ description: "Operation name (one of the list above)" }),
-      message: Type.Optional(Type.String({ description: "Customer reply text (reply_to_ticket) OR internal note text (add_note)" })),
+      message: Type.Optional(Type.String({ description: "reply_to_ticket: the WHOLE customer reply - HTML (tables/headings, inline styles) or markdown. add_note: the internal note." })),
       internal_note: Type.Optional(Type.String({ description: "resolve_ticket: internal review note" })),
-      customer_html: Type.Optional(Type.String({ description: "resolve_ticket: the HTML customer reply (inline styles)" })),
+      customer_html: Type.Optional(Type.String({ description: "resolve_ticket: the HTML customer reply (inline styles). reply_to_ticket also accepts it as the whole reply (it wins over message) - never split one reply across message and customer_html." })),
       reason: Type.Optional(Type.String({ description: "close_ticket / cancel reason" })),
       cancel: Type.Optional(Type.Boolean({ description: "resolve_ticket: true to cancel instead of close" })),
       company_partner_id: Type.Optional(Type.Number({ description: "set_ticket_company: correct company partner_id" })),
       partner_id: Type.Optional(Type.Number({ description: "KB ops: the company partner_id" })),
       article_id: Type.Optional(Type.Number({ description: "get_kb_article: article id" })),
+      query: Type.Optional(Type.String({ description: "search_kb / get_kb_article / get_global_kb: the words to search for" })),
+      offset: Type.Optional(Type.Number({ description: "get_kb_article: character offset to read a long article from" })),
       title: Type.Optional(Type.String({ description: "KB article title" })),
       content: Type.Optional(Type.String({ description: "KB article content" })),
       name: Type.Optional(Type.String({ description: "find_company: company name" })),
@@ -2101,7 +2373,17 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // password splashed into the transcript to find out what they are approving.
       let notebookAuth = null;
       let notebookWrote = null;
-      if (cap.cls === "secret_write") {
+      if (cap.cls === "secret_write" && p.operation === "add_totp") {
+        const g = gate
+          ? await gate("totp_write", totpAsk(p.operation, p.args || p, actorEmail))
+          : { ok: false, reason: "no approval channel available - a TOTP code can only be added from the ai-decision window." };
+        if (!g.ok) {
+          return text(
+            (g.reason || "Adding that TOTP code was not permitted.") +
+            " Do not retry it, and do not put the secret in a ticket or email.",
+          );
+        }
+      } else if (cap.cls === "secret_write") {
         // Everything shown to the technician is built by notebookWriteSummary(), which is
         // a pure exported function so it can be tested. The first version of this branch
         // was inline and referenced an `op` variable that does not exist in this scope -
@@ -2126,8 +2408,18 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       }
       // CREDENTIALS: the technician permits each retrieval at the time. Denied outright on
       // every other surface by SURFACE_CLASSES, so this branch is the only way in.
-      if (cap.cls === "secret") {
+      if (cap.cls === "secret" && p.operation !== "get_partner_credentials") {
         const A = p.args || {};
+        if (p.operation === "get_totp_code") {
+          const g = gate
+            ? await gate("secret", totpAsk(p.operation, A, actorEmail), { privileged: false })
+            : { ok: false, reason: "no approval channel available - a TOTP code can only be revealed in a window a person opened." };
+          if (!g.ok)
+            return text(
+              (g.reason || "Revealing that TOTP code was not permitted.") +
+                " Do not retry it and do not ask the customer for their code.",
+            );
+        } else {
         const who = p.company_name || p.partner_id || A.company_name || A.partner_id || "this company";
         const wantsPriv = !!(p.include_privileged || A.include_privileged);
         // The privileged flag travels as DATA, not as a phrase in the summary: it decides
@@ -2147,6 +2439,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
               " Do not retry it and do not ask the customer for their password. If you need it, say " +
               "which system you need it for and let the technician decide.",
           );
+        }
       }
       // Closing a ticket asks a human EVERY time - never auto-approvable (ISSUES.md
       // D2/I7). MANDATE 4.8: "the model never decides that a ticket may be closed"; this
@@ -2168,7 +2461,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // so a read/write can never fail with 'ticket not found: undefined'.
       const args = { ...(p.args || {}) };
       for (const k of ["message", "internal_note", "customer_html", "reason", "cancel",
-        "company_partner_id", "partner_id", "article_id", "title", "content", "name", "domain", "email"])
+        "company_partner_id", "partner_id", "article_id", "query", "offset", "title", "content", "name", "domain", "email"])
         if (p[k] !== undefined && args[k] === undefined) args[k] = p[k];
       if (closeAuth) {
         const stamp =
@@ -2247,6 +2540,21 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     },
   });
 
+  const CREDENTIAL_STORE_RE = /partner[._]secure[._]note|shared[._]totp|secure_note|totp[._](?:secret|seed|code)\b|res_users_apikeys|ir[._]config[._]parameter/i;
+  // ...AND the command reaches stored DATA: a database client, the Odoo shell/ORM, an RPC
+  // endpoint, or raw SQL. The secrets live in the database, not in the module's files.
+  // Until 2026-09-30 the name alone was enough, so the folder custom-addons/
+  // partner_secure_notes/ matched and every grep/cat/git of the IT Notebook's own SOURCE
+  // was refused: TICKET/62044 (fix the IT Notebook paste bug) hit it 11 times, and the
+  // model started building the string with printf to get past it - worse than either.
+  const CREDENTIAL_DATA_ACCESS_RE = new RegExp([
+    "\\b(?:psql|pg_dump|pg_dumpall|pg_restore|sqlite3|mysql|mariadb|mongosh?|psycopg2?|sqlalchemy)\\b",
+    "odoo(?:-bin)?\\s+shell", "odoo\\.registry", "\\benv\\s*\\[", "\\.sudo\\(\\)",
+    "execute_kw", "search_read", "call_kw", "\\/jsonrpc", "xmlrpc", "\\/web\\/dataset",
+    "\\b(?:SELECT|INSERT|UPDATE|DELETE|COPY|TRUNCATE)\\b",
+  ].join("|"));
+  const touchesCredentialData = (cmd) =>
+    CREDENTIAL_STORE_RE.test(String(cmd || "")) && CREDENTIAL_DATA_ACCESS_RE.test(String(cmd || ""));
   const run_device_command = defineTool({
     name: "run_device_command",
     label: "Run device command",
@@ -2280,7 +2588,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // ONLY run when the ticket requester is an APPROVED support contact for the company
       // (Primary/Secondary Support Contact in Odoo). This is deterministic and applies
       // even in Write mode / Auto-approve - no exceptions.
-      if (privilegedMatch(p.command)) {
+      if (privilegedMatch(p.command) && !techApproved(techTurns)) {
         let authz = null;
         try { if (hd?.operations?.check_support_authorization) authz = await hd.operations.check_support_authorization({ ticket: ticketRef }); } catch { /* verify below */ }
         if (!authz || !authz.authorized) {
@@ -2291,9 +2599,42 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
             (authz
               ? `Requester "${authz.requester}" is NOT an authorized support contact for ${authz.company}. Authorized contacts: ${(authz.authorized_contacts || []).join("; ") || "none set in Odoo"}. `
               : "Authorization could not be verified. ") +
-            "Get an authorized support contact to request or approve this FIRST, then proceed.",
+            "Get an authorized support contact to request or approve this FIRST, then proceed - " +
+            "OR, if a technician is in this chat, ask THEM to approve it (their explicit OK is enough).",
           );
         }
+      }
+      // Credential stores are reached through their brokered tools ONLY. A shell on the ERP
+      // host can SELECT every IT Notebook password or INSERT a TOTP seed straight into Odoo,
+      // and that skips the credential-read gate, the totp_write instruction check, the judge
+      // and the per-user Odoo permissions. TICKET/61824 (2026-09-26): after fill_secret hit
+      // friction the model announced it would "create the TOTP entry via Odoo shell".
+      // ...and the same for hand-rolled TOTP work in the ERP database: TICKET/61824 spent a
+      // turn on psql/odoo-shell hunting a "TOTP-Admin group id" that add_totp never needs.
+      const rawOdoo = /\bpsql\b|odoo(?:-bin)?\s+shell|odoo\.registry|execute_kw|\/jsonrpc/i.test(String(p.command || ""));
+      if (rawOdoo && /totp|res[._]groups/i.test(String(p.command || ""))) {
+        return text(
+          "BLOCKED - do not do TOTP work in the ERP database by hand. helpdesk_call add_totp does it " +
+          "as the signed-in technician: pass view_group as the KEY (us_only | admin | helpdesk | " +
+          "international | public) - never a group id - plus name, issuer, account_label, secret " +
+          "(the authenticator Secret key read from the Microsoft 'Can't scan image?' page) and " +
+          "partner_id. No secret yet means the authenticator has not been enrolled: do that first " +
+          "on the Operator workstation (mysignins.microsoft.com/security-info -> Add sign-in method -> " +
+          "Authenticator app -> 'I want to use a different authenticator app' -> Next -> 'Can't scan image?').",
+        );
+      }
+      if (touchesCredentialData(p.command)) {
+        return text(
+          "BLOCKED - that command touches the credential store directly (IT Notebook " +
+          "partner.secure.note / shared TOTP). Use the brokered tools instead, they need no raw access: " +
+          "run_script_with_credential (company + label) to run a normal script with the stored login - " +
+          "that is the FIRST choice for anything with a CLI or API; helpdesk_call o365_totp_coverage / " +
+          "list_totp for LABELS (these ARE helpdesk_call operations); and the SEPARATE operator_desktop_* " +
+          "TOOLS (not helpdesk_call operations - calling them through helpdesk_call fails: " +
+          "operator_desktop_fill_secret types a stored login into a web page, and helpdesk_call add_totp " +
+          "stores a new authenticator). If one of those fails, report the exact " +
+          "error to the technician - do not work around it." + desktopLoadHint,
+        );
       }
       // DO NOT hand-roll desktop control on a machine the Operator owns. See GUI_DRIVING.
       // This is a refusal rather than an approval prompt: the problem is not that the
@@ -2308,7 +2649,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           `checks it. That is exactly how TICKET/60427 matched a device code against the wrong ` +
           `tenant (AADSTS50034) and then locked the account. ` +
           `Use operator_desktop_open_url: it is ALWAYS InPrivate and it VERIFIES the window it ` +
-          `actually got before you type anything into it.`,
+          `actually got before you type anything into it.` + desktopLoadHint,
         );
       }
       const guiHit = guiDrivingMatch(p.command);
@@ -2321,7 +2662,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           `run_device_command has none of that - on TICKET/60427 it signed in through the ` +
           `workstation's own profile, hit the wrong tenant, and locked the account. ` +
           `If you are completing a device-code or MFA prompt, ask the technician instead ` +
-          `(they can do it in seconds) rather than automating the keyboard.`,
+          `(they can do it in seconds) rather than automating the keyboard.` + desktopLoadHint,
         );
       }
       // Gate ANY command that would MODIFY the device (not just "destructive" ones) -
@@ -2830,8 +3171,11 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     // gate("device") already enforces read-only and the approval prompt here, so the
     // read-only check is folded into it and isReadonly is left null on purpose.
     approve: (summary) => (gate ? gate("device", summary) : { ok: false, reason: "no approval channel available." }),
+    approvePasswordChange: (summary) => (gate ? gate("password_change", summary) : { ok: false, reason: "no approval channel available." }),
     mutatingMatch,
   }) || [];
+  agentFirstDesktop(operatorTools, { techTurns, text });
+  mfaPhoneGate(operatorTools, { techTurns, text });
 
 
 
@@ -2938,7 +3282,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     });
   }
 
-  let baseTools = [helpdesk_call, find_devices, deviceHardwareTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
+  let baseTools = [helpdesk_call, find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
   if (sales_call) baseTools.push(sales_call);
   if (leadRef) {
     // DISCOVERY. Device tools stay - they obey Write mode and the approval prompt exactly
@@ -2959,6 +3303,6 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     baseTools = baseTools.filter((t) => !drop.has(t.name));
     baseTools.push(submit_discovery_scope);
   }
-  return { tools: baseTools, hd, hdError, sales, salesError, discoveryScope };
+  return { tools: baseTools, hd, hdError, sales, salesError, discoveryScope, unadvertisedOpLines };
 }
 

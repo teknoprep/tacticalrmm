@@ -20,6 +20,32 @@
 //   loadError()             -> models.json problem, or undefined
 //   generation              -> "modelruntime" | "authstorage"  (for logging/diagnostics)
 import { MODELS_JSON } from "./models-catalog.js";
+import { getSupportedThinkingLevels } from "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/models.js";
+
+// xAI publishes reasoningEffort including "xhigh" for these. The installed pi package
+// only maps it on grok-4.6; grok-4.3/4.5 have xhigh: null (stale) and grok-4.7 lives in
+// models.json as a stub with no map at all, so setThinkingLevel clamps "xhigh" down to
+// "high" and the setting the admin picked never reaches the API. Patch the live model
+// object — do NOT write these into models.json, which would shadow the built-in definition.
+const XAI_XHIGH = new Set(["grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7"]);
+
+function enableXhigh(model) {
+  if (!model || model.provider !== "xai" || !XAI_XHIGH.has(model.id)) return model;
+  if (!model.thinkingLevelMap) {
+    model.thinkingLevelMap = {
+      off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null,
+    };
+  } else if (model.thinkingLevelMap.xhigh == null) {
+    model.thinkingLevelMap.xhigh = "xhigh";
+  }
+  return model;
+}
+
+function patchXhigh(rt) {
+  for (const id of XAI_XHIGH) {
+    try { enableXhigh(rt.getModel ? rt.getModel("xai", id) : rt.find("xai", id)); } catch { /* not served */ }
+  }
+}
 
 // Overridable so the same code can be exercised against another installed copy
 // (the update pre-flight probe does exactly this before anything is swapped in).
@@ -43,12 +69,17 @@ export async function piGeneration() {
 // model natively?". Needed because the normal lookup resolves through models.json, so it
 // cannot tell a real built-in definition from a stub we wrote there ourselves.
 const NO_MODELS_JSON = "/nonexistent/pi-trmm-bridge-no-models.json";
+// pi's refreshed catalog (pi.dev) lives next to models.json. "Known natively" includes it:
+// that catalog is pi's own full definition WITH its price, not a stub we wrote. Without
+// this, a model pi.dev already describes (claude-opus-5-5, 2026-09-26) kept our unpriced
+// stub forever and every turn on it was booked at $0.
+const MODELS_STORE = MODELS_JSON.replace(/[^/]+$/, "models-store.json");
 let _builtinRt = null;
 async function builtinRuntime() {
   if (_builtinRt !== null) return _builtinRt;
   const m = await pi();
   if (m.ModelRuntime) {
-    const rt = await m.ModelRuntime.create({ modelsPath: NO_MODELS_JSON });
+    const rt = await m.ModelRuntime.create({ modelsPath: NO_MODELS_JSON, modelsStorePath: MODELS_STORE });
     _builtinRt = { get: (p, id) => rt.getModel(p, id) };
   } else if (m.AuthStorage && m.ModelRegistry) {
     const reg = m.ModelRegistry.create(m.AuthStorage.create(), NO_MODELS_JSON);
@@ -59,7 +90,31 @@ async function builtinRuntime() {
   return _builtinRt;
 }
 
-/** Does the installed package itself define this model (ignoring models.json)? */
+/**
+ * Refresh pi's model catalog from pi.dev (prices, context windows, new models) into
+ * models-store.json. Session runtimes stay offline and read that file, so a chat never
+ * waits on the network; this runs at startup and on every catalog probe. pi itself skips
+ * the fetch when the stored copy is under 4 hours old, unless `force`.
+ */
+export async function refreshModelCatalog({ force = false, timeoutMs = 20000 } = {}) {
+  const m = await pi();
+  if (!m.ModelRuntime) return { refreshed: false, reason: "pi runtime predates the remote catalog" };
+  const rt = await m.ModelRuntime.create({
+    modelsPath: NO_MODELS_JSON, modelsStorePath: MODELS_STORE,
+    allowModelNetwork: true, refreshOnCreate: false,
+  });
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    await rt.refresh({ allowNetwork: true, force, signal: ac.signal });
+  } finally {
+    clearTimeout(t);
+  }
+  _builtinRt = null;   // next builtinModel() sees the new catalog
+  return { refreshed: true, store: MODELS_STORE };
+}
+
+/** Does pi itself define this model (bundled or its refreshed catalog), ignoring models.json? */
 export async function builtinModel(provider, id) {
   const rt = await builtinRuntime();
   try { return rt.get(provider, id); } catch { return undefined; }
@@ -77,11 +132,22 @@ export async function piRuntime(keys = {}) {
   if (m.ModelRuntime) {
     const rt = await m.ModelRuntime.create({ modelsPath: MODELS_JSON });
     for (const [prov, key] of Object.entries(keys)) if (key) rt.setRuntimeApiKey(prov, key);
+    patchXhigh(rt);
     return {
       generation: "modelruntime",
       raw: rt,
       findModel: (provider, id) => rt.getModel(provider, id),
-      listModels: () => rt.getModels().map(toRow),
+      // ONLY MODELS WE HOLD A KEY FOR - the contract the pre-0.81 path met with getAvailable().
+      // getModels() is the whole catalog (~1700), so after the 2026-09-30 runtime update the
+      // compaction picker chose amazon-bedrock/llama4-scout (largest window, no key) and
+      // summarising failed on TICKET/61934. If the auth snapshot is not ready yet, fall back
+      // to the full list rather than returning nothing.
+      listModels: () => {
+        const all = rt.getModels();
+        let usable = all;
+        try { usable = all.filter((m) => rt.hasConfiguredAuth(m.provider)); } catch { usable = all; }
+        return (usable.length ? usable : all).map(toRow);
+      },
       sessionOpts: { modelRuntime: rt },
       loadError: () => (rt.getError ? rt.getError() : undefined),
     };
@@ -94,6 +160,7 @@ export async function piRuntime(keys = {}) {
     // create() (not inMemory()) so models.json is honoured - that is what makes a model
     // the provider has released but this package does not know about runnable.
     const reg = m.ModelRegistry.create(auth, MODELS_JSON);
+    patchXhigh(reg);
     return {
       generation: "authstorage",
       raw: reg,
@@ -119,6 +186,16 @@ function toRow(x) {
     display_name: x.name || x.id,
     reasoning: !!x.reasoning,
     context_window: x.contextWindow,
+    // The rate card pi prices this model with (USD per million tokens), or null. An
+    // all-zero card is "unpriced", not free.
+    cost: x.cost && (x.cost.input || x.cost.output) ? x.cost : null,
+    // What this model will actually honour. "xhigh"/"max" are absent unless the model's
+    // thinkingLevelMap names them — offering them otherwise is a lie, setThinkingLevel
+    // clamps them away before the request is sent.
+    // A map that nulls every level (grok-build-0.1: xAI rejects reasoningEffort at any
+    // value, including "none") comes back empty. Offer "off" so the settings UI does not
+    // fall back to high/xhigh, which the API would 400.
+    thinking_levels: getSupportedThinkingLevels(x).length ? getSupportedThinkingLevels(x) : ["off"],
   };
 }
 
