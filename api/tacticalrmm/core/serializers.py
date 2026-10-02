@@ -89,6 +89,49 @@ class CoreSettingsSerializer(HostedCoreMixin, serializers.ModelSerializer):
                 )
         attrs["ai_operator_allowed_agent_ids"] = operator_ids
 
+        # ---- AGENT ROUTING PER RULE ------------------------------------------------
+        # {"<surface>": <agent group id>}. The surface keys come from AGENT_SURFACES, so a
+        # typo is rejected here rather than silently ignored forever, and a cleared row
+        # (null / "") is dropped so "inherit the preferred group" has one representation.
+        routing = get_value("ai_agent_routing")
+        if routing in (None, ""):
+            routing = {}
+        if not isinstance(routing, dict):
+            raise serializers.ValidationError(
+                {"ai_agent_routing": "Agent routing must be an object of surface -> group."}
+            )
+        if routing:
+            from core.agent_groups import AGENT_SURFACE_KEYS
+            from core.models import AIAgentGroup
+
+            unknown = sorted(k for k in routing if k not in AGENT_SURFACE_KEYS)
+            if unknown:
+                raise serializers.ValidationError(
+                    {"ai_agent_routing": f"Unknown routing target(s): {', '.join(unknown)}."}
+                )
+            cleaned = {}
+            for key, value in routing.items():
+                if value in (None, ""):
+                    continue
+                try:
+                    cleaned[key] = int(value)
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError(
+                        {"ai_agent_routing": f"'{key}' must name an agent group id, or be cleared."}
+                    )
+            if cleaned:
+                found = set(
+                    AIAgentGroup.objects.filter(pk__in=set(cleaned.values()))
+                    .values_list("pk", flat=True)
+                )
+                missing = sorted(v for v in set(cleaned.values()) if v not in found)
+                if missing:
+                    raise serializers.ValidationError(
+                        {"ai_agent_routing": f"No agent group with id {', '.join(map(str, missing))}."}
+                    )
+            routing = cleaned
+        attrs["ai_agent_routing"] = routing
+
         operator_enabled = bool(get_value("ai_operator_enabled"))
         operator_model = get_value("ai_operator_default_model")
         if operator_enabled and not operator_model:
@@ -253,12 +296,44 @@ class ScheduleAuditSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+_NATIVE_PROVIDERS_CACHE = {"at": 0.0, "rows": None}
+
+
+def native_pi_providers(max_age: float = 300.0):
+    """Providers the installed pi runtime supports natively, as reported by the bridge
+    (GET /pi/providers): [{id, name, auth, api_key, base_url, base_url_required, model_count}].
+    Returns None when the bridge cannot be asked. Cached briefly - it only changes on a pi
+    upgrade, which restarts the bridge anyway."""
+    import time
+
+    import requests as _requests
+    from django.conf import settings as _settings
+
+    now = time.time()
+    if _NATIVE_PROVIDERS_CACHE["rows"] is not None and now - _NATIVE_PROVIDERS_CACHE["at"] < max_age:
+        return _NATIVE_PROVIDERS_CACHE["rows"]
+    bridge = getattr(_settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+    try:
+        rows = _requests.get(f"{bridge}/pi/providers", timeout=(3, 10)).json().get("providers") or None
+    except Exception:
+        rows = None
+    if rows:
+        _NATIVE_PROVIDERS_CACHE.update(at=now, rows=rows)
+    return rows
+
+
 class AIModelSerializer(serializers.ModelSerializer):
     provider_name = serializers.CharField(source="provider.name", read_only=True)
 
     class Meta:
         model = AIModel
         fields = "__all__"
+
+    def validate_auto_summarize_tokens(self, value):
+        v = int(value or 0)
+        if v < 20000 or v > 1000000:
+            raise serializers.ValidationError("Auto-summarize threshold must be between 20,000 and 1,000,000 tokens.")
+        return v
 
 
 class AIAgentGroupMemberSerializer(serializers.ModelSerializer):
@@ -300,11 +375,18 @@ class AIAgentGroupSerializer(serializers.ModelSerializer):
             "workspace",
             "enabled",
             "is_default",
+            "auto_summarize_tokens",
             "members",
             "created_time",
             "modified_time",
         )
         read_only_fields = ("slug", "created_time", "modified_time")
+
+    def validate_auto_summarize_tokens(self, value):
+        v = int(value or 0)
+        if v < 20000 or v > 1000000:
+            raise serializers.ValidationError("Auto-summarize threshold must be between 20,000 and 1,000,000 tokens.")
+        return v
 
     def validate(self, attrs):
         if self.instance is None and not attrs.get("members"):
@@ -360,6 +442,10 @@ class AIAgentGroupSerializer(serializers.ModelSerializer):
                     "model_id": m.get("model_id") or "",
                     "display_name": m.get("display_name") or m.get("model_id") or "",
                     "thinking_level": m.get("thinking_level") or "medium",
+                    # The backup model this role falls back to when its provider refuses outright.
+                    "fallback_provider": m.get("fallback_provider") or "",
+                    "fallback_model_id": m.get("fallback_model_id") or "",
+                    "fallback_thinking_level": m.get("fallback_thinking_level") or "",
                     "definition": m.get("definition") or "",
                     "enabled": m.get("enabled", True),
                 },
@@ -414,6 +500,38 @@ class AIProviderSerializer(serializers.ModelSerializer):
 
     def get_api_key_set(self, obj) -> bool:
         return bool(obj.api_key)
+
+    def validate_name(self, value):
+        """The provider id must be one the installed pi runtime supports NATIVELY.
+
+        Why (2026-09-27): a DeepSeek key saved as provider "custom" failed every chat with
+        "Model not found: custom/deepseek-flash" - pi files DeepSeek under "deepseek", and
+        "custom" is not a provider the bridge can run at all. Asking the bridge (which asks
+        pi) makes the list follow pi upgrades instead of a hardcoded one. If the bridge
+        cannot be reached the id is accepted on shape alone - a wrong id only fails later,
+        and refusing every save during a bridge restart would be worse.
+        """
+        import re
+
+        v = str(value or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,49}", v):
+            raise serializers.ValidationError("Provider id must be lowercase letters, digits and dashes (e.g. deepseek).")
+        if self.instance is not None and self.instance.name == v:
+            return v  # unchanged - never block an edit of an existing row
+        native = native_pi_providers()
+        if native is None:
+            return v
+        row = next((p for p in native if p.get("id") == v), None)
+        if row is None:
+            sample = ", ".join(sorted(p["id"] for p in native)[:60])
+            raise serializers.ValidationError(
+                f"'{v}' is not a provider the installed pi runtime supports natively. Pick one of: {sample}"
+            )
+        if not row.get("api_key"):
+            raise serializers.ValidationError(
+                f"'{v}' only supports OAuth sign-in in pi, which this page cannot do - it needs an API key provider."
+            )
+        return v
 
     def validate_api_key(self, value):
         """Refuse anything that plainly is not an API key.
@@ -619,4 +737,21 @@ class AITicketAutomationSubjectSerializer(serializers.ModelSerializer):
 
     def get_procedure_titles(self, obj) -> list:
         return [f"{p.pk} {p.title}" for p in obj.procedures.all()]
+
+    def validate_statements(self, value):
+        """A rule is only saved if every condition, action and parameter in it is one the
+        interpreter knows. Same principle as the bridge's tool gating: an unknown verb is not a
+        mistake to paper over at run time, it is a rule that must not exist.
+
+        The prelude (approval) and the terminator (stop) are written in HERE rather than trusted
+        from the request, so no client - not the editor, not a direct API call - can save a rule
+        without its gate."""
+        from core.ai_rules import validate, with_defaults
+
+        if value in (None, {}, []):
+            return {}
+        clean, errors = validate(value)
+        if errors:
+            raise serializers.ValidationError(errors[:8])
+        return with_defaults(clean) if clean else {}
 

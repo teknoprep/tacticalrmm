@@ -815,7 +815,7 @@ def _ai_device_facts(agent):
 
 def _run_prompt_on_agent(
     *, agent, model, prompt, allow_mutating, run_id, reply_register="none",
-    primary_role="", secondary_machines=None,
+    primary_role="", secondary_machines=None, extra_fields=None,
 ):
     """Execute one headless AI run via the bridge. Returns (status, summary, output,
     ticket_error).
@@ -839,10 +839,16 @@ def _run_prompt_on_agent(
     payload = {
         "agent_id": agent.agent_id,
         "device_facts": device_facts,
-        "provider": model.provider.name,
-        "model_id": model.model_id,
-        "api_key": model.provider.api_key,
-        "thinking_level": model.thinking_level,
+        # A GROUP OVERRIDES THE CALLER'S MODEL (owner, 2026-09-29): when `extra_fields` carries
+        # a group's orchestrator (core.agent_groups.headless_orchestrator_fields) it also
+        # carries the keys and the roster, and `model` may be None because the caller had no
+        # reason to resolve one. Splatted here so it wins.
+        **(extra_fields or {
+            "provider": model.provider.name,
+            "model_id": model.model_id,
+            "api_key": model.provider.api_key,
+            "thinking_level": model.thinking_level,
+        }),
         "prompt": prompt,
         "allow_mutating": allow_mutating,
         "run_id": run_id,
@@ -1940,12 +1946,22 @@ def triage_ai_ticket(state_pk, force=False):
         return "gone"
     if not force and st.status not in ("new", "error"):
         return f"skip status={st.status}"
-    model = _resolve_ai_model(None)
-    if not model:
-        st.status = "error"
-        st.error_detail = "no enabled AI model/default configured"
-        st.save(update_fields=["status", "error_detail"])
-        return st.error_detail
+    # WHICH MODEL TRIAGES? Settings > AI > "Agent routing per rule" for this surface wins,
+    # else the "Preferred agent group" (owner, 2026-09-27, per-rule 2026-09-29): the group's
+    # orchestrator thinks, its roster can be delegated to, and its provider keys are used.
+    # Without a group this falls back to the starred default AIModel, exactly as before.
+    from core.agent_groups import headless_group_blob
+
+    gh = headless_group_blob(core, surface="triage")
+    group_orch = gh.get("group_orchestrator") or {}
+    model = None
+    if not group_orch:
+        model = _resolve_ai_model(None)
+        if not model:
+            st.status = "error"
+            st.error_detail = "no enabled AI model/default configured"
+            st.save(update_fields=["status", "error_detail"])
+            return st.error_detail
 
     st.status = "triaging"
     st.save(update_fields=["status"])
@@ -2212,10 +2228,22 @@ def triage_ai_ticket(state_pk, force=False):
                 "ticket_ref": st.ticket_ref,
                 "is_alert": st.is_alert,
                 "requester_email": st.requester or "",
-                "provider": model.provider.name,
-                "model_id": model.model_id,
-                "api_key": model.provider.api_key,
-                "thinking_level": model.thinking_level,
+                **(
+                    {
+                        "provider": group_orch.get("provider", ""),
+                        "model_id": group_orch.get("model_id", ""),
+                        "api_key": (gh.get("agent_group_keys") or {}).get(group_orch.get("provider", ""), ""),
+                        "thinking_level": group_orch.get("thinking_level") or "medium",
+                        **gh,
+                    }
+                    if group_orch
+                    else {
+                        "provider": model.provider.name,
+                        "model_id": model.model_id,
+                        "api_key": model.provider.api_key,
+                        "thinking_level": model.thinking_level,
+                    }
+                ),
                 "triage_prompt": core.ai_ticket_triage_prompt or "",
                 "act_enabled": bool(core.ai_ticket_act_on_alerts),
                 "act_domains": scope["act_domains"],
@@ -2285,7 +2313,12 @@ def triage_ai_ticket(state_pk, force=False):
     # however clear the answer was. If the owner has approved a SUBJECT whose rules fire on
     # this ticket, it is now worked - within that subject's mode - by core.ai_autowork.
     # Alerts are not touched by this stage: they have the condition/verifier path.
-    if (not data.get("error") and st.status == "triaged"
+    # A TICKET THE AUTOMATION HAS STOOD DOWN ON IS NEVER WORKED AGAIN by it. The flag is checked
+    # here, at the one place automation decides to act, because everything else (status, re-triage,
+    # new activity) flows through this point. A human clears it by working the ticket.
+    if getattr(st, "automation_stood_down", False):
+        logger.info("autowork: %s skipped - automation stood down (%s)", st.ticket_ref, st.stood_down_reason or "no reason recorded")
+    elif (not data.get("error") and st.status == "triaged"
             and st.classification in ("regular", "unknown") and not st.is_alert):
         try:
             from core.ai_autowork import find_subject, hd_op, work_ticket
@@ -3018,9 +3051,14 @@ def attempt_ai_ticket_resolve(ticket_ref):
         return "disabled"
     st = AITicketState.objects.filter(ticket_ref=ticket_ref).first()
     dr = AIDecisionRequest.objects.filter(ticket_ref=ticket_ref).order_by("-id").first()
-    model = _resolve_ai_model(None)
-    if not model:
-        return "no model"
+    from core.agent_groups import headless_orchestrator_fields, model_fallback_fields
+
+    ai_fields = headless_orchestrator_fields(core, surface="resolve")
+    if not ai_fields:
+        model = _resolve_ai_model(None)
+        if not model:
+            return "no model"
+        ai_fields = model_fallback_fields(model)
     ctx = (dr.context if dr else None) or {"summary": (st.summary if st else "")}
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     try:
@@ -3039,8 +3077,7 @@ def attempt_ai_ticket_resolve(ticket_ref):
                     (ctx or {}).get("summary", ""),
                     (ctx or {}).get("proposed_action", ""),
                 ),
-                "provider": model.provider.name, "model_id": model.model_id,
-                "api_key": model.provider.api_key, "thinking_level": model.thinking_level,
+                **ai_fields,
                 "helpdesk_api": {
                     "base_url": core.ai_helpdesk_api_base_url or "",
                     "api_key": core.ai_helpdesk_api_key or "",
@@ -3098,8 +3135,15 @@ def run_ai_scheduled_action(pk):
         status="running",
     )
 
-    model = _resolve_ai_model(None)
-    if not model:
+    # WHICH MODEL RUNS THIS? Settings > Pi.dev AI routes this surface to a group's orchestrator,
+    # else the preferred group, else the starred default (owner, 2026-09-29). /pi/run honours the
+    # provider/model/key; `model` stays None when a group applies, and _run_prompt_on_agent takes
+    # the fields from extra_fields.
+    from core.agent_groups import headless_orchestrator_fields
+
+    ai_fields = headless_orchestrator_fields(core, surface="scheduled")
+    model = None if ai_fields else _resolve_ai_model(None)
+    if not ai_fields and not model:
         msg = "no enabled AI model/default configured"
         act.status = "error"
         act.result = msg
@@ -3132,6 +3176,7 @@ def run_ai_scheduled_action(pk):
     status, summary, output, ticket_error = _run_prompt_on_agent(
         agent=act.agent, model=model, prompt=prompt,
         allow_mutating=act.allow_mutating, run_id=run_id,
+        extra_fields=ai_fields,
     )
 
     run.status = status or "error"
@@ -3223,9 +3268,14 @@ def mine_ticket_procedures(force=False, chain=False):
     # Always look back over the configured window; the per-ticket dedup ledger (below)
     # decides what actually gets mined, so re-scanning is cheap and never double-processes.
     since = now - timedelta(days=max(1, core.ai_procedures_backfill_days or 120))
-    model = _resolve_ai_model(None)
-    if not model:
-        return "no model"
+    from core.agent_groups import headless_orchestrator_fields, model_fallback_fields
+
+    ai_fields = headless_orchestrator_fields(core, surface="miner")
+    if not ai_fields:
+        model = _resolve_ai_model(None)
+        if not model:
+            return "no model"
+        ai_fields = model_fallback_fields(model)
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)
     try:
@@ -3242,10 +3292,7 @@ def mine_ticket_procedures(force=False, chain=False):
                     {"code": f"{p['id']:07d}", "title": p["title"], "category": p["category"]}
                     for p in AIProcedure.objects.values("id", "title", "category")[:1500]
                 ],
-                "provider": model.provider.name,
-                "model_id": model.model_id,
-                "api_key": model.provider.api_key,
-                "thinking_level": model.thinking_level,
+                **ai_fields,
                 "mining_prompt": core.ai_procedures_mining_prompt or "",
                 "helpdesk_api": {
                     "base_url": core.ai_helpdesk_api_base_url or "",
@@ -3339,6 +3386,58 @@ def mine_ticket_procedures(force=False, chain=False):
 # is filed against, or how it dedupes: that is `report_model_changes` in
 # helpdesk.js, so a change in reporting needs no product change.
 # ---------------------------------------------------------------------------
+# NOT a task: this is a helper called directly by refresh_ai_model_catalog below. The `@app.task`
+# that used to sit here belonged to THAT function - inserting this one between the decorator and
+# its function stole it, so celerybeat fired `core.tasks.refresh_ai_model_catalog` every hour into
+# a worker that had never registered it, and every tick was discarded (TICKET/61886, 2026-09-27).
+def reprice_unpriced_spend(rows):
+    """Re-price ledger turns recorded as unpriced once pi has a rate card for that model.
+
+    `rows` are catalog rows from the bridge; `cost` is pi's own card (USD per million
+    tokens, same object pi's calculateCost reads), null when still unknown. The arithmetic
+    mirrors calculateCost: the tier is chosen on input + cache read + cache write tokens.
+    The ledger does not keep 1-hour cache writes apart, so every write is charged at the
+    5-minute rate - close, and never more than the real charge would have been.
+    Returns {"provider/model": turns_repriced}.
+    """
+    from decimal import Decimal
+
+    from core.models import AISpendEntry
+
+    D = lambda v: Decimal(str(v or 0))  # noqa: E731
+    per_m = Decimal(1_000_000)
+    out = {}
+    for m in rows or []:
+        card = m.get("cost") or None
+        if not card or not (card.get("input") or card.get("output")):
+            continue
+        qs = AISpendEntry.objects.filter(
+            provider=m.get("provider") or "", model_id=m.get("model_id") or "", priced=False
+        )
+        n = 0
+        for e in qs.iterator():
+            tokens_in = e.input_tokens + e.cache_read_tokens + e.cache_write_tokens
+            rates, best = card, -1
+            for tier in card.get("tiers") or []:
+                above = tier.get("inputTokensAbove") or 0
+                if tokens_in > above and above > best:
+                    rates, best = tier, above
+            e.cost_input = D(rates.get("input")) * e.input_tokens / per_m
+            e.cost_output = D(rates.get("output")) * e.output_tokens / per_m
+            e.cost_cache_read = D(rates.get("cacheRead")) * e.cache_read_tokens / per_m
+            e.cost_cache_write = D(rates.get("cacheWrite")) * e.cache_write_tokens / per_m
+            e.cost_total = e.cost_input + e.cost_output + e.cost_cache_read + e.cost_cache_write
+            e.priced = True
+            e.save(update_fields=[
+                "cost_input", "cost_output", "cost_cache_read", "cost_cache_write",
+                "cost_total", "priced",
+            ])
+            n += 1
+        if n:
+            out[f"{m.get('provider')}/{m.get('model_id')}"] = n
+    return out
+
+
 @app.task
 def refresh_ai_model_catalog(force=False):
     import json
@@ -3384,6 +3483,12 @@ def refresh_ai_model_catalog(force=False):
 
     rows = data.get("models") or []
     provider_errors = data.get("provider_errors") or {}
+    # Turns booked at $0 because the model had no price yet get their real cost now that it
+    # has one. Never fatal: pricing history must not block the catalog check.
+    try:
+        repriced = reprice_unpriced_spend(rows)
+    except Exception:
+        repriced = {}
     # current[provider] = {model_id: display_name}   (the snapshot shape, unchanged)
     current = {}
     for m in rows:
@@ -3471,6 +3576,9 @@ def refresh_ai_model_catalog(force=False):
     core.save(update_fields=["ai_model_catalog", "ai_model_catalog_checked"])
 
     summary_tail = (f"{len(registered)} registered for use" if registered else "")
+    if repriced:
+        summary_tail = ((summary_tail + "; ") if summary_tail else "") + "repriced " + ", ".join(
+            f"{k} x{v}" for k, v in repriced.items())
     if provider_errors:
         summary_tail += (", " if summary_tail else "") + f"discovery errors: {json.dumps(provider_errors)[:160]}"
 
@@ -4196,9 +4304,14 @@ def _dr_summary_html(data, tickets, actors, quality, value, baselines, sample, c
 
     import requests as _requests
 
-    model = _resolve_ai_model(None)
-    if not model:
-        return ""
+    from core.agent_groups import headless_orchestrator_fields, model_fallback_fields
+
+    ai_fields = headless_orchestrator_fields(core, surface="daily")
+    if not ai_fields:
+        model = _resolve_ai_model(None)
+        if not model:
+            return ""
+        ai_fields = model_fallback_fields(model)
     tot = data.get("totals") or {}
     techs = []
     for a in sorted(actors.values(), key=lambda x: -x["minutes"]):
@@ -4264,8 +4377,7 @@ def _dr_summary_html(data, tickets, actors, quality, value, baselines, sample, c
         r = _requests.post(
             f"{bridge}/pi/analyze",
             json={
-                "provider": model.provider.name, "api_key": model.provider.api_key,
-                "model_id": model.model_id, "thinking_level": model.thinking_level or "medium",
+                **ai_fields,
                 "system_prompt": prompt,
                 "content": "Here are the computed figures for the period:\n\n"
                            + _json.dumps(digest, indent=1, default=str),
@@ -5062,10 +5174,12 @@ _SPEND_GROUPS = {
     "model": "model_id",
     "surface": "surface",
     "ticket": "ticket_ref",
+    "role": "role",
 }
 _SPEND_GROUP_LABELS = {
     "day": "Day", "client": "Client", "user": "Technician",
     "model": "Model", "surface": "Surface", "ticket": "Ticket",
+    "role": "Agent role (and model)",
 }
 
 
@@ -5125,11 +5239,18 @@ def collect_ai_spend(hours: int, options=None) -> dict:
         if not field:
             return []
         qs = rows.annotate(day=TruncDate("at")) if field == "day" else rows
+        # Role is shown WITH its model: one model fills several roles (Opus 5 is judge and
+        # authorizer) and one role can change model (a coder fallback).
+        fields = ("role", "model_id") if field == "role" else (field,)
         out = []
-        for b in qs.values(field).annotate(**sums).order_by(
+        for b in qs.values(*fields).annotate(**sums).order_by(
                 "day" if field == "day" else "-cost_total"):
+            if field == "role":
+                key = f"{b['role'] or '(not recorded)'} · {b['model_id'] or '?'}"
+            else:
+                key = str(b[field]) if b[field] not in (None, "") else "(none)"
             out.append({
-                "key": str(b[field]) if b[field] not in (None, "") else "(none)",
+                "key": key,
                 "turns": b["turns"],
                 "cost_total": f(b["cost_total"]),
                 "cost_output": f(b["cost_output"]),

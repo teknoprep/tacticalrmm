@@ -22,30 +22,58 @@ to a customer, and suppression always leaves a tracker open and a note behind (Â
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("trmm")
 
 # A pattern from a data row is still a pattern: cap it, compile it defensively, and let a
 # bad row disable itself rather than take the poller down.
 MAX_PATTERN = 400
-MAX_PHRASES = 25
+# Raised from 25 (owner, 2026-09-25). A subject that covers a whole family of tickets - "a
+# customer is asking us to judge a suspicious email" - legitimately needs dozens of phrases,
+# and the cap was quietly eating them. Substring tests are cheap; the cap is only here so a
+# runaway data row cannot make the poller crawl.
+MAX_PHRASES = 120
 
 
 def _rx(pattern: str) -> Optional[re.Pattern]:
     if not pattern or len(pattern) > MAX_PATTERN:
+        logger.warning("ai_conditions: pattern ignored (over %s chars): %.60s", MAX_PATTERN, pattern)
         return None
     try:
         return re.compile(pattern, re.I | re.M)
-    except re.error:
+    except re.error as e:
+        logger.warning("ai_conditions: pattern ignored (bad regex: %s): %.60s", e, pattern)
         return None
 
 
-def _phrases(v: Any) -> List[str]:
+def _phrases(v: Any, key: str = "") -> List[str]:
+    """Phrases from a data row, capped - but NEVER silently.
+
+    Truncation here is not cosmetic, and which way it fails depends on the key. Losing an
+    entry from body_any/body_all NARROWS a rule (it stops firing - annoying, visible).
+    Losing one from body_none WIDENS it: a disqualifier that was meant to keep a ticket away
+    from the AI just stops applying, and nothing says so. That is how "i clicked the link and
+    entered my password" - an incident that must reach a human - silently became eligible for
+    an automated reassuring reply. So: disqualifiers are never truncated, and any cap that
+    does bite is logged loudly instead of being swallowed.
+    """
     if isinstance(v, str):
         v = [v]
     if not isinstance(v, list):
         return []
-    return [str(x) for x in v[:MAX_PHRASES] if str(x).strip()]
+    out = [str(x) for x in v if str(x).strip()]
+    if key == "body_none":
+        return out                      # safety list: honour every entry
+    if len(out) > MAX_PHRASES:
+        logger.warning(
+            "ai_conditions: %s truncated from %s to %s phrases - the rule is narrower than written",
+            key or "phrase list", len(out), MAX_PHRASES,
+        )
+        out = out[:MAX_PHRASES]
+    return out
 
 
 def evaluate_match(spec: Dict[str, Any], *, subject: str, body: str, sender: str) -> Tuple[bool, Dict[str, str]]:
@@ -92,15 +120,15 @@ def evaluate_match(spec: Dict[str, Any], *, subject: str, body: str, sender: str
         if not rx or not rx.search(sender):
             return False, {}
 
-    for phrase in _phrases(spec.get("body_all")):
+    for phrase in _phrases(spec.get("body_all"), "body_all"):
         if phrase.lower() not in hay.lower():
             return False, {}
 
-    any_phrases = _phrases(spec.get("body_any"))
+    any_phrases = _phrases(spec.get("body_any"), "body_any")
     if any_phrases and not any(p.lower() in hay.lower() for p in any_phrases):
         return False, {}
 
-    for phrase in _phrases(spec.get("body_none")):
+    for phrase in _phrases(spec.get("body_none"), "body_none"):
         if phrase.lower() in hay.lower():
             return False, {}
 

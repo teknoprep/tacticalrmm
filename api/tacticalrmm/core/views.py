@@ -865,6 +865,26 @@ class UpdateDeleteAIProvider(APIView):
         return Response("ok")
 
 
+class AINativeProviders(APIView):
+    """Providers the installed pi runtime supports natively - the Providers dropdown in
+    Settings > AI is built from this, so a provider added by a pi upgrade shows up without
+    a code change (2026-09-27). Falls back to the built-in label list if the bridge is down."""
+
+    permission_classes = [IsAuthenticated, CoreSettingsPerms]
+
+    def get(self, request):
+        from .serializers import native_pi_providers
+
+        rows = native_pi_providers()
+        if rows is None:
+            rows = [
+                {"id": k, "name": v, "api_key": True, "base_url": "", "base_url_required": k == "custom", "model_count": None}
+                for k, v in AIProvider.PROVIDER_CHOICES
+            ]
+            return Response({"providers": rows, "source": "fallback"})
+        return Response({"providers": rows, "source": "pi"})
+
+
 class AIAvailableModels(APIView):
     """Which models can be attached right now. Asks each provider what it actually
     serves today (so a model released this morning is offered), and marks anything the
@@ -945,6 +965,370 @@ class HelpdeskAssist(APIView):
             return Response({"reply": f"(bridge error: {e})"})
 
 
+class AIAutomationApprovalView(APIView):
+    """The approval surface for ONE ticket's automation, used by the AI Decision window (which is
+    where the ticket's AI note points the technician).
+
+    GET  ?ticket_ref=...            -> what this ticket is waiting on, or what was approved
+         &subject=<id>
+    POST {action: "propose"}        -> (re)write the plan from the subject's rule, for review
+         {action: "approve"}        -> a technician says GO on the plan they were shown
+         {action: "decline", reason}
+
+    Technicians may approve - that is the owner's ruling of 2026-09-28 - so any authenticated user
+    who can see this endpoint can. What bounds the damage is not who they are but WHAT they are
+    approving: `approve` refuses if the plan or the rule changed since it was displayed, and the
+    interpreter only acts on an approval whose digests still match. A support contact's approval
+    (the tokenised channel) is recorded with its own capacity so a rule that needs customer-side
+    verification can demand exactly that.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from core.ai_approval import review
+
+        from core.models import AIAutomationApproval, AITicketAutomationSubject
+
+        ticket_ref = str(request.query_params.get("ticket_ref") or "").strip()
+        if not ticket_ref:
+            return Response({"error": "ticket_ref is required"}, status=400)
+        subject_id = request.query_params.get("subject")
+        qs = AIAutomationApproval.objects.filter(ticket_ref=ticket_ref)
+        if subject_id:
+            qs = qs.filter(subject_id=subject_id)
+        row = qs.order_by("-created").first()
+        if not row:
+            return Response({"state": "none", "ticket_ref": ticket_ref})
+        subj = AITicketAutomationSubject.objects.filter(pk=row.subject_id).first()
+        return Response(review(row, (subj.statements if subj else None)))
+
+    def post(self, request):
+        from core.ai_approval import (
+            CAPACITY_SUPPORT_CONTACT,
+            CAPACITY_TECHNICIAN,
+            approve,
+            decline,
+            propose,
+            review,
+        )
+
+        from core.models import AIAutomationApproval, AITicketAutomationSubject
+
+        d = request.data or {}
+        action = str(d.get("action") or "propose").lower()
+        ticket_ref = str(d.get("ticket_ref") or "").strip()
+        if not ticket_ref:
+            return Response({"error": "ticket_ref is required"}, status=400)
+        subj = AITicketAutomationSubject.objects.filter(pk=d.get("subject")).first()
+
+        if action == "propose":
+            # WHICH SUBJECT? The window does not know, and should not have to: it has a ticket. So
+            # resolve it here the same way the poller does - read the ticket and ask the subjects
+            # which one fires on it. That is what makes "show me the plan" a button a technician can
+            # press on any ticket, rather than something only the automation can create.
+            if subj is None:
+                from core.ai_autowork import find_subject, hd_op
+
+                core = get_core_settings()
+                t = ((hd_op(core, "get_ticket", {"ticket": ticket_ref}) or {}).get("ticket") or {})
+                if not t:
+                    return Response({"error": f"could not read {ticket_ref} from the helpdesk"}, status=502)
+                msgs = ((hd_op(core, "get_ticket", {"ticket": ticket_ref}) or {}).get("messages") or [])
+                # INTERNAL NOTES ARE EXCLUDED, exactly as the poller does it. Including them fed
+                # the AI's OWN notes back into subject matching: after one run, the note's wording
+                # matched a different subject ("suspicious email...") and the wrong automation
+                # claimed the ticket. The customer's words decide which subject runs, never ours.
+                body_text = str(t.get("description") or "") + "\n" + "\n".join(
+                    str(m.get("text") or "") for m in msgs if (m.get("type") or "") != "Note"
+                )
+                subj = find_subject(
+                    subject_line=str(t.get("email_subject") or t.get("name") or ""),
+                    body=body_text,
+                    sender=str(t.get("email") or t.get("partner_email") or ""),
+                    client=str(t.get("partner_company_name") or ""),
+                )
+                if subj is None:
+                    return Response({"error": f"no automation subject matches {ticket_ref} - there is nothing to plan"}, status=400)
+            if not (subj.statements or {}).get("blocks"):
+                return Response({"error": f"subject '{subj.name}' has no rule yet - there is nothing to review"}, status=400)
+            row = propose(ticket_ref=ticket_ref, subject=subj, statements=subj.statements,
+                          proposed_by=request.user.username)
+            return Response({"ok": True, **review(row, subj.statements)})
+
+        row = AIAutomationApproval.objects.filter(ticket_ref=ticket_ref).order_by("-created").first()
+        if row is None:
+            return Response({"error": "nothing has been proposed for this ticket"}, status=400)
+
+        if action == "approve":
+            # A technician in the console, or a support contact arriving through the tokenised
+            # channel. The capacity is recorded because rules can demand the stronger one.
+            capacity = d.get("capacity") if d.get("capacity") in (CAPACITY_TECHNICIAN, CAPACITY_SUPPORT_CONTACT) else CAPACITY_TECHNICIAN
+            try:
+                approve(row, by=request.user.username, capacity=capacity,
+                        plan=d.get("plan") if isinstance(d.get("plan"), dict) else None,
+                        rule=(subj.statements if subj is not None else None))
+            except ValueError as e:
+                # Not a 500: this is the gate doing its job, and the window shows the message and
+                # asks the technician to look again.
+                return Response({"error": str(e), **review(row, (subj.statements if subj else None))}, status=409)
+            return Response({"ok": True, **review(row, (subj.statements if subj else None))})
+
+        if action == "decline":
+            decline(row, by=request.user.username, reason=str(d.get("reason") or ""))
+            return Response({"ok": True, **review(row, (subj.statements if subj else None))})
+
+        return Response({"error": f"unknown action '{action}'"}, status=400)
+
+
+class AIKbArticles(APIView):
+    """Search and read helpdesk KB articles.
+
+    The helpdesk op `list_kb_articles` called WITHOUT a partner_id returns EVERY article in the
+    Odoo system (id, title, company, category). I previously assumed otherwise from the tool's
+    parameter list and told the owner there was no cross-customer search - that was wrong, and this
+    endpoint now does what the data actually allows:
+
+      ?q=sendplot          search the whole catalogue (title / company / category)
+      ?ids=40,44           resolve specific ids, INCLUDING their text, for the popout
+      ?all=1               the whole catalogue, for a count
+
+    The catalogue is cached in-process for a few minutes: it is ~10KB and only changes when
+    somebody edits the helpdesk, so a keystroke must not cost a helpdesk call.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    # Per-process cache (each uwsgi worker keeps its own). Small, short, and never authoritative:
+    # anything that must be exact is read by id.
+    _catalogue: dict = {"at": 0.0, "rows": []}
+    _ttl = 600
+
+    def _catalogue_rows(self):
+        import time
+
+        now = time.time()
+        if self._catalogue["rows"] and now - self._catalogue["at"] < self._ttl:
+            return self._catalogue["rows"]
+        from core.ai_autowork import hd_op
+
+        core = get_core_settings()
+        try:
+            rows = hd_op(core, "list_kb_articles", {}) or []
+        except Exception as e:
+            logger.warning("kb catalogue unavailable: %s", e)
+            rows = []
+        rows = [r for r in rows if isinstance(r, dict) and r.get("id")]
+        if rows:
+            type(self)._catalogue = {"at": now, "rows": rows}
+            return rows
+        return self._catalogue["rows"]
+
+    def get(self, request):
+        import re as _re
+
+        q = str(request.query_params.get("q") or "").strip()
+        raw_ids = str(request.query_params.get("ids") or "")
+        ids = [int(x) for x in _re.findall(r"\d+", raw_ids)][:25]
+
+        # ---- specific ids: resolve, with text (the chips' labels and the popout) -------------
+        if ids:
+            from core.ai_autowork import hd_op
+
+            core = get_core_settings()
+            out = []
+            for i in ids:
+                try:
+                    a = hd_op(core, "get_kb_article", {"id": i})
+                except Exception as e:  # a KB hiccup must not break the editor
+                    logger.warning("kb article %s unavailable: %s", i, e)
+                    a = None
+                if isinstance(a, dict):
+                    title = str(a.get("title") or "").strip()
+                    content = str(a.get("content") or "")
+                    company = str(a.get("company") or "").strip()
+                    url = str(a.get("url") or "").strip()
+                    # A helpdesk that does not know an id answers with an empty shape, not with an
+                    # error. Anything with no title, body, company or link is not an article.
+                    if title or content or company or url:
+                        out.append({"id": i, "title": title or f"Article {i}", "company": company,
+                                    "url": url, "content": content})
+                        continue
+                out.append({"id": i, "title": f"Article {i}", "company": "", "url": "", "content": "",
+                            "missing": True})
+            return Response({"articles": out})
+
+        # ---- whole catalogue (counts / diagnostics only) -------------------------------------
+        if request.query_params.get("all"):
+            rows = self._catalogue_rows()
+            return Response({"articles": [self._brief(r) for r in rows], "catalogue_size": len(rows)})
+
+        # ---- search ---------------------------------------------------------------------------
+        # NOTHING is fetched until the query is worth running. Owner's shape: "every time a few
+        # characters are typed in and then there is a pause you use that as the filter" - so an
+        # empty or 1-char field shows NOTHING rather than dumping the library, and the helpdesk is
+        # not called at all.
+        if len(q) < 2:
+            return Response({"articles": [], "needs_more": True})
+
+        rows = self._catalogue_rows()
+        needle = q.lower()
+        scored = []
+        for r in rows:
+            title = str(r.get("title") or "")
+            company = str(r.get("company") or "")
+            category = str(r.get("category") or "")
+            tl, cl, kl = title.lower(), company.lower(), category.lower()
+            if needle in tl:
+                rank = 0 if tl.startswith(needle) else 1
+            elif needle in cl:
+                rank = 2
+            elif needle in kl:
+                rank = 3
+            else:
+                continue
+            scored.append((rank, tl, r))
+        scored.sort(key=lambda x: (x[0], x[1]))
+        return Response({
+            "articles": [self._brief(r) for _, _, r in scored[:40]],
+            "total": len(scored),
+            "catalogue_size": len(rows),
+            # THE CAP IS REAL AND IS NOT HIDDEN. `list_kb_articles` answers with at most 100 rows
+            # and ignores limit/offset, so this searches that slice and nothing more. Saying so in
+            # the editor is the difference between "not here" and "this search cannot see it".
+            "catalogue_capped": len(rows) >= 100,
+        })
+
+    @staticmethod
+    def _brief(row: dict) -> dict:
+        return {
+            "id": row.get("id"),
+            "title": str(row.get("title") or f"Article {row.get('id')}"),
+            "company": str(row.get("company") or ""),
+            "category": str(row.get("category") or ""),
+        }
+
+
+class AIRuleVocabulary(APIView):
+    """The rule language itself: conditions, actions, the fixed prelude and terminator.
+
+    Served from core/ai_rules.py so the editor can never offer a verb the interpreter does not
+    know - the same reason AGENT_SURFACES is served rather than duplicated in the UI."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from core.ai_rules import vocabulary
+
+        return Response(vocabulary())
+
+
+class AIRuleDraft(APIView):
+    """"Have an AI help write this rule" - one button in the subject editor.
+
+    The model is given the technician's plain-English description plus the procedures available
+    to this subject, and returns a rule tree. For each step it must decide whether the work is
+    MECHANICAL (the same commands every time -> it writes the finished powershell/cmd/bash
+    script, which a human then reviews) or needs JUDGEMENT every time (-> an IF/THEN block that
+    calls the AI at run time).
+
+    Nothing here is trusted: the tree is validated against the vocabulary and errors come back
+    to the editor to be fixed, and the draft is never saved by this endpoint - it only fills the
+    form. The prelude and terminator are added by the serializer on save, so a draft cannot skip
+    the approval gate even if the model tried to."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import json as _json
+
+        import requests as _requests
+        from django.conf import settings as dj_settings
+
+        from core.ai_rules import DRAFT_SYSTEM_PROMPT, draft_content, validate
+        from core.models import AIProcedure, AITicketAutomationSubject
+        from core.tasks import _resolve_ai_model
+
+        description = str(request.data.get("description") or "").strip()
+        if not description:
+            return Response({"error": "Describe what the rule should do, in plain English."}, status=400)
+        if len(description) > 4000:
+            description = description[:4000]
+
+        subj = None
+        if request.data.get("subject"):
+            subj = AITicketAutomationSubject.objects.filter(pk=request.data.get("subject")).first()
+
+        # The procedures this rule may cite: the subject's own selection when it has one, else
+        # every approved procedure (the AI-mined corpus is the point - it is what makes the
+        # rule concrete instead of generic).
+        qs = AIProcedure.objects.exclude(status="retired")
+        if subj is not None and subj.procedures.exists():
+            procs = list(subj.procedures.all())
+        else:
+            procs = list(qs.order_by("-occurrence_count")[:60])
+        plist = [
+            {"id": p.pk, "title": p.title, "status": p.status, "applies_to": p.applies_to,
+             "symptom": p.symptom, "fix": p.fix}
+            for p in procs
+        ]
+
+        core = get_core_settings()
+        from core.agent_groups import headless_orchestrator_fields
+
+        model = _resolve_ai_model(None)
+        if not model:
+            return Response({"error": "No AI model is configured. Add one in Settings > Pi.dev AI."}, status=400)
+        payload = {
+            **headless_orchestrator_fields(core, surface="subjects"),
+            "provider": model.provider.name,
+            "model_id": model.model_id,
+            "api_key": model.provider.api_key,
+            "system_prompt": DRAFT_SYSTEM_PROMPT,
+            "content": draft_content(
+                description=description, procedures=plist,
+                subject={"name": subj.name if subj else "", "description": subj.description if subj else "",
+                         "instructions": subj.instructions if subj else ""},
+            ),
+            "purpose": "rule-draft", "username": request.user.username,
+        }
+        bridge = getattr(dj_settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+        try:
+            r = _requests.post(f"{bridge}/pi/analyze", json=payload, timeout=(10, 300))
+            out = r.json()
+        except Exception as e:
+            return Response({"error": f"The AI service did not answer: {e}"[:300]}, status=502)
+        if out.get("error"):
+            return Response({"error": str(out["error"])[:300]}, status=502)
+
+        import re as _re
+
+        text = (out.get("text") or "").strip()
+        text = _re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=_re.I | _re.M)
+        try:
+            data = _json.loads(text)
+        except Exception:
+            m = _re.search(r"\{[\s\S]*\}", text)
+            try:
+                data = _json.loads(m.group(0)) if m else {}
+            except Exception:
+                data = {}
+        statements = data.get("statements") if isinstance(data, dict) else None
+        if not isinstance(statements, dict) or not statements.get("blocks"):
+            return Response({"error": "The AI did not return a usable rule. Try describing it again, or write it by hand."}, status=502)
+        clean, errors = validate(statements)
+        # A draft that does not validate is returned WITH its problems so a person can fix them
+        # in the form - refusing outright would hide what the model was trying to say.
+        from core.ai_rules import english
+
+        return Response({
+            "statements": clean,
+            "english": english(clean) if clean else [],
+            "errors": errors,
+            "notes": str(data.get("notes") or "")[:1500],
+        })
+
+
 class AIPromptAssist(APIView):
     """AI helper that interviews the admin and drafts the PROMPT for an AI task or
     Bulk AI command (and, for bulk, the combined-report instruction). Stateless;
@@ -1010,13 +1394,17 @@ class GetAddAIAgentGroup(APIView):
     permission_classes = [IsAuthenticated, CoreSettingsPerms]
 
     def get(self, request):
-        from core.agent_groups import ROLE_CATALOG
+        from core.agent_groups import AGENT_SURFACES, ROLE_CATALOG
 
         groups = AIAgentGroup.objects.all().prefetch_related("members")
         return Response(
             {
                 "groups": AIAgentGroupSerializer(groups, many=True).data,
                 "roles": ROLE_CATALOG,
+                # The headless rules Settings > Pi.dev AI lets you route individually.
+                # Served from AGENT_SURFACES so the UI labels and the resolver's keys
+                # are the same list.
+                "surfaces": AGENT_SURFACES,
             }
         )
 
@@ -1700,6 +2088,60 @@ class AISendEmail(APIView):
         )
 
 
+class AIRmmClients(APIView):
+    """GET /core/ai/rmm-clients/?q=<name filter>  - every RMM client with site and device
+    counts, plus totals. Read-only, for the Pi bridge's list_rmm_clients tool.
+
+    Scoped by the caller's role (filter_by_role) exactly like the dashboard, so it can
+    never show a client the calling account could not already see. Carries no device
+    detail - get_device_hardware and find_devices are for that.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Q
+
+        from agents.models import Agent
+        from clients.models import Client
+        from tacticalrmm.constants import AgentMonType
+
+        q = (request.query_params.get("q") or "").strip()
+        clients = Client.objects.filter_by_role(request.user).order_by("name")  # type: ignore
+        if q:
+            clients = clients.filter(name__icontains=q)
+        clients = clients.annotate(n_sites=Count("sites", distinct=True))
+        counts = {
+            row["site__client_id"]: row
+            for row in Agent.objects.filter_by_role(request.user)  # type: ignore
+            .values("site__client_id")
+            .annotate(
+                devices=Count("id"),
+                servers=Count("id", filter=Q(monitoring_type=AgentMonType.SERVER)),
+                workstations=Count("id", filter=Q(monitoring_type=AgentMonType.WORKSTATION)),
+            )
+        }
+        out = []
+        for c in clients:
+            n = counts.get(c.id, {})
+            out.append({
+                "id": c.id,
+                "name": c.name,
+                "sites": c.n_sites,
+                "devices": n.get("devices", 0),
+                "servers": n.get("servers", 0),
+                "workstations": n.get("workstations", 0),
+            })
+        return Response({
+            "total_clients": len(out),
+            "total_sites": sum(x["sites"] for x in out),
+            "total_devices": sum(x["devices"] for x in out),
+            "clients_with_no_devices": sum(1 for x in out if not x["devices"]),
+            "filter": q or None,
+            "clients": out,
+        })
+
+
 class AIDeviceNote(APIView):
     """Durable per-device memory for Pi.dev AI.
 
@@ -2152,6 +2594,7 @@ class AISpendEntryView(APIView):
             turn_index=turn_index,
             defaults={
                 "surface": str(d.get("surface") or "device_chat")[:20],
+                "role": str(d.get("role") or "")[:32],
                 "provider": str(d.get("provider") or "")[:50],
                 "model_id": str(d.get("model_id") or "")[:255],
                 "actor_user": user,
@@ -2520,62 +2963,204 @@ class AITicketAutomationSubjectDetail(APIView):
 
 
 class AutomationSubjectDecide(APIView):
-    """One-click approve/reject from the daily report email. No login: the 40-character
-    single-use token IS the credential, and the only thing it can do is flip ONE proposal
-    to approved or rejected. It cannot edit rules or widen a mode. Consumed on use."""
+    """Approve/reject a proposal from the daily report email. No login: the 40-character
+    token IS the credential, and the only thing it can do is flip ONE proposal to approved
+    or rejected. It cannot edit rules or widen a mode.
+
+    WHY THIS IS A TWO-STEP (owner, 2026-09-25). It used to decide on the GET, and the very
+    first real approval proved why that is wrong:
+
+        104.47.55.254  HEAD /...decide/approve/Y2mT.../  12:20:17   <- Microsoft 365 mail scanner
+        50.212.237.129 GET  /...decide/approve/Y2mT.../  12:20:18   <- the owner, one second later
+
+    Django maps HEAD onto get() when no head handler exists, so Defender/Safe Links SILENTLY
+    APPROVED the subject while scanning the mail, the token was consumed, and the human's own
+    click landed on "Link already used or invalid". Every approval went that way. Worse, the
+    same scan of a Reject link would have auto-rejected a good proposal, and a subject could
+    go live without anyone ever clicking.
+
+    So: GET is SAFE - it only renders a confirmation page with a button. HEAD does nothing at
+    all. The decision happens on POST, which no mail scanner or link-prefetcher performs.
+    Tokens are not blanked afterwards; `status != proposed` enforces single use and still
+    lets a repeat visit say WHICH subject it was and what it became.
+    """
 
     permission_classes = []
     authentication_classes = []
 
+    @staticmethod
+    def _page(title, body, color, extra=""):
+        from django.http import HttpResponse
+        from html import escape
+
+        resp = HttpResponse(
+            "<!doctype html><html><head><meta charset='utf-8'><title>%s</title>"
+            "<meta name='robots' content='noindex,nofollow'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'></head>"
+            "<body style='font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:60px auto;color:#1f2937'>"
+            "<div style='border-left:6px solid %s;padding:16px 20px;background:#f9fafb'>"
+            "<h2 style='margin:0 0 8px'>%s</h2><div>%s</div>%s</div></body></html>"
+            % (escape(title), color, escape(title), body, extra)
+        )
+        # Belt and braces: never let a proxy or scanner cache or pre-render this.
+        resp["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+        resp["X-Robots-Tag"] = "noindex, nofollow"
+        return resp
+
+    def _lookup(self, action, token):
+        from core.models import AITicketAutomationSubject
+
+        field = "approve_token" if action == "approve" else "reject_token"
+        return AITicketAutomationSubject.objects.filter(**{field: str(token or "")[:64]}).first()
+
+    def head(self, request, action, token):
+        """A mail scanner's reachability probe. Answer it; change nothing."""
+        from django.http import HttpResponse
+
+        resp = HttpResponse(status=200)
+        resp["Cache-Control"] = "no-store"
+        return resp
+
     def get(self, request, action, token):
+        """SAFE. Shows what the link would do and asks for one more click."""
+        from django.http import HttpResponse
+        from html import escape
+
+        token = str(token or "")[:64]
+        if action not in ("approve", "reject") or not token:
+            return HttpResponse("Bad request", status=400)
+        subj = self._lookup(action, token)
+        if not subj:
+            return self._page(
+                "Link not recognised",
+                "This link does not match any proposal. Nothing was changed. "
+                "Open the Procedures page &rarr; Ticket Automation Subjects to manage them.",
+                "#6b7280",
+            )
+        if subj.status != "proposed":
+            decided = (
+                f" on {subj.approved_at:%d %b %Y %H:%M} UTC" if subj.approved_at else ""
+            )
+            by = f" by {escape(subj.approved_by)}" if subj.approved_by else ""
+            if subj.proposal_kind == "extend" and subj.extends_subject_id and subj.status == "retired":
+                return self._page(
+                    "Already applied",
+                    f"These rules were already merged into <b>{escape(subj.extends_subject.name)}</b>"
+                    f"{decided}{by}. Nothing was changed by opening this link again.",
+                    "#6b7280",
+                )
+            return self._page(
+                f"Already {subj.status}",
+                f"<b>{escape(subj.name)}</b> was already <b>{escape(subj.status)}</b>{decided}{by}. "
+                "Nothing was changed by opening this link again.",
+                "#6b7280",
+            )
+
+        is_extend = subj.proposal_kind == "extend" and subj.extends_subject_id
+        target = subj.extends_subject if is_extend else None
+        if action == "approve":
+            verb, colour, btn = "Approve", "#166534", "Yes - approve it"
+            if is_extend and target:
+                what = (
+                    f"This will <b>widen the existing subject</b> <b>{escape(target.name)}</b> with the "
+                    f"extra recognition rules below, and no new subject will be created."
+                )
+            else:
+                what = (
+                    f"This will make <b>{escape(subj.name)}</b> live in "
+                    f"<b>{escape(subj.get_mode_display())}</b> mode. Matching tickets that arrive from "
+                    "now on will be worked automatically. The AI never closes a ticket under a subject "
+                    "and replies only on a confident verdict."
+                )
+        else:
+            verb, colour, btn = "Reject", "#991b1b", "Yes - reject it"
+            what = (
+                f"This will reject <b>{escape(subj.name)}</b>. It will not be proposed again "
+                "under that name and nothing will be automated."
+            )
+
+        rules = "<br>".join(
+            f"<code>{escape(k)}</code>: {escape(json.dumps(v))}" for k, v in (subj.match or {}).items()
+        ) or "<i>none</i>"
+        form = (
+            f"<form method='post' style='margin-top:18px'>"
+            f"<button type='submit' style='background:{colour};color:#fff;padding:11px 20px;border:0;"
+            f"border-radius:4px;font-size:14px;font-weight:600;cursor:pointer'>{btn}</button>"
+            f"</form>"
+            f"<div style='font-size:11px;color:#6b7280;margin-top:10px'>Nothing has changed yet. "
+            f"This second click exists because mail-security scanners open links in email "
+            f"automatically; they cannot press this button.</div>"
+        )
+        return self._page(
+            f"{verb} this proposal?",
+            f"<div style='margin-bottom:10px'>{what}</div>"
+            f"<div style='margin-top:10px'><b>Recognises:</b>"
+            f"<div style='font-size:12px;margin:4px 0 0 10px'>{rules}</div></div>",
+            colour,
+            form,
+        )
+
+    def post(self, request, action, token):
+        """The actual decision. Scanners do not POST."""
         from django.http import HttpResponse
         from django.utils import timezone as _tz
         from html import escape
 
-        from core.models import AITicketAutomationSubject
+        from core.ai_subjects_report import merge_subject_match
 
         token = str(token or "")[:64]
-        field = "approve_token" if action == "approve" else "reject_token"
         if action not in ("approve", "reject") or not token:
             return HttpResponse("Bad request", status=400)
-        subj = AITicketAutomationSubject.objects.filter(**{field: token}).first()
-        page = lambda title, body, color: HttpResponse(  # noqa: E731
-            "<!doctype html><html><head><meta charset='utf-8'><title>%s</title></head>"
-            "<body style='font-family:Segoe UI,Arial,sans-serif;max-width:640px;margin:60px auto;color:#1f2937'>"
-            "<div style='border-left:6px solid %s;padding:16px 20px;background:#f9fafb'>"
-            "<h2 style='margin:0 0 8px'>%s</h2><div>%s</div></div></body></html>"
-            % (escape(title), color, escape(title), body)
-        )
+        subj = self._lookup(action, token)
         if not subj:
-            return page("Link already used or invalid",
-                        "This approval link has been used, or does not match a pending proposal. "
-                        "Nothing was changed. Open the Procedures page to manage subjects.", "#6b7280")
+            return self._page("Link not recognised",
+                              "This link does not match any proposal. Nothing was changed.", "#6b7280")
         if subj.status != "proposed":
-            return page(f"Already {subj.status}",
-                        f"<b>{escape(subj.name)}</b> is already <b>{escape(subj.status)}</b>. Nothing was changed.",
-                        "#6b7280")
-        if action == "approve":
-            subj.status = "approved"
-            subj.enabled = True
+            return self._page(f"Already {subj.status}",
+                              f"<b>{escape(subj.name)}</b> is already <b>{escape(subj.status)}</b>. "
+                              "Nothing was changed.", "#6b7280")
+
+        if action == "reject":
+            subj.status = "rejected"
+            subj.enabled = False
+            subj.save(update_fields=["status", "enabled", "updated"])
+            return self._page("Rejected",
+                              f"<b>{escape(subj.name)}</b> was rejected and will not be proposed "
+                              "again under that name.", "#991b1b")
+
+        # APPROVE. An extension merges into the subject it widens; it does not become a
+        # second live row saying almost the same thing.
+        target = subj.extends_subject if subj.proposal_kind == "extend" else None
+        if target:
+            added = merge_subject_match(target, subj.match or {})
+            target.save(update_fields=["match", "updated"])
+            subj.status = "retired"
+            subj.enabled = False
             subj.approved_at = _tz.now()
             subj.approved_by = "email-link"
-            subj.approve_token = ""
-            subj.reject_token = ""
-            subj.save()
-            return page("Approved - live",
-                        f"<b>{escape(subj.name)}</b> is now live in <b>{escape(subj.get_mode_display())}</b> mode. "
-                        "Matching tickets that arrive from now on will be worked automatically. "
-                        "The AI never closes a ticket under a subject and replies only on a confident verdict. "
-                        "Edit, narrow or switch it off any time on the Procedures page &rarr; Ticket Automation Subjects.",
-                        "#166534")
-        subj.status = "rejected"
-        subj.enabled = False
-        subj.approve_token = ""
-        subj.reject_token = ""
-        subj.save()
-        return page("Rejected",
-                    f"<b>{escape(subj.name)}</b> was rejected and will not be proposed again under that name.",
-                    "#991b1b")
+            subj.save(update_fields=["status", "enabled", "approved_at", "approved_by", "updated"])
+            detail = "".join(f"<li><code>{escape(k)}</code>: {escape(json.dumps(v))}</li>" for k, v in added.items())
+            return self._page(
+                "Subject widened",
+                f"<b>{escape(target.name)}</b> now also recognises these tickets. No new subject was "
+                f"created.<ul style='margin:8px 0'>{detail or '<li><i>already covered - nothing to add</i></li>'}</ul>"
+                "Edit or narrow it any time on the Procedures page &rarr; Ticket Automation Subjects.",
+                "#166534",
+            )
+
+        subj.status = "approved"
+        subj.enabled = True
+        subj.approved_at = _tz.now()
+        subj.approved_by = "email-link"
+        subj.save(update_fields=["status", "enabled", "approved_at", "approved_by", "updated"])
+        return self._page(
+            "Approved - live",
+            f"<b>{escape(subj.name)}</b> is now live in <b>{escape(subj.get_mode_display())}</b> mode. "
+            "Matching tickets that arrive from now on will be worked automatically. "
+            "The AI never closes a ticket under a subject and replies only on a confident verdict. "
+            "Edit, narrow or switch it off any time on the Procedures page &rarr; Ticket Automation Subjects.",
+            "#166534",
+        )
 
 
 class AIMobileInbox(APIView):
@@ -2882,9 +3467,10 @@ class AIDecisionSession(APIView):
         req_id = request.data.get("model_id")
         if req_id:
             match = next((m for m in allowed if m.model_id == req_id), None)
-            if not match:
-                return notify_error("Requested model is not permitted for your role.")
-            chosen = match
+            if match:
+                chosen = match
+            # Remembered model was removed, or this role cannot use it.
+            # Open on the permitted default instead of refusing the window.
         from core.agent_groups import apply_group, group_provider_keys
         group_meta = {}
         chosen = apply_group(group_meta, request, chosen)
@@ -2965,6 +3551,7 @@ class AIDecisionSession(APIView):
             # PRIVILEGED rows are excluded from this and still prompt every time (enforced
             # in the bridge, not here).
             "autocredential_allowed": ac,
+            "autototp_allowed": ac,
             # Show the live token/cost meter? Visibility only - grants no capability.
             "cost_visible": bool(is_super or (user.role and user.role.can_view_ai_cost)),
             # May this ticket window be paired to a phone? See core/ai_remote.py.
@@ -3041,6 +3628,9 @@ class AIDecisionSession(APIView):
             "persist_history": True,
             "operator": operator_policy,
         }
+        # An admin's per-TICKET capability grant (core/session_caps.py) ORs into the blob here,
+        # so both the bridge session and the window below see the same permissions.
+        _apply_session_caps(blob, request.user, d.ticket_ref if not _is_crm else d.subject_key, is_super)
         pi_token = create_pi_session(data=blob)
         return Response({
             "token": pi_token,
@@ -3056,10 +3646,19 @@ class AIDecisionSession(APIView):
             "agent_groups": group_meta.get("agent_groups") or [],
             "agent_group": group_meta.get("agent_group"),
             "require_approval": True,
-            "autoapprove_allowed": aa,
-            "auto_approve": bool(aa and getattr(request.user, "ai_autoapprove_default", False)),
-            "autocredential_allowed": ac,
-            "auto_credential": bool(ac and getattr(request.user, "ai_autocredential_default", False)),
+            "mutate_allowed": bool(blob.get("mutate_allowed")),
+            "autoapprove_allowed": bool(blob.get("autoapprove_allowed")),
+            "auto_approve": bool(blob.get("autoapprove_allowed") and getattr(request.user, "ai_autoapprove_default", False)),
+            "autocredential_allowed": bool(blob.get("autocredential_allowed")),
+            "autototp_allowed": bool(blob.get("autototp_allowed")),
+            "auto_credential": bool(blob.get("autocredential_allowed") and getattr(request.user, "ai_autocredential_default", False)),
+            "allow_email": bool(blob.get("allow_email", True)),
+            # Which of the above came from an admin GRANT rather than the user's role, so the
+            # window can label them ("granted for this ticket").
+            "caps_granted": blob.get("caps_granted") or [],
+            # May this user hand capabilities to others? (Lets the window show the admin panel;
+            # the API enforces it regardless - this is a courtesy, not the permission.)
+            "can_grant_caps": bool(is_super or (user.role and user.role.can_edit_core_settings)),
             "remote_allowed": blob["remote_allowed"],
             "operator_enabled": operator_policy["enabled"],
             "operator_machines": [
@@ -3070,6 +3669,20 @@ class AIDecisionSession(APIView):
 
 
 @method_decorator(csrf_exempt, name="dispatch")
+def _apply_session_caps(blob: dict, user, ticket_ref: str, is_super: bool) -> dict:
+    """OR any admin per-ticket capability grant into a chat blob (core/session_caps.py)."""
+    from core.session_caps import apply_caps
+
+    try:
+        apply_caps(blob, user, "ticket", ticket_ref or "")
+    except Exception:
+        pass          # never break opening a chat over a grant lookup
+    # Auto-TOTP is its own capability now: default it to whatever auto-credential allows (the
+    # behaviour before grants existed) unless a grant or the caller set it explicitly.
+    blob.setdefault("autototp_allowed", bool(blob.get("autocredential_allowed")))
+    return blob
+
+
 class AutoworkDuplicates(APIView):
     """Which tickets are held behind the one the automation is working RIGHT NOW.
 

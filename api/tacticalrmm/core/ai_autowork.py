@@ -105,6 +105,10 @@ def _subject_payload(subj, core) -> dict:
             fix_agent_id = str((subj.fix_target or {}).get("agent_id") or "") if isinstance(getattr(subj, "fix_target", None), dict) else ""
     return {
         "id": subj.pk, "name": subj.name, "description": subj.description, "mode": subj.mode,
+        # THE RULE TRAVELS WITH THE TICKET. Without this the bridge had no idea a rule existed and
+        # silently fell back to mode + fix_actions - which is exactly how a subject that had been
+        # converted to a rule went on executing its old canned actions.
+        "statements": subj.statements or {},
         "instructions": subj.instructions, "procedures": procs, "kb_articles": kbs,
         "fix_actions": fix_actions, "fix_agent_id": fix_agent_id, "fix_withheld": fix_withheld,
         # A reply is allowed in both modes; the bridge only sends on a confident verdict.
@@ -126,8 +130,22 @@ def _subject_payload(subj, core) -> dict:
 #     on a customer who is already unhappy is how trust is lost;
 #   * a thank-you needs no thought and no spend. Re-close it.
 # Order matters: the STILL-BROKEN test runs first, so "thanks, but it's still down" is read
-# as still down. Anything that is neither goes down the ordinary triage path, where the
-# model decides - guessing is not required here, only recognising the two clear cases.
+# as still down.
+#
+# A THANK-YOU MUST BE A CLEAN ONE. This is the difference between closing a ticket and closing
+# it on someone who just told us something is still wrong: "Thanks - but now the Tuesday batch
+# fails too" contains a thank-you and a new problem, and the first version of this classifier
+# read it as gratitude and re-closed the ticket. Anything with a problem signal in it is now
+# treated as NOT a thank-you, which (with the owner's rule of 2026-09-28) means the automation
+# stands down and a person reads it.
+_NEW_PROBLEM = re.compile(
+    r"\b(but|however|although|though|except|still|again|also|another|one more|"
+    r"issue|problem|error|errors|failed|failing|fail|broke|broken|crash|"
+    r"not? ?working|does ?n[o']?t work|can'?t|cannot|unable|won'?t|"
+    r"help|please|need|question|wondering|check|look at|"
+    r"same (?:thing|problem|issue)|one (?:other|more) thing)\b",
+    re.I,
+)
 _STILL_BROKEN = re.compile(
     r"\b(did ?n[o']?t (?:work|fix|help)|does ?n[o']?t work|not fixed|still (?:down|broken|not working|"
     r"happening|an issue|the same)|back (?:down|again)|same (?:problem|issue|thing) again|"
@@ -153,13 +171,40 @@ def classify_reply(text: str) -> str:
     if _STILL_BROKEN.search(body):
         return "still_broken"
     if _THANKS.search(body):
-        # A thank-you that also describes a problem is not a thank-you. Kept deliberately
-        # cautious: length is a poor signal, but a long message with a question in it is
-        # far more likely to be a new problem than gratitude.
+        # A thank-you that also describes a problem is not a thank-you - see _NEW_PROBLEM.
+        if _NEW_PROBLEM.search(body):
+            return "unclear"
         if "?" in body and len(body) > 200:
             return "unclear"
         return "thanks"
     return "unclear"
+
+
+def stand_down(st, *, reason: str, core, decision_url: str = "", note_title: str = "",
+               note_body: str = "", tag: bool = True) -> None:
+    """Automation stops on this ticket for good, and a person is fetched.
+
+    Used for every "do not keep automating this" case: the customer says it is still broken, the
+    customer replies with anything that is not a thank-you, or a reviewed fix broke while running.
+    The flag survives re-triage, which is the point - a status alone could not, because the poller
+    re-marks the ticket and the automation would run again.
+    """
+    from django.utils import timezone as _tz
+
+    st.automation_stood_down = True
+    st.stood_down_reason = (reason or "")[:200]
+    st.stood_down_at = _tz.now()
+    try:
+        if note_title and hd_op(core, "add_note", {"ticket": st.ticket_ref, "message":
+                (note_title + "\n" + note_body).strip() + (_chat_anchor(decision_url) if decision_url else "")}):
+            pass
+        if tag:
+            hd_op(core, "set_needs_input_tag", {"ticket": st.ticket_ref})
+        # Un-assign from the bot (never from a human - release_ticket enforces that) so it shows
+        # in the queue as waiting for a person.
+        hd_op(core, "release_ticket", {"ticket": st.ticket_ref})
+    except Exception as e:
+        logger.warning("stand-down bookkeeping failed for %s: %s", st.ticket_ref, e)
 
 
 def handle_reply_to_resolved(st, *, body_text: str, core, decision_url: str = "") -> Optional[str]:
@@ -171,20 +216,16 @@ def handle_reply_to_resolved(st, *, body_text: str, core, decision_url: str = ""
     if verdict == "still_broken":
         st.status = "escalated"
         st.proposed_action = "Customer says it is not fixed. Escalated to a human; automation stands down."
-        try:
-            hd_op(core, "add_note", {"ticket": st.ticket_ref, "message": (
-                "\U0001F916 Pi.dev AI - STANDING DOWN, A HUMAN IS NEEDED\n"
+        stand_down(
+            st, core=core, decision_url=decision_url,
+            reason="customer says it is not fixed",
+            note_title="\U0001F916 Pi.dev AI - STANDING DOWN, A HUMAN IS NEEDED",
+            note_body=(
                 "This ticket was resolved automatically and the customer has replied to say it is "
                 "NOT fixed. The automation will not try again on this ticket - a technician needs to "
                 "take it, because a second automated attempt on someone who is already unhappy is not "
-                "what they asked for.\n\nWhat the automation did before is in the notes above."
-                + (_chat_anchor(decision_url) if decision_url else ""))})
-            hd_op(core, "set_needs_input_tag", {"ticket": st.ticket_ref})
-            # Un-assign from the bot (never from a human - release_ticket enforces that)
-            # so it shows in the queue as waiting for a person.
-            hd_op(core, "release_ticket", {"ticket": st.ticket_ref})
-        except Exception as e:
-            logger.warning("reply-escalation note failed for %s: %s", st.ticket_ref, e)
+                "what they asked for.\n\nWhat the automation did before is in the notes above."),
+        )
         return "escalated"
     if verdict == "thanks":
         st.status = "auto_closed"
@@ -197,7 +238,28 @@ def handle_reply_to_resolved(st, *, body_text: str, core, decision_url: str = ""
         except Exception as e:
             logger.warning("reply-reclose failed for %s: %s", st.ticket_ref, e)
         return "reclosed"
-    return None
+    # ANYTHING ELSE STANDS THE AUTOMATION DOWN (owner, 2026-09-28: "for anything under advise that
+    # is anything other than thank you... we should not continue working on it with automation again
+    # and leave it for a tech").
+    #
+    # This used to return None, which fell through to ordinary triage - and triage runs the
+    # automation. So a reply of "thanks, but the printer is still doing it on Tuesdays" would have
+    # been handed back to the same automation that had just answered, with no human involved. A
+    # person takes it now, and the stand-down flag keeps it that way however many times it is
+    # re-triaged.
+    st.status = "escalated"
+    st.proposed_action = "Customer replied after automation handled it. Standing down; a human takes it."
+    stand_down(
+        st, core=core, decision_url=decision_url,
+        reason="customer replied (not a thank-you)",
+        note_title="\U0001F916 Pi.dev AI - STANDING DOWN, A HUMAN IS NEEDED",
+        note_body=(
+            "The automation handled this ticket and the customer has replied with something that is "
+            "not a thank-you. Automation will not work this ticket again - a technician needs to read "
+            "the reply and take it from here.\n\nThe customer's reply and what the automation did "
+            "are in the thread above."),
+    )
+    return "escalated"
 
 
 def _chat_anchor(url: str, label: str = "Chat with me to continue this ticket") -> str:
@@ -221,12 +283,78 @@ def _mark_duplicate_closed(dup_ref: str, primary_ref: str) -> None:
     )
 
 
+def _approval_blob(ticket_ref: str, subj, *, requester_email: str = "", core=None) -> dict:
+    """What the bridge needs to enforce the rule's first line: was this approved, by whom, in what
+    capacity - and, crucially, was it approved WITHOUT anybody clicking anything.
+
+    THREE WAYS THIS COMES BACK TRUE (owner, 2026-09-28):
+
+      1. A RECORDED APPROVAL - an internal technician clicked the approval link on the ticket (the
+         AI Decision window), or a support contact replied "approved" to the email we sent them.
+         Both are rows in AIAutomationApproval, carrying who and in what capacity.
+      2. AUTO-APPROVAL WHEN THE REQUESTER IS A SUPPORT CONTACT - "auto approval in B should ALWAYS be
+         the case if the ticket comes from a support contact user email". The helpdesk already
+         answers exactly this (check_support_authorization returns the company's Primary/Secondary
+         contacts), and the codebase already treats that answer as the authorisation for unattended
+         identity/access work.
+
+    Anything else is NOT approved, and the bridge will hold the run to read-only: the ticket then
+    needs a person - the support contact replying to the email, or a technician on the link.
+
+    No customer email reached this decision, and none is trusted: `authorized` comes from the
+    helpdesk's contact records for the customer, not from the wording of the request.
+    """
+    from core.ai_approval import active_approval
+
+    try:
+        row = active_approval(ticket_ref, subj, subj.statements or {})
+    except Exception as e:  # never let the gate's own bookkeeping break the run
+        logger.warning("autowork: could not resolve approval for %s: %s", ticket_ref, e)
+        row = None
+    if row is not None:
+        return {"approved": True, "by": row.approved_by, "capacity": row.approver_capacity,
+                "digest": row.plan_digest, "auto": False,
+                "reason": "an approval was recorded for this plan"}
+
+    # ---- AUTO-APPROVAL: the requester IS a support contact --------------------------------
+    # `core` is passed in. An earlier version called get_core_settings() here without importing it,
+    # and the NameError was caught by the except below and reported as "not a support contact" - a
+    # gate that fails silently into the safe answer is indistinguishable from a gate that is
+    # working, which is the worst way for this one to be wrong. Now the failure is loud, and it
+    # still fails CLOSED (unapproved), because a privileged grant must not ride on an error.
+    if core is None:
+        try:
+            from core.utils import get_core_settings
+
+            core = get_core_settings()
+        except Exception as e:
+            logger.error("autowork: cannot load core settings for the approval gate on %s: %s", ticket_ref, e)
+            core = None
+    auth = {}
+    if core is not None:
+        try:
+            auth = hd_op(core, "check_support_authorization", {"ticket": ticket_ref}) or {}
+        except Exception as e:
+            logger.error("autowork: support-contact check FAILED for %s (%s) - treating as NOT approved", ticket_ref, e)
+            auth = {}
+    if isinstance(auth, dict) and auth.get("authorized") is True:
+        primary = str(auth.get("primary_support_contact") or "")
+        who = requester_email or (primary if "@" in primary else "") or "support contact"
+        logger.info("autowork: %s auto-approved - requester %s is an authorised support contact", ticket_ref, who)
+        return {"approved": True, "by": who, "capacity": "support_contact", "digest": "", "auto": True,
+                "reason": "the requester is an authorised support contact for this customer"}
+    return {"approved": False, "by": "", "capacity": "", "digest": "", "auto": False,
+            "reason": "the requester is not a support contact, so a person has to approve first"}
+
+
 def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, core, model,
-                shadow: bool = False) -> dict:
+                shadow: bool = False, dry_run: bool = False) -> dict:
     """Work one ticket under a subject. Returns a small result dict; updates `st` in place
     (caller saves). Takes and releases the work claim around the bridge call."""
-    subj.tickets_matched += 1
-    subj.save(update_fields=["tickets_matched"])
+    # A dry run leaves no trace at all - not even a counter.
+    if not dry_run:
+        subj.tickets_matched += 1
+        subj.save(update_fields=["tickets_matched"])
 
     # ---- the dedup lock -----------------------------------------------------------
     cond_key = ""
@@ -298,6 +426,25 @@ def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, cor
 
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     outcome = "error"
+    # WHICH MODEL WORKS IT? The subject's own group, else this surface's routing entry, else
+    # Settings' preferred group, else the model the caller resolved (the starred default).
+    # See core.agent_groups.headless_group_blob.
+    from core.agent_groups import headless_group_blob
+
+    gh = headless_group_blob(core, surface="autowork", override=getattr(subj, "agent_group", None))
+    group_orch = gh.get("group_orchestrator") or {}
+    if group_orch:
+        model_blob = {
+            "provider": group_orch.get("provider", ""),
+            "model_id": group_orch.get("model_id", ""),
+            "api_key": (gh.get("agent_group_keys") or {}).get(group_orch.get("provider", ""), ""),
+            "thinking_level": group_orch.get("thinking_level") or "medium",
+        }
+    else:
+        model_blob = {
+            "provider": model.provider.name, "model_id": model.model_id,
+            "api_key": model.provider.api_key, "thinking_level": model.thinking_level,
+        }
     try:
         r = requests.post(
             f"{bridge}/pi/autowork",
@@ -305,10 +452,17 @@ def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, cor
                 "ticket_ref": st.ticket_ref,
                 "requester_email": st.requester or "",
                 "client": client or "",
-                "provider": model.provider.name, "model_id": model.model_id,
-                "api_key": model.provider.api_key, "thinking_level": model.thinking_level,
+                **model_blob,
+                **gh,
                 "decision_url": decision_url,
                 "shadow": bool(shadow),
+                "dry_run": bool(dry_run),
+                # THE GATE, RESOLVED IN DJANGO. The bridge cannot read the approvals table, so the
+                # answer travels with the ticket: is THIS plan, under THIS rule version, approved
+                # for THIS ticket, by whom, in what capacity? `active_approval` returns None the
+                # moment the rule is edited (digest mismatch), which is what stops an approval of
+                # rule A from authorising rule B.
+                "approval": _approval_blob(st.ticket_ref, subj, requester_email=st.requester or "", core=core),
                 "subject": _subject_payload(subj, core),
                 # Tickets already held behind this one when the session starts. More may
                 # arrive while it works - the session re-reads them with
@@ -360,7 +514,7 @@ def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, cor
         )[:5000]
         st.error_detail = ""
         outcome = action
-        if action == "replied":
+        if action == "replied" and not dry_run:
             subj.tickets_worked += 1
             subj.last_worked = timezone.now()
             subj.save(update_fields=["tickets_worked", "last_worked"])
@@ -369,18 +523,51 @@ def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, cor
         # cooldown can never engage and a service that keeps dying gets restarted on every
         # new ticket. Found the hard way on TICKET/61474: the restart ran, counters stayed 0.
         applied = [str(x) for x in (data.get("fix_applied") or []) if x]
-        if applied:
+        if applied and not dry_run:
             subj.fixes_applied = (subj.fixes_applied or 0) + 1
             subj.last_fix_at = timezone.now()
             subj.save(update_fields=["fixes_applied", "last_fix_at"])
             logger.info("autowork: %s applied fix %s on %s", subj.name, applied, st.ticket_ref)
+        # A REVIEWED ACTION THAT BROKE ENDS AUTOMATION FOR THIS TICKET (owner, 2026-09-28):
+        # "note that on the ticket and stop trying to process it, hand it off to a human". The
+        # bridge already forced confidence to unsure and wrote the failure into its note; this is
+        # the second half - it must not be counted as a fix a human can rely on, and the ticket
+        # must stay OPEN with the needs-input tag rather than being filed to AI Closed. Also: do
+        # NOT set last_fix_at, or the cooldown would later refuse the very retry a technician
+        # makes after repairing the action.
+        broken = data.get("fix_broken") or {}
+        if broken:
+            outcome = "needs_input"
+            st.status = "needs_input"
+            # Owner, 2026-09-28: "if a fix action is broken when it runs, then we need to note that
+            # on the ticket and stop trying to process it, hand it off to a human." The note is
+            # written by the bridge; this is the 'stop trying, hand it over' half, and it is the
+            # durable kind: re-triage will not put it back in front of the automation.
+            stand_down(st, core=core, decision_url=decision_url,
+                       reason=f"reviewed action '{broken.get('action')}' failed",
+                       note_title="", note_body="", tag=True)
+            if applied:
+                subj.fixes_applied = max(0, (subj.fixes_applied or 1) - 1)
+                subj.save(update_fields=["fixes_applied"])
+            logger.warning("autowork: reviewed action %r broke on %s - stopped and handed to a human",
+                           broken.get("action"), st.ticket_ref)
     # AI CLOSED WHEN THE AUTOMATION FINISHED IT (owner, 2026-09-17). Only on a CONFIDENT
     # verdict we actually replied to: unsure, a failed reply or an error stays OPEN with the
     # needs-input tag, because closing a ticket nobody answered is worse than leaving it.
     # AI Closed and never Closed - that stage exists so a human reviews the decision.
     v_final = data.get("verdict") or {}
     applied_final = [str(x) for x in (data.get("fix_applied") or []) if x]
-    if outcome == "replied" and v_final.get("confidence") == "confident":
+    if data.get("fix_broken"):
+        # Never AI-closed: a fix that broke is the opposite of a resolved ticket, however
+        # confident the session that broke it felt about its own summary.
+        outcome = "needs_input"
+        st.status = "needs_input"
+    elif data.get("close_allowed") is False:
+        # THE RULE DECIDES WHETHER THIS CAN BE CLOSED (owner, 2026-09-28: "Rules are for FIX").
+        # A rule whose branches never reach close_ticket means exactly that - the ticket stays
+        # open for a human, however confident the session was about its own summary.
+        logger.info("autowork: %s not closed - the subject's rule has no close step", st.ticket_ref)
+    elif outcome == "replied" and v_final.get("confidence") == "confident":
         try:
             hd_op(core, "ai_close_ticket", {"ticket": st.ticket_ref, "reason": (
                 "\U0001F916 Pi.dev AI - worked automatically under \"" + subj.name + "\" and resolved.\n"

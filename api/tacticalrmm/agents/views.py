@@ -1760,6 +1760,17 @@ def _pi_device_facts(agent):
     }
 
 
+def _apply_device_caps(blob: dict, user, agent_id: str) -> dict:
+    """OR any admin per-DEVICE capability grant into a device-chat blob (core/session_caps.py)."""
+    from core.session_caps import apply_caps
+
+    try:
+        apply_caps(blob, user, "device", agent_id or "")
+    except Exception:
+        pass          # never break opening a chat over a grant lookup
+    return blob
+
+
 def _pi_operator_policy(core, user):
     """Return only allowlisted Operator workstations the current technician may access."""
     from tacticalrmm.permissions import _has_perm_on_agent
@@ -1862,9 +1873,10 @@ class PiMultiSession(APIView):
         chosen = default_model
         if req_id:
             match = next((m for m in allowed if m.model_id == req_id), None)
-            if not match:
-                return notify_error("Requested model is not permitted for your role.")
-            chosen = match
+            if match:
+                chosen = match
+            # Remembered model was removed, or this role cannot use it.
+            # Open on the permitted default instead of refusing the window.
         from core.agent_groups import apply_group, group_provider_keys
         group_meta = {}
         chosen = apply_group(group_meta, request, chosen)
@@ -1956,6 +1968,8 @@ class PiMultiSession(APIView):
             },
             "helpdesk_code": core.ai_helpdesk_code or "",
         }
+        # An admin's per-DEVICE capability grant (core/session_caps.py) applies to this chat.
+        _apply_device_caps(blob, user, machines[0]["agent_id"] if machines else "")
 
         token = create_pi_session(data=blob)
 
@@ -2061,9 +2075,10 @@ class AgentPiSession(APIView):
         chosen = default_model
         if req_id:
             match = next((m for m in allowed if m.model_id == req_id), None)
-            if not match:
-                return notify_error("Requested model is not permitted for your role.")
-            chosen = match
+            if match:
+                chosen = match
+            # Remembered model was removed, or this role cannot use it.
+            # Open on the permitted default instead of refusing the window.
         from core.agent_groups import apply_group, group_provider_keys
         group_meta = {}
         chosen = apply_group(group_meta, request, chosen)
@@ -2152,6 +2167,9 @@ class AgentPiSession(APIView):
             "helpdesk_code": core.ai_helpdesk_code or "",
             "operator": operator_policy,
         }
+        # An admin's per-DEVICE capability grant (core/session_caps.py) applies to this chat.
+        _apply_device_caps(blob, user, agent.agent_id)
+        blob["can_grant_caps"] = bool(is_super or (user.role and user.role.can_edit_core_settings))
 
         token = create_pi_session(data=blob)
 

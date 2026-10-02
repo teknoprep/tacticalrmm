@@ -235,6 +235,27 @@ class CoreSettings(BaseAuditModel):
     # may receive Operator tools and which configured AI model should be selected when
     # an Operator-capable Pi Chat / AI Decision session starts.
     ai_operator_enabled = models.BooleanField(default=False)
+    # PREFERRED AGENT GROUP (owner, 2026-09-27). Headless surfaces - ticket triage, autowork, and
+    # anything else with no group of its own - run on this group: its orchestrator thinks, its
+    # roster is available to delegate to, and its provider keys apply. Unset = the old behaviour
+    # (the starred default AIModel, no specialists). A per-subject / per-task choice wins over it.
+    ai_preferred_agent_group = models.ForeignKey(
+        "core.AIAgentGroup",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="preferred_for_settings",
+    )
+
+    # AGENT ROUTING PER RULE (owner, 2026-09-29). The preferred group above is the default for
+    # EVERY headless surface; this lets one rule differ - the procedure miner on a long-context
+    # model while triage stays cheap, say. {"<surface>": <AIAgentGroup id>}. A surface with no
+    # entry inherits the preferred group, so setting only that one routes everything; a
+    # Ticket Automation Subject's own group still wins over both. The keys are declared in
+    # core.agent_groups.AGENT_SURFACES, which the settings API serves to the UI and the
+    # serializer validates against - so the interface and the resolver cannot drift apart.
+    ai_agent_routing = models.JSONField(default=dict, blank=True)
+
     ai_operator_default_model = models.ForeignKey(
         "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="operator_default_for",
@@ -966,21 +987,27 @@ class Schedule(BaseAuditModel):
 
 
 class AIProvider(BaseAuditModel):
+    # NOT a closed list since 2026-09-27 (owner): `name` must be a provider id the INSTALLED
+    # pi runtime supports natively - the bridge reports them (GET /pi/providers) and
+    # AIProviderSerializer.validate_name checks against that - so a provider added by a pi
+    # upgrade (DeepSeek was the first) can be configured without a code change. These labels
+    # are only a display fallback for when the bridge cannot be asked.
     PROVIDER_CHOICES = [
         ("anthropic", "Anthropic"),
         ("openai", "OpenAI"),
         ("google", "Google"),
         ("xai", "xAI"),
         ("openrouter", "OpenRouter"),
+        ("deepseek", "DeepSeek"),
         ("custom", "Custom (OpenAI-compatible)"),
     ]
-    name = models.CharField(max_length=50, choices=PROVIDER_CHOICES, unique=True)
+    name = models.CharField(max_length=50, unique=True)
     api_key = models.CharField(max_length=500, blank=True, default="")
     base_url = models.CharField(max_length=500, blank=True, default="")
     enabled = models.BooleanField(default=True)
 
     def __str__(self) -> str:
-        return self.get_name_display()
+        return dict(self.PROVIDER_CHOICES).get(self.name, self.name)
 
     @staticmethod
     def serialize(obj):
@@ -1019,6 +1046,9 @@ class AIModel(BaseAuditModel):
     thinking_level = models.CharField(max_length=20, blank=True, default="medium")
     enabled = models.BooleanField(default=True)
     is_default = models.BooleanField(default=False)
+    # Auto-summarize threshold (tokens of context) for chats running on this model (when it is not in an agent group). A window's
+    # own setting still wins; a group's beats a model's. 100k default (owner, 2026-09-26).
+    auto_summarize_tokens = models.PositiveIntegerField(default=100000)
 
     class Meta:
         unique_together = ("provider", "model_id")
@@ -1065,6 +1095,9 @@ class AIAgentGroup(BaseAuditModel):
     )
     enabled = models.BooleanField(default=True)
     is_default = models.BooleanField(default=False)
+    # Auto-summarize threshold (tokens of context) for chats running on this group. A window's
+    # own setting still wins; a group's beats a model's. 100k default (owner, 2026-09-26).
+    auto_summarize_tokens = models.PositiveIntegerField(default=100000)
 
     class Meta:
         ordering = ["name"]
@@ -1094,6 +1127,16 @@ class AIAgentGroupMember(models.Model):
     role = models.CharField(max_length=32)
     provider = models.CharField(max_length=50)
     model_id = models.CharField(max_length=255)
+    # BACKUP MODEL (owner, 2026-09-27). A provider failing is not a fault the model can work
+    # around: xAI refused every request for two days with a 403 ("used all available credits or
+    # reached its monthly spending limit") and each affected turn simply died mid-flight. Retrying
+    # the same provider is pointless, so the bridge switches to this model instead and carries on.
+    # Blank = no fallback: the turn fails as it does today. Only used for provider failures that
+    # are permanent by nature (quota, billing, auth, model-not-found) - never for a stall, a
+    # timeout or a Stop, which have their own recovery.
+    fallback_provider = models.CharField(max_length=50, blank=True, default="")
+    fallback_model_id = models.CharField(max_length=255, blank=True, default="")
+    fallback_thinking_level = models.CharField(max_length=20, blank=True, default="")
     display_name = models.CharField(max_length=255, blank=True, default="")
     thinking_level = models.CharField(max_length=20, blank=True, default="medium")
     definition = models.TextField(
@@ -1110,6 +1153,275 @@ class AIAgentGroupMember(models.Model):
     def __str__(self) -> str:
         return f"{self.group.slug}:{self.role} -> {self.provider}/{self.model_id}"
 
+
+class AIRelayKey(models.Model):
+    """An API key for the PI RELAY (2026-09-27): lets a pi running anywhere (a technician's
+    laptop, another server) use ONE agent group through the bridge, with the RMM's provider
+    keys, spend ledger and group config - see /opt/pi-trmm-bridge/docs/PI-RELAY.md.
+
+    Credential = RMM username (or email) + this key, sent as HTTP Basic over TLS. One key =
+    one user + one group; a user may hold several (one per group, per machine).
+
+    The key is shown ONCE at creation. Only an HMAC-SHA256 of it (peppered with
+    settings.PI_RELAY_KEY_PEPPER) is stored, so a database leak does not leak usable keys.
+    The key is ~290 bits of randomness, so a fast hash is correct here (no password
+    stretching needed); comparison is constant-time.
+
+    Access ends the moment any of these is true: key revoked, key expired, user inactive,
+    user lost can_use_ai, group disabled, or the key's daily/monthly budget is spent.
+    """
+
+    PREFIX = "pirk"
+
+    user = models.ForeignKey("accounts.User", related_name="ai_relay_keys", on_delete=models.CASCADE)
+    # ONE key can reach SEVERAL groups (2026-09-27, owner): a technician signs in once and can
+    # switch between IT and Coding with /group. Budgets stay per key, not per group.
+    groups = models.ManyToManyField("core.AIAgentGroup", related_name="relay_keys")
+    label = models.CharField(max_length=100, blank=True, default="", help_text="e.g. 'Sean laptop'")
+    # WHY THIS KEY EXISTS (owner, 2026-09-30): which computer / person / job it is for, and why
+    # it was issued. A key with only a label and "created by manage.py" could not be explained.
+    purpose = models.TextField(blank=True, default="")
+    # Public half of the key (appears in the key string and in logs). Never secret.
+    key_id = models.CharField(max_length=16, unique=True, db_index=True)
+    secret_hash = models.CharField(max_length=64)
+    created = models.DateTimeField(auto_now_add=True)
+    created_by = models.CharField(max_length=150, blank=True, default="")
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.CharField(max_length=150, blank=True, default="")
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    last_used_ip = models.CharField(max_length=64, blank=True, default="")
+    # Spend caps in USD, enforced by the bridge from the spend ledger. Null = no cap.
+    daily_budget_usd = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    monthly_budget_usd = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Optional comma-separated IPs/CIDRs the key may be used from. Empty = anywhere.
+    allowed_ips = models.TextField(blank=True, default="")
+    # "Send Pi RMM install" (2026-09-27): the key cannot be read back (hash only), so the
+    # email carries a NEW secret for the same key_id. These record when/where it went.
+    rotated_at = models.DateTimeField(null=True, blank=True)
+    install_sent_at = models.DateTimeField(null=True, blank=True)
+    install_sent_to = models.CharField(max_length=254, blank=True, default="")
+    install_sent_by = models.CharField(max_length=150, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created"]
+
+    def __str__(self) -> str:
+        slugs = ", ".join(self.groups.values_list("slug", flat=True)) or "-"
+        return f"{self.PREFIX}_{self.key_id} ({self.user.username} / {slugs})"
+
+    # ---- key material -----------------------------------------------------------------
+    @classmethod
+    def _hash(cls, full_key: str) -> str:
+        import hashlib
+        import hmac
+
+        from django.conf import settings
+
+        pepper = getattr(settings, "PI_RELAY_KEY_PEPPER", "")
+        if not pepper:
+            raise RuntimeError("PI_RELAY_KEY_PEPPER is not set in local_settings.py")
+        return hmac.new(pepper.encode(), full_key.encode(), hashlib.sha256).hexdigest()
+
+    @classmethod
+    def issue(cls, *, user, label="", created_by="", expires_at=None,
+              daily_budget_usd=None, monthly_budget_usd=None, allowed_ips=""):
+        """Create a key. Returns (row, full_key). full_key is NEVER retrievable again.
+        The caller sets `groups` afterwards (issue_key in core/relay.py does)."""
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits
+        while True:
+            key_id = "".join(secrets.choice(alphabet) for _ in range(12))
+            if not cls.objects.filter(key_id=key_id).exists():
+                break
+        secret = "".join(secrets.choice(alphabet) for _ in range(48))  # ~285 bits
+        full_key = f"{cls.PREFIX}_{key_id}_{secret}"
+        row = cls.objects.create(
+            user=user, label=label, key_id=key_id, secret_hash=cls._hash(full_key),
+            created_by=created_by, expires_at=expires_at, daily_budget_usd=daily_budget_usd,
+            monthly_budget_usd=monthly_budget_usd, allowed_ips=allowed_ips or "",
+        )
+        return row, full_key
+
+    def new_secret(self):
+        """-> (full_key, secret_hash) for a fresh secret on THIS key_id. Not saved: the caller
+        stores the hash only once the key has been delivered (so a failed email cannot lock
+        the user out). The key_id stays, so budgets and spend history carry over."""
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits
+        secret = "".join(secrets.choice(alphabet) for _ in range(48))
+        full_key = f"{self.PREFIX}_{self.key_id}_{secret}"
+        return full_key, self._hash(full_key)
+
+    @classmethod
+    def parse(cls, full_key: str):
+        """-> key_id or None. Shape check only; says nothing about validity."""
+        import re
+
+        m = re.fullmatch(rf"{cls.PREFIX}_([A-Za-z0-9]{{12}})_([A-Za-z0-9]{{48}})", str(full_key or "").strip())
+        return m.group(1) if m else None
+
+    def matches(self, full_key: str) -> bool:
+        import hmac
+
+        return hmac.compare_digest(self.secret_hash, self._hash(str(full_key or "").strip()))
+
+    def ip_allowed(self, ip: str) -> bool:
+        import ipaddress
+
+        rules = [r.strip() for r in (self.allowed_ips or "").split(",") if r.strip()]
+        if not rules:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        for r in rules:
+            try:
+                if addr in ipaddress.ip_network(r, strict=False):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    @property
+    def ledger_prefix(self) -> str:
+        """Spend-ledger session ids for this key start with this (see the bridge relay)."""
+        return f"relay-{self.key_id}-"
+
+
+
+class AIRelayKeyUse(models.Model):
+    """WHERE A RELAY KEY IS USED (owner, 2026-09-30): one row per (key, source IP), updated on
+    every verification the bridge asks for. `last_used_ip` alone could only ever say
+    "127.0.0.1" or one address - never the history, never which client."""
+
+    key = models.ForeignKey("core.AIRelayKey", related_name="uses", on_delete=models.CASCADE)
+    ip = models.CharField(max_length=64)
+    first_seen = models.DateTimeField()
+    last_seen = models.DateTimeField()
+    times = models.PositiveIntegerField(default=1)
+    client = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        unique_together = ("key", "ip")
+        ordering = ["-last_seen"]
+
+
+class AIAutomationApproval(models.Model):
+    """A TECHNICIAN (or support contact) saying GO, on a plan they were shown first.
+
+    Owner, 2026-09-28:
+      "it can be approved by a tech... in the ai-decision area of the notes in the ticket...
+       basically it would allow a tech to approve the workflow / take them to a window where it
+       can watch the AI work & scripts run / and see the output live... so it doesn't just have to
+       be support contact approval... it can be tech approval"
+      "when the tech get's take to the area where it works on things... it will be told what its
+       about to do first... that way the tech can review before you say go"
+
+    So this is NOT a blanket permission for a subject. It is approval of ONE PLAN for ONE TICKET,
+    reviewed on screen first. Both digests are stored for that reason:
+
+      rule_digest - the version of the rule the plan was written under. Edit the rule and every
+                    outstanding approval stops matching: approving rule A must never authorise B.
+      plan_digest - the exact steps the approver read. Regenerate the plan and it goes back for
+                    review rather than running something nobody approved.
+
+    An approval can be given by a support contact for the customer (customer-side authorisation,
+    via a signed single-use token) or by one of our own technicians (authenticated, in the AI
+    Decision window). Rules that change a customer ACCOUNT can narrow the gate themselves with the
+    `approved_by_support_contact` condition. Expiry is enforced in code, so no cleanup job is
+    needed - the same approach as a session capability grant.
+
+    This records nothing about whether the work happened: the run's own ledger covers that.
+    """
+
+    CAPACITY = (
+        ("technician", "One of our technicians"),
+        ("support_contact", "A support contact for the customer"),
+    )
+
+    ticket_ref = models.CharField(max_length=120, db_index=True)
+    subject = models.ForeignKey(
+        "core.AITicketAutomationSubject", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="approvals",
+    )
+    rule_digest = models.CharField(max_length=64)
+    plan = models.JSONField(default=dict, blank=True)
+    plan_digest = models.CharField(max_length=64)
+    proposed_by = models.CharField(max_length=150, blank=True, default="")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.CharField(max_length=150, blank=True, default="")
+    approver_capacity = models.CharField(max_length=20, choices=CAPACITY, blank=True, default="")
+    expires_at = models.DateTimeField(null=True, blank=True)
+    declined_at = models.DateTimeField(null=True, blank=True)
+    declined_by = models.CharField(max_length=150, blank=True, default="")
+    decline_reason = models.CharField(max_length=200, blank=True, default="")
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["ticket_ref", "subject"])]
+
+
+class AISessionCapability(models.Model):
+    """A PER-SESSION grant of a chat capability an admin makes for a technician (owner, 2026-09-27).
+
+    Why this exists: the switches in a chat window's hamburger - Write mode, Auto-approve,
+    Auto-credential, Auto-TOTP, customer email - are gated by the user's ROLE
+    (can_use_ai_mutate, can_use_ai_autoapprove, ...). That is the right default, but it has no
+    middle ground: a technician whose role lacks a switch cannot have it for one ticket where an
+    admin decides it is warranted. The only alternatives were "change their role for everything"
+    or "give them nothing".
+
+    A grant is: one user + one scope (this ticket, this device, or everywhere) + a set of caps,
+    with an expiry and an audit trail (who granted it, when, and why in `note`). It can only ever
+    ADD to what the role already allows - a grant cannot take a capability away - and every
+    capability it hands over is still subject to the approval prompts, the judge and the
+    credential gate underneath. Expiry is enforced here; nothing needs a background job.
+    """
+
+    SCOPE_TICKET = "ticket"
+    SCOPE_DEVICE = "device"
+    SCOPE_ALL = "all"
+    SCOPES = [
+        (SCOPE_TICKET, "One ticket"),
+        (SCOPE_DEVICE, "One device"),
+        (SCOPE_ALL, "Everywhere (standing)"),
+    ]
+
+    user = models.ForeignKey("accounts.User", related_name="ai_session_caps", on_delete=models.CASCADE)
+    scope_kind = models.CharField(max_length=10, choices=SCOPES, default=SCOPE_TICKET)
+    # Ticket ref ("TICKET/61884"), agent id, or "" for SCOPE_ALL. Stored as given so it matches
+    # the bridge's live-session keys (decision:TICKET/61884, or the agent id).
+    scope_ref = models.CharField(max_length=100, blank=True, default="", db_index=True)
+    caps = models.JSONField(default=list, blank=True)
+    note = models.CharField(max_length=200, blank=True, default="")
+    granted_by = models.CharField(max_length=150, blank=True, default="")
+    created = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.CharField(max_length=150, blank=True, default="")
+
+    class Meta:
+        ordering = ["-created"]
+        indexes = [models.Index(fields=["user", "scope_kind", "scope_ref"])]
+
+    def __str__(self) -> str:
+        caps = ",".join(self.caps or [])
+        return f"{self.user.username} {self.scope_kind}:{self.scope_ref or '*'} [{caps}]"
+
+    @property
+    def active(self) -> bool:
+        if self.revoked_at:
+            return False
+        from django.utils import timezone
+
+        return self.expires_at is None or self.expires_at > timezone.now()
 
 class AITask(BaseAuditModel):
     SCHEDULE_INTERVAL = "interval"
@@ -1418,6 +1730,21 @@ class AITicketState(models.Model):
     # new | baseline | skipped_out_of_scope | triaging | triaged | error
     # (later phases: claimed, awaiting_customer, working, resolved, escalated, handed_off)
     status = models.CharField(max_length=30, default="new")
+
+    # AUTOMATION HAS STOOD DOWN ON THIS TICKET - permanently, until a human clears it.
+    #
+    # Owner, 2026-09-28: "if the customer reply's back for anything under advise that is anything
+    # other than thank you, then we should not continue working on it with automation again and
+    # leave it for a tech."
+    #
+    # A status was not enough for this. The poller re-triages a ticket whenever new activity
+    # arrives, triage re-marks it "triaged", and the automation then runs again - so the stand-down
+    # has to be a fact about the ticket that survives re-triage, not a status that gets overwritten.
+    # Set when: the customer says it is not fixed; the customer replies with anything that is not a
+    # thank-you; or a reviewed fix broke while running.
+    automation_stood_down = models.BooleanField(default=False)
+    stood_down_reason = models.CharField(max_length=200, blank=True, default="")
+    stood_down_at = models.DateTimeField(null=True, blank=True)
     # alert_clean | alert_actionable | regular | unknown
     classification = models.CharField(max_length=40, blank=True, default="")
     summary = models.TextField(blank=True, default="")
@@ -2104,6 +2431,8 @@ class AISpendEntry(models.Model):
         # declared choices -- but with no choice declared the label rendered as the
         # raw string "odoo" instead of something a human reads.
         ("odoo", "Odoo AI panel (CRM / quotations)"),
+        # 2026-09-27: a pi running elsewhere (laptop, another server) through the PI RELAY.
+        ("relay", "pi relay (remote pi client)"),
         ("other", "Other"),
     )
 
@@ -2113,6 +2442,10 @@ class AISpendEntry(models.Model):
     # bridge's fire-and-forget POST idempotent, so a retry cannot double-bill a report.
     turn_index = models.PositiveIntegerField(default=0)
     surface = models.CharField(max_length=20, choices=SURFACE, default="device_chat")
+    # Which agent-group ROLE this turn was bought for: "chat" (the orchestrator), "judge",
+    # "authorizer", "coder", "coder (fallback)", "researcher", "scout", ... Empty on
+    # surfaces with no group and on rows recorded before 2026-09-26.
+    role = models.CharField(max_length=32, blank=True, default="", db_index=True)
     provider = models.CharField(max_length=50)
     model_id = models.CharField(max_length=255, db_index=True)
 
@@ -2290,6 +2623,11 @@ class AITicketAutomationSubject(models.Model):
     )
 
     name = models.CharField(max_length=160)
+    # Blank = use Settings' preferred agent group. Set = this subject's own group, whose
+    # orchestrator does the thinking for tickets matching this subject.
+    agent_group = models.ForeignKey(
+        "core.AIAgentGroup", null=True, blank=True, on_delete=models.SET_NULL, related_name="autowork_subjects"
+    )
     description = models.TextField(blank=True, default="")
     status = models.CharField(max_length=12, choices=STATUS, default="proposed")
     enabled = models.BooleanField(default=True)
@@ -2330,9 +2668,44 @@ class AITicketAutomationSubject(models.Model):
     last_fix_at = models.DateTimeField(null=True, blank=True)
     fixes_applied = models.IntegerField(default=0)
 
-    # Approval by email link. One token each way; consumed on use.
+    # THE RULE (see core/ai_rules.py). English IF / THEN / ELSE IF / ELSE / END IF, stored as
+    # blocks:
+    #   {"prelude": "approval_gate", "terminator": "stop",
+    #    "blocks": [{"if": {"condition": "procedure_cause", "args": {"procedure": 412}},
+    #                "then":  [{"action": "investigate", "args": {}}],
+    #                "else":  [{"action": "hand_to_human", "args": {}}]}]}
+    #
+    # Structured, not free text: permission has to be data a person can read and approve, and a
+    # model may never compose a command. The prelude (approval) and terminator (stop) are written
+    # into every saved rule by ai_rules.with_defaults(), so the gate exists in the DATA and not
+    # only in the interface. Empty = the subject works its old way (mode + fix_actions).
+    statements = models.JSONField(default=dict, blank=True)
+
+    # Approval by email link. One token each way.
+    #
+    # The tokens are NOT blanked when used (owner, 2026-09-25). They were, and it made the
+    # system lie: a second visit to a spent link could not find the row, so it said "link
+    # already used or invalid" instead of "already approved - <name> is live". Single use is
+    # enforced by `status != proposed`, which still knows WHICH subject the link belonged to.
+    # The token can do nothing else: it flips one proposal, it cannot edit rules or widen a
+    # mode, and the decision itself only happens on POST (see AutomationSubjectDecide).
     approve_token = models.CharField(max_length=64, blank=True, default="", db_index=True)
     reject_token = models.CharField(max_length=64, blank=True, default="", db_index=True)
+
+    # AN EXTENSION INSTEAD OF A NEW SUBJECT. The daily report used to only ever propose new
+    # subjects, because it was never shown the ones that already exist - so "spam",
+    # "phishing/BEC" and "unexpected verification emails" arrived as three separate rows for
+    # what is one job. A proposal may now say "widen subject N" instead; approving it merges
+    # the extra match phrases into N and retires the proposal row rather than creating a
+    # fourth near-duplicate.
+    proposal_kind = models.CharField(
+        max_length=10,
+        choices=(("new", "New subject"), ("extend", "Extend an existing subject")),
+        default="new",
+    )
+    extends_subject = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="extension_proposals",
+    )
     proposed_by_report = models.DateTimeField(null=True, blank=True)
     proposal_reason = models.TextField(blank=True, default="")
     proposal_tickets = models.JSONField(default=list, blank=True)

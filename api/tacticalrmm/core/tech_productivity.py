@@ -1981,11 +1981,16 @@ def audit(payload: Dict[str, Any], checks: List[Dict[str, str]], hours: int,
 
     from django.conf import settings as _settings
 
+    from core.agent_groups import headless_orchestrator_fields, model_fallback_fields
     from core.tasks import _resolve_ai_model
+    from core.utils import get_core_settings
 
-    model = _resolve_ai_model(None)
-    if not model:
-        return {}
+    ai_fields = headless_orchestrator_fields(get_core_settings(), surface="productivity")
+    if not ai_fields:
+        model = _resolve_ai_model(None)
+        if not model:
+            return {}
+        ai_fields = model_fallback_fields(model)
     digest = {
         "period_hours": hours,
         "desk": payload["desk"],
@@ -2031,8 +2036,7 @@ def audit(payload: Dict[str, Any], checks: List[Dict[str, str]], hours: int,
     try:
         r = _requests.post(
             f"{bridge_url}/pi/analyze",
-            json={"provider": model.provider.name, "api_key": model.provider.api_key,
-                  "model_id": model.model_id, "thinking_level": model.thinking_level or "medium",
+            json={**ai_fields,
                   "system_prompt": prompt,
                   "content": "Figures and derivation notes:\n\n"
                              + json.dumps(digest, indent=1, default=str)},
@@ -2741,11 +2745,15 @@ def narratives(payload: Dict[str, Any], hours: int, core, options=None) -> Dict[
     """Ask the model for a coaching paragraph per technician. Never fatal."""
     import requests as _requests
 
+    from core.agent_groups import headless_orchestrator_fields, model_fallback_fields
     from core.tasks import _resolve_ai_model
 
-    model = _resolve_ai_model(None)
-    if not model:
-        return {}
+    ai_fields = headless_orchestrator_fields(core, surface="productivity")
+    if not ai_fields:
+        model = _resolve_ai_model(None)
+        if not model:
+            return {}
+        ai_fields = model_fallback_fields(model)
     digest = {
         "period_hours": hours,
         "desk": payload["desk"],
@@ -2772,8 +2780,7 @@ def narratives(payload: Dict[str, Any], hours: int, core, options=None) -> Dict[
     try:
         r = _requests.post(
             f"{bridge_url}/pi/analyze",
-            json={"provider": model.provider.name, "api_key": model.provider.api_key,
-                  "model_id": model.model_id, "thinking_level": model.thinking_level or "medium",
+            json={**ai_fields,
                   "system_prompt": prompt,
                   "content": "Computed figures for the period:\n\n"
                              + json.dumps(digest, indent=1, default=str)},

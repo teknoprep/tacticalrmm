@@ -1,7 +1,7 @@
 from django.urls import path
 from django.conf import settings
 
-from . import odoo_ai, views
+from . import odoo_ai, relay, views
 
 urlpatterns = [
     # Odoo `ai_pi_bridge` addon entry points. Shared-secret authenticated (see
@@ -48,6 +48,16 @@ urlpatterns = [
     path("ai/providers/", views.GetAddAIProvider.as_view()),
     path("ai/providers/<int:pk>/", views.UpdateDeleteAIProvider.as_view()),
     path("ai/available-models/", views.AIAvailableModels.as_view()),
+    path("ai/native-providers/", views.AINativeProviders.as_view()),
+    # pi relay (2026-09-27) - see core/relay.py
+    path("ai/relay/verify/", relay.AIRelayVerify.as_view()),
+    path("ai/session-caps/", relay.AISessionCapabilities.as_view()),
+    path("ai/relay/keys/", relay.AIRelayKeys.as_view()),
+    # Must come before the <int:pk> routes in intent (an int converter would not match it
+    # anyway) and before any future <str:pk> pattern that could swallow it.
+    path("ai/relay/keys/notify-update/", relay.AIRelayKeyNotifyUpdate.as_view()),
+    path("ai/relay/keys/<int:pk>/", relay.AIRelayKeyDetail.as_view()),
+    path("ai/relay/keys/<int:pk>/send-install/", relay.AIRelayKeySendInstall.as_view()),
     path("ai/model-catalog/refresh/", views.AIModelCatalogRefresh.as_view()),
     path("ai/runtime/status/", views.AIRuntimeStatus.as_view()),
     path("ai/daily-report/send/", views.AIDailyReportSendNow.as_view()),
@@ -64,6 +74,7 @@ urlpatterns = [
     path("ai/tasks/<int:pk>/", views.UpdateDeleteAITask.as_view()),
     path("ai/tasks/<int:pk>/run/", views.RunAITaskNow.as_view()),
     path("ai/email/", views.AISendEmail.as_view()),
+    path("ai/rmm-clients/", views.AIRmmClients.as_view()),
     path("ai/device-note/", views.AIDeviceNote.as_view()),
     path("ai/resolve-devices/", views.AIResolveDevices.as_view()),
     path("ai/schedule-action/", views.AIScheduleAction.as_view()),
@@ -88,6 +99,14 @@ urlpatterns = [
     path("ai/mobile/inbox/", views.AIMobileInbox.as_view()),
     path("ai/automation-subjects/", views.AITicketAutomationSubjects.as_view()),
     path("ai/automation-subjects/<int:pk>/", views.AITicketAutomationSubjectDetail.as_view()),
+    # The rule language + its drafting assistant: vocabulary is read by the editor, draft is the
+    # "have an AI help write this" button. Neither saves anything - the subject serializer does.
+    path("ai/rule-vocab/", views.AIRuleVocabulary.as_view()),
+    path("ai/rule-draft/", views.AIRuleDraft.as_view()),
+    # Approval for automation on one ticket, shown as a plan first (the AI Decision window).
+    path("ai/approval/", views.AIAutomationApprovalView.as_view()),
+    # Resolve helpdesk KB article ids to titles + text (the subject editor's article picker).
+    path("ai/kb-articles/", views.AIKbArticles.as_view()),
     # Unauthenticated by design: tokenised one-click decision from the report email.
     path("ai/automation-subjects/decide/<str:action>/<str:token>/", views.AutomationSubjectDecide.as_view()),
     path("ai/runs/", views.AITaskRuns.as_view()),
