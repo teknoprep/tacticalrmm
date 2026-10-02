@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import re
 import traceback
 from contextlib import suppress
 from time import sleep
@@ -1709,6 +1711,43 @@ def _ticket_in_scope(t, scope, is_alert):
 
 
 
+# TRIAGE RETRY (owner, 2026-10-02). A triage that failed for a TRANSIENT reason - the provider
+# hung (the 2026-10-01 DeepSeek outage left TICKET/62123-62125 in "error" for good), the bridge
+# timed out or dropped the connection - used to stay in "error" forever: the poller only
+# re-triages "new" tickets or tickets with new activity. The error now carries its own retry
+# count and time, "[retry N @ISO] message", and the poller retries it with a growing wait.
+_TRIAGE_RETRY_RE = re.compile(r"^\[retry (\d+) @([0-9T:.+\-]+Z?)\] ")
+_TRIAGE_TRANSIENT = ("bridge error", "timed out", "timeout", "connection aborted", "remotedisconnected",
+                     "connection refused", "connection reset", "502", "503", "504",
+                     "model did not call submit_triage", "unable to start processing")
+TRIAGE_MAX_RETRIES = 3
+TRIAGE_RETRY_WAIT_MIN = 20
+
+
+def _triage_error_detail(previous: str, message: str, *, bump: bool = False) -> str:
+    """The error text to store, keeping (or bumping) the retry counter and stamping the time."""
+    m = _TRIAGE_RETRY_RE.match(previous or "")
+    n = int(m.group(1)) if m else 0
+    base = _TRIAGE_RETRY_RE.sub("", str(message or ""))
+    return f"[retry {n + 1 if bump else n} @{djangotime.now().isoformat()}] {base}"[:2000]
+
+
+def _triage_retry_due(st) -> bool:
+    """Is this errored triage worth another attempt now?"""
+    detail = st.error_detail or ""
+    if not any(k in detail.lower() for k in _TRIAGE_TRANSIENT):
+        return False
+    m = _TRIAGE_RETRY_RE.match(detail)
+    n = int(m.group(1)) if m else 0
+    if n >= TRIAGE_MAX_RETRIES:
+        return False
+    try:
+        when = datetime.datetime.fromisoformat(m.group(2)) if m else (st.updated or st.created)
+    except Exception:
+        when = st.updated or st.created
+    return djangotime.now() - when >= datetime.timedelta(minutes=TRIAGE_RETRY_WAIT_MIN * (n + 1))
+
+
 def _decision_url_for(ticket_ref: str) -> str:
     """The existing AI Decision link for a ticket, so an escalation note points a technician
     straight at the conversation the automation had. Empty when there is no thread.
@@ -1879,6 +1918,12 @@ def poll_helpdesk_tickets(only_refs=None):
         # from a non-AI author (customer/tech reply, or a tech handing it back).
         if st.status == "triaging":
             continue  # in progress
+        if st.status == "error" and in_scope and _triage_retry_due(st):
+            st.error_detail = _triage_error_detail(st.error_detail, st.error_detail, bump=True)
+            st.save(update_fields=["error_detail"])
+            triage_ai_ticket.delay(st.pk, force=True)
+            enqueued += 1
+            continue
         new_activity = last_msg > (st.last_message_id or 0) and not msg_from_bot
         # advance markers (also past the AI's own messages -> no self-loop). Only save
         # when something actually changed, so a dormant ticket isn't re-written (and its
@@ -1979,6 +2024,22 @@ def triage_ai_ticket(state_pk, force=False):
         if getattr(settings, "CORS_ORIGIN_WHITELIST", None) else ""
     )
     decision_url = f"{base_url}/ai-decision/{decision_token}" if base_url else ""
+    # THE LINK MUST EXIST BEFORE ANYONE CAN POST IT (owner, 2026-10-02). The bridge puts this
+    # URL in the note it writes DURING the run, but the row used to be created only AFTER the
+    # bridge answered - so a run Django gave up on (TICKET/62125: 900s timeout in the DeepSeek
+    # outage, the bridge posted its note 40 minutes later) and every path that returns early
+    # (known conditions, cancelled alerts) left a link to nothing: 508 of them since 09-01.
+    # Alerts start "closed" so they do not crowd the inbox; a worked ticket is reopened below.
+    if decision_url and not _existing:
+        try:
+            AIDecisionRequest.objects.get_or_create(
+                token=decision_token,
+                defaults={"ticket_ref": st.ticket_ref, "status": "closed" if st.is_alert else "open",
+                          "question": "", "messages": [],
+                          "context": {"summary": st.subject or "", "requester": st.requester or ""}},
+            )
+        except Exception as e:
+            DebugLog.error(message=f"could not pre-create the AI Decision thread for {st.ticket_ref}: {e}")
     bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
     run_timeout = getattr(settings, "PI_RUN_TIMEOUT", 3600)
 
@@ -2264,13 +2325,13 @@ def triage_ai_ticket(state_pk, force=False):
         data = r.json()
     except Exception as e:
         st.status = "error"
-        st.error_detail = f"bridge error: {e}"
+        st.error_detail = _triage_error_detail(st.error_detail, f"bridge error: {e}")
         st.save(update_fields=["status", "error_detail"])
         return st.error_detail
 
     if data.get("error"):
         st.status = "error"
-        st.error_detail = str(data["error"])[:2000]
+        st.error_detail = _triage_error_detail(st.error_detail, str(data["error"]))
     else:
         action = data.get("action") or "shadow_note"
         st.status = {
@@ -3141,6 +3202,9 @@ def run_ai_scheduled_action(pk):
     # the fields from extra_fields.
     from core.agent_groups import headless_orchestrator_fields
 
+    # `core` was never defined in this function, so every scheduled action since the
+    # per-surface routing landed (2026-09-29) died here with NameError (found 2026-10-02).
+    core = get_core_settings()
     ai_fields = headless_orchestrator_fields(core, surface="scheduled")
     model = None if ai_fields else _resolve_ai_model(None)
     if not ai_fields and not model:
