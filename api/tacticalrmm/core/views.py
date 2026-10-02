@@ -3082,6 +3082,22 @@ class AutomationSubjectDecide(APIView):
         rules = "<br>".join(
             f"<code>{escape(k)}</code>: {escape(json.dumps(v))}" for k, v in (subj.match or {}).items()
         ) or "<i>none</i>"
+        # A SCRIPT PROPOSAL IS APPROVED WITH THE SCRIPT IN FRONT OF YOU (owner, 2026-10-02): the
+        # daily report now proposes Fix-mode subjects that carry a reviewed PowerShell script, so
+        # the approval page shows exactly what will run, where, and which values it reads.
+        if subj.mode == "device_fix" and subj.fix_actions:
+            tgt = (subj.fix_target or {}).get("hostname") if isinstance(subj.fix_target, dict) else ""
+            where = (f"Runs on <b>{escape(tgt)}</b>" if tgt else
+                     "<span style='color:#b45309'><b>No device pinned</b> - it cannot run until one is "
+                     "chosen on the Procedures page</span>")
+            for a in subj.fix_actions:
+                params = ", ".join(f"{escape(p.get('name', ''))} ({escape(p.get('type', ''))})" for p in a.get("params") or [])
+                rules += (
+                    f"<div style='margin-top:12px'><b>Script:</b> {escape(a.get('name', ''))} &middot; {where}"
+                    + (f" &middot; reads from the ticket: {params}" if params else "") + "</div>"
+                    f"<pre style='background:#f6f8fa;border:1px solid #e5e7eb;border-radius:6px;padding:10px;"
+                    f"font-size:12px;white-space:pre-wrap;max-height:420px;overflow:auto'>{escape(a.get('command', ''))}</pre>"
+                )
         form = (
             f"<form method='post' style='margin-top:18px'>"
             f"<button type='submit' style='background:{colour};color:#fff;padding:11px 20px;border:0;"
