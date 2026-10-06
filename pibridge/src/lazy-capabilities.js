@@ -163,5 +163,8 @@ export function makeLazyCapabilities({ capabilities, log = () => {} }) {
 //   - CRM/opportunity ops belong to the discovery surface.
 //   - TOTP ops are listed by the "totp" capability when it loads.
 // Matched by name pattern rather than a fixed list so a deployment's own naming still works.
-export const TICKET_CHAT_UNADVERTISED = [/opportunit/i, /totp/i];
+// read_ticket_attachment is deliberately NOT advertised through helpdesk_call: the model is meant
+// to use the ticket_attachment tool, which returns the image as a picture. Called through
+// helpdesk_call it would return a base64 blob into the transcript instead (owner, 2026-10-06).
+export const TICKET_CHAT_UNADVERTISED = [/opportunit/i, /totp/i, /read_ticket_attachment/i];
 export const TOTP_OP_RE = /totp/i;

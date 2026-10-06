@@ -222,3 +222,36 @@ runs to restart sendplot should stay") and adds the verification branch. `mode`,
 * Every mutating verb carries a `class` (`read` / `fix` / `reply` / `note` / `close` / `human` /
   `wait` / `stop`) so the bridge can keep gating on capability classes rather than on names.
 * An unknown condition or action is rejected at save time — never ignored at run time.
+
+---
+
+## No IF, no run (owner, 2026-10-06)
+
+> "should the script be applied only if it's in the IF and the IF is true… i think actions should
+> be allowed to be there but they should NOT RUN unless an IF is setup in the rules"
+
+An attached reviewed script is **library data, not authority**. Three things are now enforced in
+code (`src/autowork-rule.js`, unit-tested in `test/autowork-fix.test.mjs`):
+
+1. **A subject with no rule runs NO reviewed action.** `fix_actions` are kept (a person reviewed
+   them) but they are inert. A `device_fix` subject with no `statements` is capped at read-only and
+   may not close the ticket — nothing ran, so nothing is finished. *M365 Offboarding (subject #31)
+   carried `m365-offboard-user` and no rule; it could never have run it.*
+2. **A `run_script` only runs from inside an IF that is TRUE.** `rulePlan()` records the guard chain
+   of every action and drops a script whose guard is false before it can reach the toolbelt:
+   * `approved_by_support_contact` is settled from the recorded approval's **capacity** — a
+     technician's approval does not satisfy it (account changes want the customer side);
+   * the fix cooldown (`fix_allowed`) withholds every script on a ticket;
+   * a `run_script` that is not inside any IF, or carries no body, is dropped;
+   * the remaining conditions (`cause_known`, `details_sufficient`, `procedure_cause`, …) are the
+     session's judgement, by design — but the step still has to sit inside an IF to be reachable.
+   Dropped scripts are removed from `apply_fix` **and** named in the session prompt as unavailable.
+3. **A script's own `RESULT: FAIL` line counts as a failure.** Every reviewed script ends with
+   `RESULT: OK …` / `RESULT: FAIL …`; a FAIL now ends the run and hands the ticket to a human even
+   if the script forgot to `exit 1` (subject #31's offboarding script printed FAIL and exited 0).
+
+`_subject_payload` sends `fix_actions: []` and a `fix_allowed` boolean; the bridge never reads the
+subject's attached actions for execution, only the rule's `run_script` steps. New scripted proposals
+from the daily report are created **with** their rule (`rule_for_fix`), so a proposal can never be a
+script that cannot run. Existing Fix subjects were migrated by
+`python manage.py rules_for_fix_subjects --apply`.

@@ -14,6 +14,7 @@ import { CONFIG } from "./config.js";
 import { brandEmailPolicy, BRAND } from "./brand.js";
 import { mutatingMatch as toolsMutatingMatch, buildTools, buildReportTools, buildTicketTriageTools, buildDecisionTools, buildProcedureMiningTools, operatorPromptSection } from "./tools.js";
 import { classOf, classSource, allowedOps, SURFACE_CLASSES, CLASSES, CAPS_MODE } from "./capabilities.js";
+import { rulePlan, autoworkDecision } from "./autowork-rule.js";
 import { loadHelpdesk } from "./helpdesk-runtime.js";
 import { loadVerifiers, matchVerifier, inspectVerifiers } from "./verifier-runtime.js";
 import { trmm } from "./trmm.js";
@@ -336,6 +337,7 @@ const DEFAULT_DECISION_POLICY =
   `FOLLOWERS: to keep someone in the loop on THIS ticket (CC) - even if they aren't the requester, e.g. a customer's IT contact or a vendor - use helpdesk_call add_follower with their email (and name). Prefer this over emailing them separately, so the whole conversation stays on the ticket.\n` +
   `PRIVILEGED ACTIONS (identity/access) - EXTRA AUTHORIZATION GATE: creating/adding a user, disabling/removing/offboarding a user, changing permissions/roles/group membership, granting or revoking access or licenses, adding mailbox delegates / shared mailboxes, or resetting another person's password/MFA - anything that GRANTS or REMOVES ACCESS - is PRIVILEGED and goes BEYOND fixing something already installed. Before doing ANY privileged action automatically, call helpdesk_call check_support_authorization; proceed ONLY if authorized==true (the requester is the company's Primary or a Secondary Support Contact). If false, DO NOT make the change - explain that identity/access changes must be requested/approved by an authorized support contact, and leave it for a human. This gate applies EVEN in Write mode / Auto-approve. Ordinary break/fix on already-installed systems is NOT privileged.\n` +
   `RESEARCH: use web_search/web_fetch for how-to steps or vendor docs, then draft clear steps.\n` +
+  `SCREENSHOTS AND FILES: a ticket usually carries evidence as a FILE - a customer's screenshot, a photo of a handwritten note, a log. get_ticket gives you the TEXT only. Run helpdesk_call list_ticket_attachments to see what is there, then ticket_attachment with an id to LOOK at it: an image is returned to you as a picture and you must read it rather than infer it from the surrounding words. Never say you cannot see an attachment, and never describe what a screenshot shows without opening it.\n` +
   `DEVICE FIXING: run_device_command diagnoses/fixes. Non-disruptive fixes run freely; reboots / service-stops / data-loss are REFUSED unless device changes are approved this turn. Diagnose read-only first, explain what you'll change, then do it. Never delete data.\n` +
     `MEMORY - TWO SEPARATE STORES, do not mix them:\n` +
   `  - save_device_note = DEVICE-SPECIFIC facts about ONE machine (its role, disk/volume/pool layout, service/container names, hardware quirks, a fix that worked on it, how to verify its health). Anything tied to a specific host goes here, NOT the KB.\n` +
@@ -4428,117 +4430,21 @@ async function runProcedureMining(blob) {
 //     to process each time, then it's in plain old IF THEN ELSE english".
 //
 // So the model may decide WHEN. It never decides WHAT IT MAY DO.
-function rulePlan(subj, blob) {
-  const st = subj && subj.statements;
-  const blocks = st && Array.isArray(st.blocks) ? st.blocks : [];
-  if (!blocks.length) return null;
-  const allow = { investigate: false, fix: false, reply: false, note: false, close: false, handoff: false, wait: false, stop: false };
-  const scripts = [];
-  const procedures = new Set();
-  const english = [];
-  let branchesOnCapacity = false;
-
-  const walk = (list, indent) => {
-    for (const step of list || []) {
-      if (!step || typeof step !== "object") continue;
-      if (step.if) {
-        const c = step.if.condition || "";
-        const a = step.if.args || {};
-        if (c === "approved_by_support_contact") branchesOnCapacity = true;
-        const txt = c === "procedure_cause" ? `if procedure #${a.procedure} is the confirmed cause`
-          : c === "probe_confirms" ? `if the probe confirms procedure #${a.procedure}`
-          : c === "cause_known" ? "if the cause is known"
-          : c === "fix_verified" ? "if the fix verified"
-          : c === "customer_replied" ? "if the customer replied"
-          : c === "requester_is_support_contact" ? "if the requester is a support contact"
-          : c === "approved_by_support_contact" ? "if the approval came from a support contact"
-          : c === "fixed_recently" ? `if a fix ran in the last ${a.minutes} minutes`
-          : c === "nothing_matched" ? "if nothing else matched" : `if ${c}`;
-        english.push(`${"  ".repeat(indent)}${txt}`);
-        walk(step.then, indent + 1);
-        walk(step.elif || [], indent);
-        if (step.else) { english.push(`${"  ".repeat(indent)}else`); walk(step.else, indent + 1); }
-        continue;
-      }
-      const act = step.action || "";
-      const a = step.args || {};
-      if (act === "investigate" || act === "verify_fix") allow.investigate = true;
-      if (act === "fix_procedure") { allow.fix = true; if (a.procedure) procedures.add(Number(a.procedure)); }
-      if (act === "run_script") {
-        allow.fix = true;
-        // `timeout` is the kill limit, `wait` the pause after. A drafted rule that says wait:1 means
-        // "do not pause", NOT "kill this after one second" - which is what it used to do.
-        if (a.name && a.script) scripts.push({ name: a.name, shell: a.shell || "powershell", command: a.script,
-                                               timeout: Number(a.timeout || 300), wait: Number(a.wait || 0),
-                                               params: Array.isArray(a.params) ? a.params : [] });
-      }
-      if (act === "reply_customer") allow.reply = true;
-      if (act === "note_ticket") allow.note = true;
-      if (act === "close_ticket") allow.close = true;
-      if (act === "hand_to_human") allow.handoff = true;
-      if (act === "wait_customer") allow.wait = true;
-      if (act === "stop") allow.stop = true;
-      const label = act === "run_script" ? `run the script "${a.name}"`
-        : act === "fix_procedure" ? `fix it with procedure #${a.procedure}`
-        : act === "reply_customer" ? "update the customer" : act === "note_ticket" ? "note the ticket"
-        : act === "close_ticket" ? "close the ticket" : act === "hand_to_human" ? "hand it to a human"
-        : act === "wait_customer" ? "wait for the customer" : act === "stop" ? "stop processing"
-        : act === "investigate" ? "investigate the device" : act === "verify_fix" ? "check that it is back up" : act;
-      english.push(`${"  ".repeat(indent)}${label}`);
-    }
-  };
-  walk(blocks, 1);
-
-  // THE GATE. The approval arrives with the blob, resolved in Django by core/ai_approval.py.
-  const ap = (blob && blob.approval) || {};
-  const approved = !!ap.approved;
-  const capacity = ap.capacity || "";
-  // THE GATE IS "A PERSON APPROVED" - support contact OR technician (owner, 2026-09-28: "just do
-  // it as if a tech did approve it... accept a technician in the rules first line").
-  //
-  // This used to demand a support contact whenever a rule mentioned `approved_by_support_contact`
-  // anywhere, which made any rule that BRANCHES on who approved impossible to satisfy with a
-  // technician - including subject #9, whose whole first branch was that question. Capacity is now
-  // a fact the branch is judged against, not a gate: a rule that wants the stricter path writes it
-  // as a branch ("if the approval came from a support contact... else ask the customer"), and the
-  // session is told which one it has.
-  const gateOk = approved;
-
-  // WHAT THE RUN MAY ACTUALLY DO. No gate, no fix. No verb in the rule, no verb in the toolbelt.
-  const mayFix = gateOk && allow.fix && scripts.length > 0;   // a fix needs a reviewed script to run
-  const mayInvestigate = allow.investigate;
-  const surface = mayFix ? "autowork_fix" : (mayInvestigate ? "autowork_readonly" : "advise");
-  const mode = mayFix ? "device_fix" : (mayInvestigate ? "device_readonly" : "advise");
-  return {
-    present: true, english, allow, scripts, procedures: [...procedures],
-    branchesOnCapacity, approved, capacity, gateOk, mode, surface,
-    blockReason: !approved ? "no approval is on file for this ticket, so the rule's first line is not satisfied" : "",
-  };
-}
-
 async function runAutowork(blob) {
   const ticketRef = blob.ticket_ref || "";
   const subj = blob.subject || {};
-  // MODE IS THE CEILING (see AITicketAutomationSubject.mode). device_fix is only honoured
-  // when the owner actually attached reviewed actions to the subject - a mode with no
-  // actions behind it degrades to read-only investigation rather than pretending.
-  // A RULE, IF THERE IS ONE, IS THE CEILING. Without a rule this falls back to the old
-  // mode + fix_actions pair, which is what every subject used before the rule language existed.
+  // A RULE, IF THERE IS ONE, IS THE CEILING - AND WITHOUT ONE THERE IS NO ACTION AT ALL.
+  //
+  // Owner's rule (2026-10-06): "actions should be allowed to be there but they should NOT RUN
+  // unless an IF is setup in the rules". `fix_actions` are reviewed LIBRARY data attached to the
+  // subject, not authority. `autoworkDecision` therefore runs NO script when there is no rule, and
+  // caps a device_fix subject at read-only; `rulePlan` drops any script whose IF is false (or
+  // missing, or withheld by the cooldown) before it can reach the toolbelt.
   const plan = rulePlan(subj, blob);
-  const fixActions = plan
-    ? plan.scripts
-    : (Array.isArray(subj.fix_actions) ? subj.fix_actions.filter((a) => a && a.name && a.command) : []);
-  const mode = plan ? plan.mode
-    : (subj.mode === "device_fix" && fixActions.length ? "device_fix"
-      : (subj.mode === "device_readonly" || subj.mode === "device_fix" ? "device_readonly" : "advise"));
-  const surface = plan ? plan.surface : (mode === "advise" ? "advise" : (mode === "device_fix" ? "autowork_fix" : "autowork_readonly"));
-  // Reply and close are the rule's to grant when a rule exists: the old `reply_allowed` flag was a
-  // single blanket switch, and a rule can say "reply only down this branch".
-  const ruleAllowsReply = !plan || plan.allow.reply;
-  const ruleAllowsClose = !plan || plan.allow.close;
+  const { fixActions, mode, surface, ruleAllowsReply, ruleAllowsClose } = autoworkDecision(subj, plan);
   log("autowork_rule", ticketRef, subj.name || "",
-      plan ? `rule: mode=${mode} gateOk=${plan.gateOk} approved=${plan.approved} scripts=${plan.scripts.length} reply=${plan.allow.reply} close=${plan.allow.close}${plan.blockReason ? " blocked=" + plan.blockReason : ""}`
-           : "no rule - using mode + fix_actions");
+      plan ? `rule: mode=${mode} gateOk=${plan.gateOk} approved=${plan.approved} scripts=${plan.scripts.length} dropped=${plan.dropped.length} reply=${plan.allow.reply} close=${plan.allow.close}${plan.blockReason ? " blocked=" + plan.blockReason : ""}`
+           : `no rule - fix actions are INERT (mode capped at ${mode}); a rule with an IF is required to run anything`);
   const rt = await piRuntime({ [blob.provider]: blob.api_key });
   // THE GROUP WIRING WAS MISSING HERE AND IT MADE AUTOWORK COMPLETELY DEAD.
   //
@@ -4640,10 +4546,11 @@ async function runAutowork(blob) {
   // restart the thing - but only the thing, only the way a human wrote down, and only
   // when it has first PROVEN the service is actually down.
   //
-  // The model supplies a NAME. It never supplies a command: the commands are
-  // subject.fix_actions, reviewed in the Procedures page. That is what keeps "restart
-  // SendPlot" from becoming anything else, whatever a ticket or an injected instruction
-  // asks for.
+  // The model supplies a NAME. It never supplies a command: the commands come from the RULE's
+  // `run_script` steps, which a person reviewed and approved. That is what keeps "restart
+  // SendPlot" from becoming anything else, whatever a ticket or an injected instruction asks
+  // for. Under the owner's rule of 2026-10-06 the scripts in `fixActions` are ONLY the ones the
+  // rule reaches through a TRUE IF - the subject's attached `fix_actions` are inert library data.
   // THE INCIDENT'S TICKETS. This one, plus every ticket held behind it. The session may
   // reply to and close these and nothing else (enforced in buildDecisionTools via
   // allowedTickets), so "handle your duplicates too" cannot become "touch any ticket".
@@ -4697,8 +4604,9 @@ async function runAutowork(blob) {
       "Run ONE of this subject's reviewed remediation actions, by name: " +
       fixActions.map((a) => `'${a.name}'${a.what ? ` (${a.what})` : ""}`).join(", ") + ". " +
       "Or name 'all' to run them in the order listed, which is what a full restart means. " +
-      "PRECONDITIONS, enforced in code: you must already have probed and shown the service is " +
-      "DOWN (a failed port test or a non-200 page), and a fix may run only once per ticket. " +
+      "PRECONDITIONS, enforced in code: you must quote the evidence that authorises this action " +
+      "- the read-only probe showing the service is DOWN, or the ticket details that make the change " +
+      "correct - and a fix may run only once per ticket. " +
       "Never use this on a service that is responding - a working service is not an incident. " +
       "After it runs, PROBE AGAIN and report what you found; if it is still down, say so and " +
       "let a human take it.",
@@ -4843,7 +4751,12 @@ async function runAutowork(blob) {
         out.push(`--- ${act.name} (${line.ms} ms${rr.code === null ? "" : `, exit ${rr.code}`})\n${line.output}`);
         log("autowork_fix", ticketRef, subj.name || "", `${act.name} on ${agentId.slice(0, 8)}`);
         // BROKEN = the call failed, a non-zero exit code, or the transport's own failure text.
-        const broken = rr.threw || (rr.code !== null && rr.code !== 0) || /^FAILED:/i.test(rr.text.trim());
+        // ALSO the script's own verdict line: every reviewed script ends with "RESULT: OK - ..." or
+        // "RESULT: FAIL - ...", and a script whose internal verification failed must NOT be read as
+        // a success just because it forgot to `exit 1` (subject #31's offboarding script printed
+        // FAIL and still exited 0). A failed verdict ends the run and hands it to a human.
+        const broken = rr.threw || (rr.code !== null && rr.code !== 0) || /^FAILED:/i.test(rr.text.trim())
+          || /\bRESULT:\s*FAIL/i.test(rr.text);
         if (broken) {
           fixBroken = { action: act.name, retcode: rr.code, output: line.output, ms: line.ms };
           out.push(`\nSTOP. The reviewed action "${act.name}" FAILED. This is not a "try something else" situation: the owner's reviewed fix is broken, so nothing further may be run, and no attempt may be made to invent a replacement. Do not retry it, do not run another action. Call report_verdict now with kind='unclear' or 'needs_input', confidence='unsure', and say plainly that the reviewed action "${act.name}" failed with the output above. A human must fix the action.`);
@@ -4927,6 +4840,10 @@ async function runAutowork(blob) {
           `  Gate: ${plan.gateOk ? `SATISFIED (approved by ${blob.approval?.by || "a person"} as ${plan.capacity || "technician"})` : `NOT SATISFIED - ${plan.blockReason}. You may READ and REPORT only; do not fix, reply or close anything.`}\n` +
           (plan.branchesOnCapacity
             ? `  THE APPROVAL IS FROM: ${plan.capacity === "support_contact" ? "a SUPPORT CONTACT (customer-side)" : "a TECHNICIAN (ours)"}. Any branch asking "the approval came from a support contact" is ${plan.capacity === "support_contact" ? "TRUE" : "FALSE here"} - take the branch that fact points to.\n`
+            : "") +
+          (plan.dropped.length
+            ? `  NOT AVAILABLE ON THIS TICKET: ` + plan.dropped.map((d) => `"${d.name}" (${d.why})`).join("; ") +
+              `. Those steps are removed from apply_fix - do not ask for them, and do not look for another way to do them.\n`
             : "") +
           `  Your job is the BRANCHES: decide each "if" on the evidence you gathered, then take that branch's steps in order. ` +
           `Any step marked [AI decides] is yours to judge; everything else is checked by code.` +

@@ -2304,6 +2304,54 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   // when it loads (e.g. the TOTP ops in the "totp" capability).
   const unadvertisedOpLines = hd ? hdVisible.filter((n) => !advertised.includes(n)).map(opLine) : [];
 
+  // READ A TICKET ATTACHMENT - AND SEE IT (owner, 2026-10-06).
+  // Tickets carry screenshots (a customer's error, a photo of a handwritten note) and the AI could
+  // not see any of them: helpdesk_call returned text only, so a picture was invisible and the model
+  // had to guess from the words around it. This returns an IMAGE content block, which the harness
+  // already supports (it is how the built-in read tool shows a picture), so the model looks at the
+  // actual screenshot. Non-image files come back as text when they are small and textual.
+  const ticket_attachment = defineTool({
+    name: "ticket_attachment",
+    label: "Look at a ticket attachment",
+    description:
+      "Read ONE file attached to this ticket or to one of its messages, by id. Call " +
+      "helpdesk_call list_ticket_attachments first to get the ids. An image comes back as a " +
+      "PICTURE you can actually see; a small text file comes back as text. Look at every " +
+      "screenshot a ticket carries before you decide anything - it is the evidence the customer " +
+      "sent us, and never say you cannot view it.",
+    parameters: Type.Object({
+      id: Type.Number({ description: "attachment id from helpdesk_call list_ticket_attachments" }),
+    }),
+    execute: async (_id, p) => {
+      if (!hd?.operations?.read_ticket_attachment) {
+        return text("reading attachments is not available on this helpdesk");
+      }
+      let out;
+      try {
+        out = await hd.operations.read_ticket_attachment({ id: p.id });
+      } catch (e) {
+        return text(`could not read attachment ${p.id}: ${e?.message || e}`);
+      }
+      if (out?.error) {
+        return text(String(out.error));
+      }
+      const head = `${out.name || "attachment"} (${out.mimetype || "?"}, ${out.size || 0} bytes)`;
+      if (out.image_base64 && String(out.mimetype || "").startsWith("image/")) {
+        return {
+          content: [
+            { type: "text", text: `${head} - shown to you as a picture below. This is the actual file from the ticket.` },
+            { type: "image", data: out.image_base64, mimeType: out.mimetype },
+          ],
+          details: {},
+        };
+      }
+      if (out.text) {
+        return text(`${head}:\n\n${String(out.text).slice(0, 20000)}`);
+      }
+      return text(`${head} - there is nothing readable in it.`);
+    },
+  });
+
   const helpdesk_call = defineTool({
     name: "helpdesk_call",
     label: "Helpdesk operation",
@@ -3282,7 +3330,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     });
   }
 
-  let baseTools = [helpdesk_call, find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
+  let baseTools = [helpdesk_call, ...(hd?.operations?.read_ticket_attachment ? [ticket_attachment] : []), find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
   if (sales_call) baseTools.push(sales_call);
   if (leadRef) {
     // DISCOVERY. Device tools stay - they obey Write mode and the approval prompt exactly
@@ -3299,7 +3347,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     // it now gates itself on the window's switches (see its execute). attach_capture is
     // still out - it attaches to a TICKET, and there is no ticket on this surface.
     const drop = new Set(["attach_capture", "schedule_action", "cancel_scheduled_action",
-                          "save_procedure"]);
+                          "save_procedure", "ticket_attachment"]);
     baseTools = baseTools.filter((t) => !drop.has(t.name));
     baseTools.push(submit_discovery_scope);
   }
