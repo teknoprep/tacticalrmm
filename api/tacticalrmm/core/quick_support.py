@@ -58,6 +58,7 @@ NODES_TTL = 3  # the device list; shared by every tech polling the page
 CLAIM_TTL = 8 * 3600
 SEEN_TTL = 24 * 3600
 TEAMS_SENT_TTL = 12 * 3600
+TEAMS_GRACE = 10  # seconds after connect before posting
 
 VIEWMODES = {"desktop": 11, "terminal": 12, "files": 13}
 
@@ -197,24 +198,25 @@ def _entry(n):
             cache.delete(f"qs:claim:{key}")
         claim = None
 
-    since = None
-    if help_text:
-        seen_key = "qs:seen:" + hashlib.sha1(f"{nid}|{help_text}".encode()).hexdigest()
+    # One "request" = one run of the Assistant (one agent connection). Since 2026-11-02 the exe is
+    # built "Application, always connected" (AutoConnect=3): RUNNING it is the request, so an
+    # online device is waiting whether or not the customer also typed a Request Help message.
+    agct = n.get("agct")
+    request_id = f"{key}|{agct or ''}"
+    since = agct / 1000 if agct else None
+    if since is None and online:
+        seen_key = "qs:seen:" + hashlib.sha1(request_id.encode()).hexdigest()
         since = cache.get(seen_key)
         if since is None:
             since = time.time()
             cache.set(seen_key, since, SEEN_TTL)
-    elif n.get("agct"):
-        since = n["agct"] / 1000
 
     if not online:
         status = "left"
     elif connected or claim:
         status = "helping"
-    elif help_text:
-        status = "waiting"
     else:
-        status = "idle"  # Assistant open but the help request was cancelled
+        status = "waiting"
 
     return {
         "id": key,
@@ -224,6 +226,7 @@ def _entry(n):
         "users": n.get("users") or [],
         "help_user": help_user,
         "help_text": help_text,
+        "request_id": request_id,
         "online": online,
         "status": status,
         "since": since,
@@ -233,7 +236,7 @@ def _entry(n):
     }
 
 
-_ORDER = {"waiting": 0, "helping": 1, "idle": 2, "left": 3}
+_ORDER = {"waiting": 0, "helping": 1, "left": 2}
 
 
 def queue_entries(group):
@@ -261,7 +264,9 @@ class QuickSupportEntry(APIView):
         except QSError as e:
             return Response({"detail": e.detail}, status=e.status)
         token = get_login_token(key=core.mesh_token, user=request.user.mesh_user_id)
-        url = f"{core.mesh_site}/?login={token}&gotomesh={quote(group['key'], safe='')}&viewmode=1"
+        # MeshCentral's parseUriArgs() does NOT url-decode and DROPS any value containing '%', so mesh/node
+        # ids (base64 with '@' and '$') must go in raw - exactly as TRMM's own Take Control does.
+        url = f"{core.mesh_site}/?login={token}&gotomesh={group['key']}&viewmode=1"
         _audit(request, f"{request.user.username} opened Quick Support in MeshCentral (group '{QS_GROUP_NAME}').", True)
         return Response({"url": url, "group": QS_GROUP_NAME})
 
@@ -318,7 +323,8 @@ class QuickSupportConnect(APIView):
         cache.delete("qs:nodes")
 
         token = get_login_token(key=core.mesh_token, user=request.user.mesh_user_id)
-        url = f"{core.mesh_site}/?login={token}&gotonode={quote(node, safe='')}&viewmode={VIEWMODES[mode]}&hide=31"
+        # raw node id on purpose - see QuickSupportEntry (MeshCentral drops '%'-encoded args)
+        url = f"{core.mesh_site}/?login={token}&gotonode={n['_id'].split('/')[-1]}&viewmode={VIEWMODES[mode]}&hide=31"
         what = f"'{e['help_text']}'" if e["help_text"] else "(no request text)"
         _audit(
             request,
@@ -353,7 +359,7 @@ def _card(e, test=False):
     dev = quote(e["id"], safe="")
     who = e.get("help_user") or ", ".join(e.get("users") or []) or "unknown"
     facts = [
-        {"title": "Customer says", "value": e.get("help_text") or "-"},
+        {"title": "Customer says", "value": e.get("help_text") or "(no message - they opened Quick Support)"},
         {"title": "Computer", "value": e.get("name") or "-"},
         {"title": "Windows user", "value": who},
     ]
@@ -361,7 +367,7 @@ def _card(e, test=False):
         facts.append({"title": "Public IP", "value": e["ip"]})
     if e.get("os"):
         facts.append({"title": "OS", "value": e["os"]})
-    title = "TEST - Quick Support notifications are working" if test else "Someone is waiting for Quick Support"
+    title = "TEST - Quick Support notifications are working" if test else f"{who} on {e.get('name') or 'a PC'} is waiting for Quick Support"
     actions = [{"type": "Action.OpenUrl", "title": "Open Quick Support queue", "url": f"{base}/quick-support?device={dev}"}]
     if not test:
         actions.insert(
@@ -401,9 +407,12 @@ def run_teams_notify():
     try:
         group, _ = _group_and_techs()
         for e in queue_entries(group):
-            if e["status"] != "waiting" or not e["help_text"]:
+            if e["status"] != "waiting":
                 continue
-            sent_key = "qs:teams:sent:" + hashlib.sha1(f"{e['id']}|{e['help_text']}".encode()).hexdigest()
+            # give an old (Request Help) exe a moment to deliver its typed message with the connect
+            if e["since"] and time.time() - e["since"] < TEAMS_GRACE:
+                continue
+            sent_key = "qs:teams:sent:" + hashlib.sha1(e["request_id"].encode()).hexdigest()
             if not cache.add(sent_key, 1, TEAMS_SENT_TTL):
                 continue
             try:
