@@ -1950,10 +1950,15 @@ def poll_helpdesk_tickets(only_refs=None):
                 try:
                     from core.ai_autowork import handle_reply_to_resolved
 
-                    _reply_body = "\n".join(
-                        str(m.get("text") or "") for m in (t.get("recent_messages") or [])
-                        if (m.get("kind") or "") != "Note" and not m.get("bot")
-                    )[:4000]
+                    # ONLY THE NEWEST MESSAGE - the reply that woke the poller (new_activity is
+                    # false when the newest message is the bot's, so this is the customer's or a
+                    # person's). This used to JOIN all recent messages and filter on m["bot"], but
+                    # recent_messages entries carry no `bot` flag, so our OWN earlier email to the
+                    # customer was classified as theirs - which is how TICKET/62719's "Thank you,
+                    # it is back up and working" was filed as "customer says it is not fixed".
+                    _msgs = [m for m in (t.get("recent_messages") or [])
+                             if (m.get("kind") or "") != "Note" and not m.get("bot")]
+                    _reply_body = str(_msgs[0].get("text") or "")[:4000] if _msgs else ""
                     outcome = handle_reply_to_resolved(
                         st, body_text=_reply_body or str(t.get("body") or ""),
                         core=core, decision_url=_decision_url_for(st.ticket_ref),
@@ -2379,7 +2384,8 @@ def triage_ai_ticket(state_pk, force=False):
     # new activity) flows through this point. A human clears it by working the ticket.
     if getattr(st, "automation_stood_down", False):
         logger.info("autowork: %s skipped - automation stood down (%s)", st.ticket_ref, st.stood_down_reason or "no reason recorded")
-    elif (not data.get("error") and st.status == "triaged"
+    elif (not data.get("error")
+            and st.status in ("triaged", "needs_input")
             and st.classification in ("regular", "unknown") and not st.is_alert):
         try:
             from core.ai_autowork import find_subject, hd_op, work_ticket
@@ -2392,7 +2398,12 @@ def triage_ai_ticket(state_pk, force=False):
                                    if (m.get("type") or "") != "Note"])
             _client2 = str(_tk2.get("partner_company_name") or data.get("client") or "")
             subj = find_subject(subject_line=_subj_line, body=_body2, sender=st.requester or "", client=_client2)
-            if subj:
+            # A needs_input ticket normally stays for a human: triage asked for a decision. But a
+            # subject that PRE-AUTHORISES safe actions (allow_safe_bypass) has already made the
+            # standing decision for exactly the non-destructive work - so hand it to the worker,
+            # where the rule's gate still decides what may actually run. A mutating action is still
+            # refused and handed back. Without the switch, nothing changes: triage's ask stands.
+            if subj and (st.status == "triaged" or getattr(subj, "allow_safe_bypass", False)):
                 work_ticket(st, subj=subj, body_text=_body2, client=_client2,
                             decision_url=decision_url, core=core, model=model)
         except Exception as e:
@@ -3094,6 +3105,130 @@ def dispatch_due_ai_scheduled_actions():
     for pk in due:
         run_ai_scheduled_action.delay(pk)
     return f"dispatched {len(due)}"
+
+
+@app.task
+def run_ai_ticket_completion(pk):
+    """Run ONE "Complete this ticket" attempt from the Ticket Console.
+
+    Owner (2026-10-15). The technician's button press IS the authorisation for this run, so the
+    approval blob carries their identity (capacity=technician). What a person still approves is the
+    REUSABLE artifact the run proposes - the rule and the procedures - which land as `proposed_*`
+    and are only written by the approve endpoint (core/ai_completion.py).
+    """
+    import requests as _requests
+
+    from core.ai_autowork import _subject_payload, find_subject, hd_op
+    from core.ai_completion import validate_artifacts
+    from core.ai_match import match_procedures as _match_procs
+    from core.agent_groups import headless_orchestrator_fields, model_fallback_fields
+    from core.models import AITicketCompletion, AITicketState
+
+    core = get_core_settings()
+    comp = AITicketCompletion.objects.filter(pk=pk).first()
+    if not comp:
+        return "gone"
+    if comp.status != "running":
+        return f"skip status={comp.status}"
+    if not (core.ai_module_enabled and (core.ai_helpdesk_code or "").strip()):
+        comp.status = "error"
+        comp.error_detail = "the AI module or the helpdesk integration is disabled"
+        comp.save(update_fields=["status", "error_detail", "updated"])
+        return "disabled"
+
+    st = AITicketState.objects.filter(ticket_ref=comp.ticket_ref).first()
+    try:
+        g = hd_op(core, "get_ticket", {"ticket": comp.ticket_ref}) or {}
+    except Exception as e:
+        g = {}
+        DebugLog.error(message=f"completion {comp.ticket_ref}: could not read the ticket: {e}")
+    tk = g.get("ticket") or {}
+    _subject_line = str(tk.get("email_subject") or (st.subject if st else "") or "")
+    body_text = "\n".join(
+        [str(tk.get("description") or "")]
+        + [str(m.get("text") or "") for m in (g.get("messages") or []) if (m.get("type") or "") != "Note"]
+    )
+    client = str(tk.get("partner_company_name") or "")
+    subj = comp.subject or find_subject(
+        subject_line=_subject_line, body=body_text,
+        sender=(st.requester if st else "") or "", client=client,
+    )
+    comp.subject = subj
+
+    ai_fields = headless_orchestrator_fields(core, surface="resolve")
+    if not ai_fields:
+        model = _resolve_ai_model(None)
+        if not model:
+            comp.status = "error"
+            comp.error_detail = "no enabled AI model/default configured"
+            comp.save(update_fields=["status", "error_detail", "updated"])
+            return "no model"
+        ai_fields = model_fallback_fields(model)
+
+    subject_payload = _subject_payload(subj, core) if subj else {}
+    ctx = {
+        "summary": (st.summary if st else "") or "",
+        "subject": _subject_line,
+        "client": client,
+        "affected_device": str(((st.proposed_action if st else "") or ""))[:300],
+        "proposed_action": (st.proposed_action if st else "") or "",
+    }
+    approval = {
+        "approved": True, "capacity": "technician", "by": comp.started_by or "console",
+        "auto": False, "digest": "",
+        "safe_bypass": bool(getattr(subj, "allow_safe_bypass", False)) if subj else False,
+        "reason": "a technician started this run from the ticket console",
+    }
+    bridge = getattr(settings, "PI_BRIDGE_URL", "http://127.0.0.1:8787")
+    try:
+        r = _requests.post(
+            f"{bridge}/pi/ticket-completion",
+            json={
+                "run_id": comp.run_id, "ticket_ref": comp.ticket_ref, "mode": comp.mode,
+                "context": ctx, "prior_findings": comp.prior_findings or "",
+                "subject": subject_payload, "approval": approval,
+                "fix_allowed": True,
+                "procedures": _match_procs(comp.ticket_ref, _subject_line, ctx["summary"], ctx["proposed_action"]),
+                **ai_fields,
+                "decision_prompt": core.ai_ticket_decision_prompt or "",
+                "helpdesk_prompt": core.ai_helpdesk_prompt or "",
+                "helpdesk_api": {
+                    "base_url": core.ai_helpdesk_api_base_url or "",
+                    "api_key": core.ai_helpdesk_api_key or "",
+                },
+                "helpdesk_code": core.ai_helpdesk_code or "",
+            },
+            timeout=(10, 1500),
+        )
+        data = r.json()
+    except Exception as e:
+        data = {"error": f"bridge error: {e}"}
+
+    if data.get("error"):
+        comp.status = "error"
+        comp.error_detail = str(data["error"])[:1500]
+        comp.save(update_fields=["status", "error_detail", "subject", "updated"])
+        return "error"
+
+    comp.verdict = data.get("verdict") or {}
+    comp.summary = (data.get("summary") or data.get("output") or "")[:8000]
+    comp.events = data.get("events") or []
+    comp.fix_applied = data.get("fix_applied") or []
+    comp.fix_broken = data.get("fix_broken") or {}
+    art = data.get("artifacts") or {}
+    clean, errors = validate_artifacts({"procedures": art.get("procedures") or [], "rule": art.get("rule") or {}})
+    comp.proposed_procedures = clean["procedures"]
+    comp.proposed_rule = clean["rule"]
+    if errors:
+        comp.error_detail = "; ".join(errors)[:1500]
+    comp.status = "awaiting_review"
+    comp.save()
+    logger.info(
+        "completion %s: mode=%s kind=%s procedures=%s rule=%s fix=%s",
+        comp.ticket_ref, comp.mode, (comp.verdict or {}).get("kind"),
+        len(comp.proposed_procedures), bool(comp.proposed_rule), len(comp.fix_applied),
+    )
+    return "ok"
 
 
 @app.task

@@ -260,6 +260,13 @@ class CoreSettings(BaseAuditModel):
     # serializer validates against - so the interface and the resolver cannot drift apart.
     ai_agent_routing = models.JSONField(default=dict, blank=True)
 
+    # WHO WRITES THE AUTO-SUMMARY FOR A CHAT ON A SINGLE MODEL (no agent group). Chats on a group
+    # use that group's own summarizer; a chat with no group used to fall through to the default
+    # group's summarizer. When these two are set the bridge tries this model first (it must be a
+    # configured model that fits the transcript). Blank = the old behaviour.
+    ai_default_summarizer_provider = models.CharField(max_length=50, blank=True, default="")
+    ai_default_summarizer_model_id = models.CharField(max_length=255, blank=True, default="")
+
     ai_operator_default_model = models.ForeignKey(
         "core.AIModel", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="operator_default_for",
@@ -2656,7 +2663,13 @@ class AITicketAutomationSubject(models.Model):
     baseline_minutes = models.FloatField(null=True, blank=True)
     # REMEDIATION THE AI MAY PERFORM - data a human approved, never text the model wrote.
     #
-    #   [{"name": "restart-web", "shell": "powershell", "command": "...", "wait": 5}, ...]
+    #   [{"name": "restart-web", "shell": "powershell", "command": "...", "wait": 5,
+    #     "safety": "restart"}, ...]
+    #
+    # `safety` is the reviewed action's DECLARED destructiveness (core.ai_rules.ACTION_SAFETY):
+    # read / restart / update / mutating. It defaults to `mutating`. It is what lets code decide
+    # whether the approval gate may be skipped for this action (see allow_safe_bypass) - never
+    # what the script says about itself, and never something a ticket can change.
     #
     # In device_fix mode the model picks an action BY NAME from this list and can do
     # nothing else: it cannot compose a command, so "restart SendPlot" can never become
@@ -2669,6 +2682,32 @@ class AITicketAutomationSubject(models.Model):
     fix_target = models.JSONField(default=dict, blank=True)
     # A service that keeps dying is a HUMAN's problem, not something to restart in a loop.
     fix_cooldown_minutes = models.IntegerField(default=60)
+    # MAY THE AUTOMATION FILE THE TICKET TO "AI Closed" WHEN IT ANSWERS? (owner, 2026-10-05)
+    # It used to close every ticket it replied to confidently - including INTAKE subjects whose whole
+    # job is to acknowledge a request and ask for the missing details. TICKET/62168/62169 (new-hire
+    # onboarding) went New -> AI Closed minutes after arriving, while the customer was still waiting
+    # for a reply and a technician still had to create the account and do the on-site visit; on
+    # TICKET/62169 the technician had to tell the customer "please ignore the last reply, that was by
+    # AI". A subject with NO RULE has nothing that says the job is done, so it must not close.
+    # Default False; the fix/script subjects and "no action needed" ones switch it on.
+    may_close_ticket = models.BooleanField(default=False, help_text=
+        "May the automation file this ticket to AI Closed once it has replied? Off for intake/advice "
+        "subjects that leave work for a human; on for subjects that actually finish the job.")
+    # MAY THE APPROVAL GATE BE SKIPPED FOR DECLARED-SAFE ACTIONS? (owner, 2026-10-15)
+    #
+    # "this should be something that can be bypassed, but if it is bypassed the only actions that
+    # can be done are IMMUTABLE actions which have 0 affect on data... restarts of services when
+    # needed / computer updates / things like this... no deletion of files or change of licenses".
+    #
+    # Off by default, so every existing subject keeps the hard gate. When ON, a `run_script` whose
+    # attached action is DECLARED safety `read`, `restart` or `update` (see core.ai_rules
+    # ACTION_SAFETY) may run WITHOUT a per-ticket approval; a `mutating` action still cannot run
+    # until a person approves the plan. The class is reviewed data on the action - this switch does
+    # not widen WHAT may run, only whether the safe subset needs a click. `verify-sendplot` is
+    # read, `restart-sendplot` is restart: exactly the SendPlot case.
+    allow_safe_bypass = models.BooleanField(default=False, help_text=
+        "Allow actions declared read-only / restart / update to run without a per-ticket approval. "
+        "Actions declared 'change data, files or accounts' always still require approval. Off by default.")
     last_fix_at = models.DateTimeField(null=True, blank=True)
     fixes_applied = models.IntegerField(default=0)
 
@@ -2744,6 +2783,73 @@ class AITicketAutomationSubject(models.Model):
             (c and c in [str(x).strip().lower() for x in (self.clients or [])])
             or (d and d in [str(x).strip().lower() for x in (self.domains or [])])
         )
+
+
+class AITicketCompletion(models.Model):
+    """ONE human-initiated "Complete this ticket" run from the Ticket Console.
+
+    Owner (2026-10-15): a magic button on the console that asks the AI to finish the ticket,
+    either "read-only and report" or "fix & report"; streams what it is doing; and, when it
+    succeeds, hands back the automation RULE and the PROCEDURES it used so a person can approve
+    them (and then review both in their own windows).
+
+    This is not the unattended autowork path. A person pressed the button, so the run is
+    authorised by that act: `approval` carries the technician's identity into the bridge. What a
+    person still has to approve is the REUSABLE part - the rule and the procedures - because that
+    is what will run unattended tomorrow. Hence proposed_* (what the AI produced) and the applied_*
+    ids (what was actually saved when a person pressed Approve).
+    """
+
+    MODE = (("readonly", "Read-only and report"), ("fix", "Fix and report"))
+    STATUS = (
+        ("running", "Running"),
+        ("awaiting_review", "Awaiting review"),
+        ("approved", "Approved"),
+        ("declined", "Declined"),
+        ("error", "Error"),
+    )
+
+    ticket_ref = models.CharField(max_length=100, db_index=True)
+    mode = models.CharField(max_length=10, choices=MODE, default="readonly")
+    status = models.CharField(max_length=20, choices=STATUS, default="running")
+    started_by = models.CharField(max_length=150, blank=True, default="")
+    # Correlates the run with the bridge's live-progress blob in redis (`pi_completion:<run_id>`)
+    # and with the AI spend ledger. Unique so a retry cannot collide.
+    run_id = models.CharField(max_length=64, unique=True)
+    # The subject whose rule fired on this ticket, if any. An approved completion EXTENDS it
+    # rather than creating a near-duplicate.
+    subject = models.ForeignKey(
+        "core.AITicketAutomationSubject", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="completions",
+    )
+    # The findings from a read-only run, handed to a later "Attempt Fix" run as context.
+    prior_findings = models.TextField(blank=True, default="")
+
+    summary = models.TextField(blank=True, default="")
+    verdict = models.JSONField(default=dict, blank=True)
+    # Durable transcript of the run (the live view is redis; this survives a reload).
+    events = models.JSONField(default=list, blank=True)
+    fix_applied = models.JSONField(default=list, blank=True)
+    fix_broken = models.JSONField(default=dict, blank=True)
+
+    # WHAT THE AI PROPOSED and WHAT A PERSON APPROVED. `proposed_rule` is
+    # {name, description, mode, match, statements, fix_actions}; `proposed_procedures` is a list of
+    # the AIProcedure field shape. Nothing here is live until Approve writes the real rows.
+    proposed_procedures = models.JSONField(default=list, blank=True)
+    proposed_rule = models.JSONField(default=dict, blank=True)
+    applied_procedure_ids = models.JSONField(default=list, blank=True)
+    applied_subject_id = models.IntegerField(null=True, blank=True)
+
+    error_detail = models.TextField(blank=True, default="")
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created"]
+        indexes = [models.Index(fields=["ticket_ref", "-created"])]
+
+    def __str__(self) -> str:
+        return f"{self.ticket_ref} [{self.mode}/{self.status}]"
 
 
 class AITicketWorkClaim(models.Model):

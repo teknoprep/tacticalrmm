@@ -1288,7 +1288,8 @@ class AIRuleDraft(APIView):
             "content": draft_content(
                 description=description, procedures=plist,
                 subject={"name": subj.name if subj else "", "description": subj.description if subj else "",
-                         "instructions": subj.instructions if subj else ""},
+                         "instructions": subj.instructions if subj else "",
+                         "actions": [a.get("name") for a in (subj.fix_actions or []) if isinstance(a, dict) and a.get("name")] if subj else []},
             ),
             "purpose": "rule-draft", "username": request.user.username,
         }
@@ -1319,12 +1320,24 @@ class AIRuleDraft(APIView):
         clean, errors = validate(statements)
         # A draft that does not validate is returned WITH its problems so a person can fix them
         # in the form - refusing outright would hide what the model was trying to say.
-        from core.ai_rules import english
+        from core.ai_rules import bind_run_scripts, english
+
+        # COLLAPSE ANY INLINE SCRIPT INTO THE LIBRARY (owner, 2026-10-06). The assistant may write a
+        # body when no attached action fits; bind it into a reviewed action and leave the rule
+        # naming it, so the form shows a short rule and the new action can be added to the subject.
+        added_actions = []
+        if clean and isinstance(clean, dict) and clean.get("blocks"):
+            existing = [a for a in (subj.fix_actions or []) if isinstance(a, dict)] if subj else []
+            have = {a.get("name") for a in existing}
+            bound, actions, _added, _changed = bind_run_scripts(clean, existing)
+            added_actions = [a for a in actions if a.get("name") not in have]
+            clean = bound
 
         return Response({
             "statements": clean,
             "english": english(clean) if clean else [],
             "errors": errors,
+            "added_actions": added_actions,
             "notes": str(data.get("notes") or "")[:1500],
         })
 
@@ -2287,14 +2300,22 @@ class AITicketConsole(APIView):
         # RECONCILE against Odoo (source of truth): if a ticket is Cancelled/Closed/Done
         # in Odoo but our AI status doesn't reflect a matching terminal state, sync it -
         # so the console never shows a closed ticket as "needs input" etc.
+        # AUTOMATION STATUSES ARE LEFT ALONE (owner, 2026-10-15). "auto_closed" et al. say more than
+        # "closed": they say the AUTOMATION resolved it, and the reply handler keys off exactly that
+        # (core/tasks.py: a "thanks, it's working" reply to an auto_closed ticket is re-closed by
+        # itself). Rewriting them to "closed" every time someone opened this console is why
+        # TICKET/62724's "the webpage is running again. Thanks" was re-worked and left for a tech.
+        # A closed stage is consistent with them, so there is nothing to reconcile.
+        automation_done = {"auto_closed", "auto_closed_duplicate", "auto_replied"}
+
         def _terminal(stage):
             s = (stage or "").lower()
             if "cancel" in s:
                 return "cancelled", {"cancelled", "cancelled_clean"}
             if "closed" in s:  # Closed + AI Closed
-                return "closed", {"closed", "resolved"}
+                return "closed", {"closed", "resolved"} | automation_done
             if "done" in s or "billing" in s:
-                return "done", {"done", "closed"}
+                return "done", {"done", "closed"} | automation_done
             return None, None
 
         reconciled = []
@@ -2357,6 +2378,125 @@ class AITicketConsoleItem(APIView):
         get_object_or_404(AITicketState, ticket_ref=ticket_ref)
         attempt_ai_ticket_resolve.delay(ticket_ref)
         return Response({"queued": True})
+
+
+class AITicketCompletionStart(APIView):
+    """Ticket Console magic button: start a "Complete this ticket" run.
+
+    POST {mode: "readonly"|"fix"}. `readonly` investigates and reports; `fix` may also run the
+    reviewed fixes of the subject that matched. Both hand back proposed procedures + an automation
+    rule for a person to approve (see AITicketCompletionApprove).
+    """
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def post(self, request, ticket_ref):
+        import uuid
+
+        from core.models import AITicketCompletion, AITicketState
+        from core.serializers import AITicketCompletionSerializer
+        from core.tasks import run_ai_ticket_completion
+
+        ref = str(ticket_ref or "").strip()
+        if not AITicketState.objects.filter(ticket_ref=ref).exists():
+            return Response({"error": f"{ref} is not a ticket the console knows about"}, status=404)
+        mode = str(request.data.get("mode") or "readonly").lower()
+        if mode not in ("readonly", "fix"):
+            return Response({"error": "mode must be 'readonly' or 'fix'"}, status=400)
+        running = AITicketCompletion.objects.filter(ticket_ref=ref, status="running").first()
+        if running:
+            return Response({"error": "a completion run is already in progress for this ticket",
+                             **AITicketCompletionSerializer(running).data}, status=409)
+        comp = AITicketCompletion.objects.create(
+            ticket_ref=ref, mode=mode, started_by=request.user.username, run_id=uuid.uuid4().hex,
+        )
+        run_ai_ticket_completion.delay(comp.pk)
+        return Response(AITicketCompletionSerializer(comp).data)
+
+
+class AITicketCompletionDetail(APIView):
+    """One completion run, plus the live progress from redis while it is still running."""
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def get(self, request, pk):
+        import json as _json
+
+        from core.models import AITicketCompletion
+        from core.serializers import AITicketCompletionSerializer
+
+        comp = get_object_or_404(AITicketCompletion, pk=pk)
+        live = None
+        try:
+            from redis import from_url
+
+            with from_url(f"redis://{settings.REDIS_HOST}:6379", decode_responses=True) as conn:
+                raw = conn.get(f"pi_completion:{comp.run_id}")
+            if raw:
+                live = _json.loads(raw)
+        except Exception:
+            live = None
+        return Response({**AITicketCompletionSerializer(comp).data, "live": live})
+
+
+class AITicketCompletionApprove(APIView):
+    """Approve the reusable artifacts a successful run proposed: save the procedures and the rule."""
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def post(self, request, pk):
+        from core.ai_completion import apply_artifacts
+        from core.models import AITicketCompletion
+        from core.serializers import AITicketCompletionSerializer
+
+        comp = get_object_or_404(AITicketCompletion, pk=pk)
+        if comp.status != "awaiting_review":
+            return Response({"error": f"this run is {comp.status}, not awaiting review"}, status=400)
+        result = apply_artifacts(comp)
+        return Response({**AITicketCompletionSerializer(comp).data, **result})
+
+
+class AITicketCompletionDecline(APIView):
+    """Reject the proposed artifacts. The run itself still happened; nothing reusable is saved."""
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def post(self, request, pk):
+        from core.models import AITicketCompletion
+        from core.serializers import AITicketCompletionSerializer
+
+        comp = get_object_or_404(AITicketCompletion, pk=pk)
+        if comp.status != "awaiting_review":
+            return Response({"error": f"this run is {comp.status}, not awaiting review"}, status=400)
+        comp.status = "declined"
+        comp.save(update_fields=["status", "updated"])
+        return Response(AITicketCompletionSerializer(comp).data)
+
+
+class AITicketCompletionAttemptFix(APIView):
+    """After a read-only run, start a Fix & Report run carrying its findings as context."""
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def post(self, request, pk):
+        import uuid
+
+        from core.models import AITicketCompletion
+        from core.serializers import AITicketCompletionSerializer
+        from core.tasks import run_ai_ticket_completion
+
+        prev = get_object_or_404(AITicketCompletion, pk=pk)
+        running = AITicketCompletion.objects.filter(ticket_ref=prev.ticket_ref, status="running").first()
+        if running:
+            return Response({"error": "a completion run is already in progress for this ticket",
+                             **AITicketCompletionSerializer(running).data}, status=409)
+        comp = AITicketCompletion.objects.create(
+            ticket_ref=prev.ticket_ref, mode="fix", started_by=request.user.username,
+            run_id=uuid.uuid4().hex, subject=prev.subject,
+            prior_findings=(prev.summary or "")[:6000],
+        )
+        run_ai_ticket_completion.delay(comp.pk)
+        return Response(AITicketCompletionSerializer(comp).data)
 
 
 class AIReportSchedules(APIView):
@@ -3069,8 +3209,12 @@ class AutomationSubjectDecide(APIView):
                 what = (
                     f"This will make <b>{escape(subj.name)}</b> live in "
                     f"<b>{escape(subj.get_mode_display())}</b> mode. Matching tickets that arrive from "
-                    "now on will be worked automatically. The AI never closes a ticket under a subject "
-                    "and replies only on a confident verdict."
+                    "now on will be worked automatically, and it replies only on a confident verdict. "
+                    + ("When it has finished, the ticket is filed to <b>AI Closed</b> for a person to "
+                       "promote to Closed."
+                       if subj.may_close_ticket else
+                       "This subject <b>leaves the ticket OPEN</b>, tagged for input: it answers the "
+                       "customer and a person finishes the job.")
                 )
         else:
             verb, colour, btn = "Reject", "#991b1b", "Yes - reject it"
@@ -3082,6 +3226,24 @@ class AutomationSubjectDecide(APIView):
         rules = "<br>".join(
             f"<code>{escape(k)}</code>: {escape(json.dumps(v))}" for k, v in (subj.match or {}).items()
         ) or "<i>none</i>"
+        # THE RULE IS SHOWN TOO (owner, 2026-10-06). A script only runs from inside an IF in the rule,
+        # so the person approving must read the rule and not just the script: the script body on its
+        # own, with no rule, never runs at all.
+        if (subj.statements or {}).get("blocks"):
+            from core.ai_rules import english as _rule_english
+
+            rendered = escape("\n".join(_rule_english(subj.statements)))
+            rules += (
+                "<div style='margin-top:12px'><b>Rule (what it may do, in order):</b>"
+                "<pre style='background:#f6f8fa;border:1px solid #e5e7eb;border-radius:6px;padding:10px;"
+                "font-size:12px;white-space:pre-wrap;margin:4px 0 0'>" + rendered + "</pre></div>"
+            )
+        elif subj.mode == "device_fix" and subj.fix_actions:
+            rules += (
+                "<div style='margin-top:12px;color:#b45309'><b>No rule.</b> The reviewed script(s) "
+                "below are stored library data and will <b>not run</b> - add a rule with an IF that "
+                "reaches the script on the Procedures page first.</div>"
+            )
         # A SCRIPT PROPOSAL IS APPROVED WITH THE SCRIPT IN FRONT OF YOU (owner, 2026-10-02): the
         # daily report now proposes Fix-mode subjects that carry a reviewed PowerShell script, so
         # the approval page shows exactly what will run, where, and which values it reads.
@@ -3173,7 +3335,8 @@ class AutomationSubjectDecide(APIView):
             "Approved - live",
             f"<b>{escape(subj.name)}</b> is now live in <b>{escape(subj.get_mode_display())}</b> mode. "
             "Matching tickets that arrive from now on will be worked automatically. "
-            "The AI never closes a ticket under a subject and replies only on a confident verdict. "
+            "It replies only on a confident verdict, and files the ticket to AI Closed only if this "
+            "subject is allowed to close (see the closing switch in the editor). "
             "Edit, narrow or switch it off any time on the Procedures page &rarr; Ticket Automation Subjects.",
             "#166534",
         )
@@ -3584,6 +3747,7 @@ class AIDecisionSession(APIView):
                          "client": (d.context or {}).get("client") or _opp.get("partner") or ""}
                         if _is_crm else d.context),
             "username": user.username,
+            "is_admin": bool(user.is_superuser or (user.role and user.role.is_superuser)),  # ADMIN DIRECTIVE 2026-10-25
             # Identity of the tech working this chat, so the bridge can assign the
             # ticket to them (matched to an Odoo user) as soon as they start talking.
             "user_email": getattr(user, "email", "") or "",

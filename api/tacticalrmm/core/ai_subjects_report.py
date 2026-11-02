@@ -303,6 +303,74 @@ def _decide_url(token: str, action: str) -> str:
 #   * MODEL. The group's PLANNER (deep reasoning) writes these, not the orchestrator.
 # ---------------------------------------------------------------------------------------------
 _PARAM_TYPES = {"email", "person", "choice", "int", "ticket_ref", "text"}
+
+# A SCRIPT ONLY RUNS FROM INSIDE A RULE (owner, 2026-10-06): "actions should be allowed to be
+# there but they should NOT RUN unless an IF is setup in the rules". A proposal that carried a
+# script and no rule would therefore be a subject that can never do anything. So every scripted
+# proposal is created WITH the rule that authorises it, and the script sits inside an IF.
+#
+# Identity/access work (Microsoft 365 / Entra / Exchange) narrows the gate to the CUSTOMER'S
+# support contact - a technician's approval is not enough for a change to someone's account. Other
+# fixes need only "the ticket says enough to do this" on top of the standing approval gate.
+_IDENTITY_TOKENS = (
+    "connect-mggraph", "connect-exchangeonline", "connect-msteams", "invoke-mg", "get-mguser",
+    "new-mguser", "update-mguser", "remove-mguser", "set-mguserlicense", "get-mgriskyuser",
+    "invoke-mgriskyuser", "revoke-mgusersigninsession", "set-mailbox", "add-mailboxpermission",
+    "remove-mailboxpermission", "add-recipientpermission", "remove-recipientpermission",
+    "add-distributiongroupmember", "remove-distributiongroupmember", "set-distributiongroup",
+    "set-unifiedgroup", "add-unifiedgrouplinks", "remove-unifiedgrouplinks",
+)
+
+
+def touches_identity(command: str) -> bool:
+    low = str(command or "").lower()
+    return any(tok in low for tok in _IDENTITY_TOKENS)
+
+
+def rule_for_fix(action_or_actions) -> dict:
+    """The rule that makes attached reviewed script(s) runnable - and only under a true IF.
+
+    Shape (see core/ai_rules.py):
+
+        IF approved_by_support_contact          (only for identity/access changes)
+          IF the ticket says enough to do this
+            run the script(s), in order
+            update the customer / note / close
+          ELSE
+            update the customer / note / wait for the customer
+        ELSE
+          update the customer / note / hand it to a human
+    """
+    actions = list(action_or_actions) if isinstance(action_or_actions, (list, tuple)) else [action_or_actions]
+    actions = [a for a in actions if isinstance(a, dict) and a.get("name") and a.get("command")]
+    # THE RULE NAMES EACH ACTION; THE COMMAND LIVES IN THE LIBRARY (owner, 2026-10-06). The script
+    # body, shell, timeout and parameter declarations are attached to the subject separately
+    # (`fix_actions=[action]` at the call site), so the rule stays short and the command has one home.
+    runs = [{"action": "run_script", "args": {"name": a["name"]}} for a in actions]
+    finished = runs + [
+        {"action": "reply_customer", "args": {}},
+        {"action": "note_ticket", "args": {}},
+        {"action": "close_ticket", "args": {}},
+    ]
+    ask = [{"action": "reply_customer", "args": {}},
+           {"action": "note_ticket", "args": {}},
+           {"action": "wait_customer", "args": {}}]
+    hand = [{"action": "reply_customer", "args": {}},
+            {"action": "note_ticket", "args": {}},
+            {"action": "hand_to_human", "args": {}}]
+    gate = {"if": {"condition": "details_sufficient", "args": {}}, "then": finished, "else": hand}
+    if any(touches_identity(a.get("command")) for a in actions):
+        blocks = [{"if": {"condition": "approved_by_support_contact", "args": {}},
+                   "then": [gate], "else": hand}]
+    else:
+        # The standing prelude already required a person's approval; this only asks whether the
+        # ticket states enough (who, what) for the script to run without guessing.
+        blocks = [{"if": {"condition": "details_sufficient", "args": {}},
+                   "then": finished, "else": hand}]
+    from core.ai_rules import with_defaults
+
+    return with_defaults({"blocks": blocks})
+
 # Where a script may run, and what it can reach from there. Scripts take typed inputs, which the
 # bridge passes only to PowerShell, so a host must be Windows. Override per schedule with
 # options.central_hosts = {"hostname": "what it can reach"}.
@@ -533,6 +601,12 @@ def collect(hours=24, options=None) -> dict:
             minutes = None
         subj = AITicketAutomationSubject.objects.create(
             name=name, description=desc[:4000], status="proposed", enabled=False, mode="device_fix",
+            # THE SCRIPT IS ONLY RUNNABLE THROUGH THE RULE. Created with it, so a proposal is never
+            # a fix that cannot run (no rule) or one that runs unguarded (owner, 2026-10-06).
+            statements=rule_for_fix(action),
+            # It carries the reviewed script that DOES the job, so it may file the ticket to AI
+            # Closed once that script has run and verified (owner, 2026-10-05).
+            may_close_ticket=True,
             match=match, instructions=clip(raw.get("reply_guidance"), 1000), all_clients=True,
             fix_actions=[action], fix_target=fix_target, baseline_minutes=minutes,
             approve_token=get_random_string(40), reject_token=get_random_string(40),

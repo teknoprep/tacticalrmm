@@ -50,6 +50,17 @@ CAPABILITIES = [
         "hint": "Reads a stored authenticator code and types it into a sign-in, without a prompt. Ticket windows only.",
     },
     {
+        # Desktop control is about ONE computer, so it only exists in a device chat. Turning the
+        # switch on adds that computer to the Operator allowlist (core/operator_machines.py).
+        "id": "desktop",
+        "label": "AI desktop control (this computer)",
+        "blob": "desktop_allowed",
+        "role_perm": "can_use_ai_desktop",
+        "scopes": ["device"],
+        "hint": "Lets them switch on AI control of this computer's screen, mouse and keyboard (the Pi AI Operator). "
+                "Operator safety rules (InPrivate sign-ins, no delete, no secure desktop) still apply.",
+    },
+    {
         "id": "email",
         "label": "Customer email",
         "blob": "allow_email",
@@ -66,6 +77,7 @@ CAP_STATE = {
     "autocredential": "autocredential",
     "autototp": "autototp",
     "email": "email",
+    "desktop": "desktop",
 }
 _by_id = {c["id"]: c for c in CAPABILITIES}
 
@@ -153,6 +165,11 @@ def grant(user, scope_kind: str, scope_ref: str, caps, *, by: str = "", minutes:
     from core.models import AISessionCapability as C
 
     caps = clean_caps(caps)
+    # A capability that only means something in one kind of window (desktop control = a device)
+    # is refused elsewhere rather than stored as a grant that silently does nothing.
+    wrong = [c for c in caps if _by_id[c].get("scopes") and scope_kind not in _by_id[c]["scopes"]]
+    if wrong:
+        raise ValueError(f"{', '.join(cap_label(c) for c in wrong)} can only be granted for a device")
     if not caps:
         raise ValueError("no known capability ids given")
     if scope_kind not in (C.SCOPE_TICKET, C.SCOPE_DEVICE, C.SCOPE_ALL):

@@ -722,3 +722,57 @@ test("a message typed while busy runs when the turn settles, even with Auto-Next
   assert.equal(h.state().questions.length, 0, "typing in the chat answers the open question");
   assert.equal(h.state().items.find((i) => i.text === "queued work for later").status, "pending");
 });
+
+// ANSWERING WHILE IT IS STILL WORKING (owner, 2026-10-25, TICKET/63160): the model asks with
+// pause_queue and carries on with what it can do. The Queue panel used to refuse the answer
+// ("wait for it to finish"); it now goes into the running turn as a steer.
+test("an answer given while the turn is still running is steered into that turn", async () => {
+  const steered = [];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-queue-"));
+  const frames = [];
+  let release;
+  const ran = [];
+  const q = makePromptQueue({
+    scopeKey: "AGENT1", root, send: (f) => frames.push(f), log: () => {},
+    isStreaming: () => !!release,
+    runPrompt: async (text) => {
+      ran.push(text);
+      q.pauseByModel("Which hostname?");
+      await new Promise((r) => { release = r; });   // keeps working after asking
+      release = null;
+    },
+    compact: async () => {},
+    steer: async (t) => { steered.push(t); return true; },
+  });
+  q.attach("s");
+  await q.handle({ type: "queue_add", text: "build the site" });
+  const running = q.handle({ type: "queue_run_next" });
+  await settle(5);
+  const qid = q.state().questions[0].id;
+  await q.handle({ type: "queue_answer", id: qid, text: "jamesnewell.blueuc.com" });
+  assert.deepEqual(steered, ["(Answering your question: \"Which hostname?\")\njamesnewell.blueuc.com"]);
+  assert.equal(q.state().questions.length, 0, "the card is answered");
+  assert.equal(q.state().paused, null);
+  assert.ok(!frames.some((f) => f.type === "error"), "no 'wait for it to finish'");
+  assert.ok(frames.some((f) => f.type === "queue_answer_steered" && f.text === "jamesnewell.blueuc.com"));
+  assert.deepEqual(ran, ["build the site"], "no second run - the answer joined the running one");
+  release();
+  await running;
+  await settle(5);
+  assert.equal(q.state().items.length, 0, "the item finished (and auto-cleared): its question was answered");
+});
+
+test("an answer given between steps (busy, not steerable) runs as the very next prompt", async () => {
+  const h = harness({ prompt: async (t, q) => { if (t === "go") q.pauseByModel("Which one?"); } });
+  await h.q.handle({ type: "queue_add", text: "go" });
+  await h.q.handle({ type: "queue_run_next" });
+  await settle(5);
+  h.setStreaming(true);            // e.g. a recovery re-run - busy, but nothing to steer into
+  await h.q.handle({ type: "queue_answer", id: h.state().questions[0].id, text: "the first" });
+  assert.equal(h.state().questions.length, 0);
+  assert.ok(!h.frames.some((f) => f.type === "error"));
+  h.setStreaming(false);
+  await h.q.advance("turn settled");
+  await settle(5);
+  assert.equal(h.ran.at(-1), "(Answering your question: \"Which one?\")\nthe first");
+});

@@ -31,6 +31,7 @@ urlpatterns = [
     path("pi/multisession/", views.PiMultiSession.as_view()),
     path("<agent:agent_id>/pi/session/", views.AgentPiSession.as_view()),
     path("<agent:agent_id>/pi/history/", views.AgentPiHistory.as_view()),
+    path("<agent:agent_id>/pi/desktop-control/", views.AgentPiDesktopControl.as_view()),
     path("<agent:agent_id>/meshcentral/recover/", views.AgentMeshCentral.as_view()),
     path("<agent:agent_id>/processes/", views.AgentProcesses.as_view()),
     path("<agent:agent_id>/processes/<int:pid>/", views.AgentProcesses.as_view()),

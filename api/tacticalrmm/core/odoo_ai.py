@@ -294,6 +294,22 @@ def session(request):
 
     core = get_core_settings()
 
+    # AGENT GROUPS (owner, 2026-11-02). The ERP chat used to run on the starred default model
+    # while every other headless surface ran on the configured group. Same resolver as triage /
+    # autowork: Settings > AI > "Agent routing per rule" (key "odoo"), else the Preferred agent
+    # group. A model the user explicitly picked in the panel still wins, and any failure falls
+    # back to the old behaviour rather than breaking the chat.
+    group_fields = {}
+    if not requested:
+        try:
+            from core.agent_groups import headless_orchestrator_fields
+
+            gf = headless_orchestrator_fields(core, surface="odoo")
+            if gf.get("provider") and gf.get("model_id") and gf.get("api_key"):
+                group_fields = gf
+        except Exception:  # never let group config take the ERP chat down
+            group_fields = {}
+
     blob = {
         "kind": "odoo",
         "surface": "odoo",
@@ -372,6 +388,21 @@ def session(request):
         # side contributes.
         "sales_prompt": getattr(core, "ai_sales_prompt", "") or "",
     }
+
+    if group_fields:
+        # The group's orchestrator runs the chat; its keys cover every provider in the roster
+        # (including a role's backup model). Logged by the bridge as `group=<slug>`.
+        blob.update(
+            {
+                "provider": group_fields["provider"],
+                "model_id": group_fields["model_id"],
+                "api_key": group_fields["api_key"],
+                "thinking_level": group_fields.get("thinking_level") or blob["thinking_level"],
+                "agent_group": group_fields.get("agent_group"),
+                "agent_group_keys": group_fields.get("agent_group_keys") or {},
+                "group_orchestrator": group_fields.get("group_orchestrator") or {},
+            }
+        )
 
     # SHARED SESSION. If the caller already has a token for this conversation and
     # its blob is still alive in Redis, hand the SAME token back. Every browser

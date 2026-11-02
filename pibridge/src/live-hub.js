@@ -77,6 +77,21 @@ export function actorOn(hub, sock, blob) {
   };
 }
 
+/** The hamburger "may" flags carried by a chat blob / a /pi/grants push. */
+const PERM_KEYS = ["mutate_allowed", "autoapprove_allowed", "autocredential_allowed", "autototp_allowed", "desktop_allowed"];
+function pickPerms(src = {}) {
+  const out = {};
+  for (const k of PERM_KEYS) if (typeof src?.[k] === "boolean") out[k] = src[k];
+  return out;
+}
+
+/** `scope::sessionId` -> `scope` (the device's agent id, or decision:<ticket>). */
+export function liveScope(key) {
+  const s = String(key || "");
+  const i = s.indexOf("::");
+  return i >= 0 ? s.slice(0, i) : s;
+}
+
 export function liveKey(scope, sessionId) {
   return `${scope}::${sessionId}`;
 }
@@ -117,6 +132,7 @@ export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}
   // queue never changed when the driver answered. Both keys now find the same hub.
   const keys = [key, ...aliases.filter((k) => k && k !== key)];
   const presence = newPresence();
+  const memberPerms = new Map();   // username -> { perms, granted, state } - see notePerms
   let graceTimer = null;
   let disposed = false;
   let streaming = false; // mirrored by the chat code so a late joiner knows the state
@@ -212,7 +228,47 @@ export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}
     },
     /** Tell everyone who is driving now. `you` differs per socket, so one frame each. */
     broadcastPresence() {
+      // Every seat change ends up here, so this is where the session's permissions are made
+      // to follow the driver (see syncDriverPerms).
+      hub.syncDriverPerms();
       for (const ws of sockets) hub.sendTo(ws, presenceFrame(presence, ws));
+    },
+
+    // PERMISSIONS FOLLOW THE DRIVER (owner, 2026-10-13). The hamburger switches (Write mode,
+    // Auto-approve, Auto-credential, Auto-TOTP) used to be fixed by whoever OPENED the session,
+    // so an admin who took over a technician's chat was stuck with the technician's role. Each
+    // member's own permissions (their role + any admin grant for this scope) are recorded on
+    // attach and kept current by /pi/grants; when the seat moves, the session's code
+    // (hub.applyDriverPerms, set by server.js) re-applies the new driver's. A grant for someone
+    // who is not driving is held here and applied the moment they take the seat.
+    permsDriver: "",
+    notePerms(username, perms = {}, granted = [], state = null) {
+      const u = String(username || "").toLowerCase();
+      if (!u) return null;
+      const cur = memberPerms.get(u) || { perms: {}, granted: [], state: {} };
+      const next = {
+        perms: { ...cur.perms, ...pickPerms(perms) },
+        granted: Array.isArray(granted) ? [...granted] : cur.granted,
+        state: state && typeof state === "object" ? { ...cur.state, ...state } : cur.state,
+      };
+      memberPerms.set(u, next);
+      return next;
+    },
+    permsFor(username) { return memberPerms.get(String(username || "").toLowerCase()) || null; },
+    syncDriverPerms() {
+      const o = presence.owner;
+      if (!o || !o.username || typeof hub.applyDriverPerms !== "function") return;
+      if (o.username === hub.permsDriver) return;
+      const p = memberPerms.get(o.username);
+      if (!p) return;
+      hub.permsDriver = o.username;
+      try {
+        hub.applyDriverPerms(o, p);
+        p.state = {};            // a held "switch it on" is spent once applied
+        log?.("live_perms_driver", key, `${o.username}: ${JSON.stringify(p.perms)}`);
+      } catch (e) {
+        log?.("live_perms_driver_error", key, String(e?.message || e));
+      }
     },
 
     get pinned() { return pinned; },
@@ -234,6 +290,8 @@ export function makeHub({ key, graceMs, log, onDispose, onOwnerChange = () => {}
       if (pinTimer) { clearTimeout(pinTimer); pinTimer = null; }
       if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; log?.("live_reattach", key, "grace cancelled - a viewer is back"); }
       sockets.add(ws);
+      // This person's OWN permissions, as minted for them by the RMM (role + grants).
+      hub.notePerms(blob.username, blob, blob.caps_granted || []);
       const res = join(presence, ws, blob);
       log?.("live_attach", key, `${blob.username || "?"} as ${res.role}${res.reclaimed ? " (reclaimed)" : ""}; ${sockets.size} socket(s)`);
       hub.broadcastPresence();

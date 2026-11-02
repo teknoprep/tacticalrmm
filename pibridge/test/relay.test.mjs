@@ -221,3 +221,32 @@ test("helpers: Basic parsing, trusted client IP, thinking cap, wire events", () 
   assert.ok(!("partial" in wireEvent({ type: "text_delta", delta: "a", partial: {} })));
   assert.ok("partial" in wireEvent({ type: "toolcall_delta", delta: "a", partial: {} }));
 });
+
+// DOCUMENT READ (2026-11-02). A relay client reads a SharePoint link through the bridge, because
+// the M365 app credentials live there. The endpoint is additive and authenticated like /whoami.
+test("document endpoint: auth required, and an unconfigured bridge refuses honestly", async () => {
+  const s = await setup();
+  try {
+    const anon = await fetch(`${s.base}/document`, { method: "POST", body: JSON.stringify({ url: "https://x.sharepoint.com/a.docx" }) });
+    assert.equal(anon.status, 401);
+
+    const saved = { ...process.env };
+    for (const k of ["M365_GRAPH_TENANT", "M365_GRAPH_CLIENT_ID", "M365_GRAPH_CLIENT_SECRET", "M365_GRAPH_CERT_PATH"]) delete process.env[k];
+    process.env.PI_DOC_ANONYMOUS = "0"; // hermetic: no real SharePoint call from a unit test
+    const r = await fetch(`${s.base}/document`, {
+      method: "POST", headers: { ...auth(), "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://blueucadmin.sharepoint.com/:w:/g/ABC" }),
+    });
+    const j = await r.json();
+    assert.equal(r.status, 200);
+    assert.equal(j.ok, false);
+    assert.equal(j.unconfigured, true);
+    assert.match(j.error, /not configured/);
+    assert.ok(j.missing.includes("M365_GRAPH_CLIENT_ID"));
+    delete process.env.PI_DOC_ANONYMOUS;
+    Object.assign(process.env, saved);
+
+    const bad = await fetch(`${s.base}/document`, { method: "POST", headers: auth(), body: "{not json" });
+    assert.equal(bad.status, 400);
+  } finally { await s.close(); }
+});

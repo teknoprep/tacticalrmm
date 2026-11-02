@@ -58,6 +58,68 @@ TERMINATOR = {
     "note": "Always the last line. Closing a ticket also stops: nothing after a close ever runs.",
 }
 
+# ---------------------------------------------------------------------------
+# HOW DESTRUCTIVE A REVIEWED ACTION IS (owner, 2026-10-15).
+#
+# The approval gate is ONE person saying "go" on ONE plan. The owner asked for a narrow way
+# around it for actions that cannot destroy anything: "if it is bypassed the only actions
+# that can be done are IMMUTABLE actions which have 0 affect on data... restarts of services
+# when needed / computer updates / things like this... no deletion of files or change of
+# licenses".
+#
+# CODE CANNOT PROVE a PowerShell body is non-destructive, so this is a DECLARED class on each
+# reviewed action - reviewed data, exactly like the command body itself - and code enforces
+# that ONLY the classes marked bypass=True may ever run without a per-ticket approval. The
+# DEFAULT is "mutating", so an action that does not say what it is stays gated. The class is a
+# claim by the person who saved the action; because the command and the class are reviewed
+# together, a wrong class is a review failure - it is not something a ticket or a prompt can
+# flip, which is what makes the boundary structural.
+# ---------------------------------------------------------------------------
+ACTION_SAFETY = [
+    {
+        "id": "read",
+        "text": "read-only",
+        "bypass": True,
+        "plain": "it only reads (probe, query, list). Nothing on the device changes.",
+    },
+    {
+        "id": "restart",
+        "text": "restart a service or host",
+        "bypass": True,
+        "plain": "start / stop / restart a service, scheduled task or process, or reboot the host. "
+                 "It does not create, change or delete customer data.",
+    },
+    {
+        "id": "update",
+        "text": "apply updates",
+        "bypass": True,
+        "plain": "install OS or software updates. It changes the system, but it does not delete or "
+                 "rewrite customer data or accounts.",
+    },
+    {
+        "id": "mutating",
+        "text": "change data, files or accounts",
+        "bypass": False,
+        "plain": "anything else: creating, changing or deleting files, licences, mailboxes, users, "
+                 "groups, configuration or credentials. ALWAYS needs a person's approval.",
+    },
+]
+DEFAULT_ACTION_SAFETY = "mutating"
+ACTION_SAFETY_IDS = frozenset(c["id"] for c in ACTION_SAFETY)
+# The only classes that may ever skip the per-ticket approval. Everything else is gated.
+BYPASSABLE_ACTION_SAFETY = frozenset(c["id"] for c in ACTION_SAFETY if c["bypass"])
+
+
+def action_safety(action) -> str:
+    """The declared safety of a reviewed action. Absent or unrecognised means 'mutating'."""
+    c = str((action or {}).get("safety") or "").strip().lower()
+    return c if c in ACTION_SAFETY_IDS else DEFAULT_ACTION_SAFETY
+
+
+def is_bypassable(action) -> bool:
+    """May this reviewed action run without a per-ticket approval? Only if its safety says so."""
+    return action_safety(action) in BYPASSABLE_ACTION_SAFETY
+
 # Conditions are evaluated by CODE. `needs_ai` marks the ones that require a model call at run
 # time (the alternative would be a deterministic ruling from an approved procedure).
 CONDITIONS = [
@@ -170,14 +232,14 @@ ACTIONS = [
     },
     {
         "id": "run_script",
-        "text": "run the script \"{name}\"",
-        "plain": "run this reviewed script. Same script every time - no reasoning involved.",
-        # PARAMETERS. A reviewed script usually NEEDS VALUES: `grant-mailbox-delegate-access`
-        # takes a mailbox, a grantee and an access level, and without them PowerShell refuses to
-        # start ("missing mandatory parameter"). Those values are exactly what the AI works out
-        # from the ticket, so the rule declares the parameters and the AI fills them at run time -
-        # and CODE validates every value before it is passed, because a value that comes out of a
-        # ticket is untrusted input on a command line.
+        "text": "run the reviewed action \"{name}\"",
+        "plain": "run a script you attached to this subject (Reviewed actions), by NAME. The command body lives there, reviewed by a person; the rule only names it, so the rule stays short and the command has one home. It runs ONLY from inside an IF that is true: a script the rule does not reach through a condition never executes (enforced in code, see the bridge's autowork-rule.js).",
+        # PARAMETERS. A reviewed action on the subject carries its own parameter DECLARATIONS
+        # (mailbox, grantee, access level, ...). The rule normally names the action and nothing
+        # else; the AI reads the values from the ticket at run time and CODE validates every one,
+        # because a value that comes out of a ticket is untrusted input on a command line. A rule
+        # may still override `shell`, `timeout`, `wait` or `params`, and may carry an inline
+        # `script` body for a one-off, but the library is the normal home for the command.
         #
         # Each parameter is:
         #   {"name": "Mailbox", "type": "email",   "required": true}
@@ -192,10 +254,10 @@ ACTIONS = [
         # carrying wait=1 (meaning "do not pause") killed a mailbox-grant script after one second.
         "params": [
             {"name": "name", "type": "str", "required": True},
-            {"name": "shell", "type": "choice", "choices": ["powershell", "cmd", "bash"], "required": True, "default": "powershell"},
-            {"name": "script", "type": "text", "required": True},
-            {"name": "timeout", "type": "int", "required": False, "default": 300},
-            {"name": "wait", "type": "int", "required": False, "default": 0},
+            {"name": "shell", "type": "choice", "choices": ["powershell", "cmd", "bash"], "required": False},
+            {"name": "script", "type": "text", "required": False},
+            {"name": "timeout", "type": "int", "required": False},
+            {"name": "wait", "type": "int", "required": False},
             {"name": "params", "type": "params", "required": False},
         ],
         "needs_ai": False,
@@ -275,6 +337,7 @@ def vocabulary() -> dict:
         "terminator": TERMINATOR,
         "conditions": CONDITIONS,
         "actions": ACTIONS,
+        "action_safety": ACTION_SAFETY,
         "max_depth": MAX_DEPTH,
     }
 
@@ -478,6 +541,136 @@ def with_defaults(statements: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# RUN_SCRIPT NAMES AN ATTACHED ACTION, IT DOES NOT CARRY THE BODY
+#
+# The owner (2026-10-06): "we either should just remove Actions altogether or call the action's
+# name in the Rule so the rule isn't so long... i like the 2nd option here so we can collapse the
+# scripts in this and then choose that in the rules".
+#
+# So the Reviewed actions ARE the library, and a rule's `run_script` step names one:
+#
+#     {"action": "run_script", "args": {"name": "m365-offboard-user"}}
+#
+# The command body, shell, timeout and parameter declarations live on the attached action. An inline
+# `script` body is still accepted (older rules, one-offs) but `bind_run_scripts()` folds it into the
+# library and leaves the rule naming it, so a saved rule never gets long again and the command has
+# exactly one home.
+# ---------------------------------------------------------------------------
+
+
+def iter_run_scripts(statements):
+    """Yield (step, where) for every run_script action in a rule tree."""
+    def walk_steps(steps, where):
+        for i, s in enumerate(steps or []):
+            if not isinstance(s, dict):
+                continue
+            if "if" in s or s.get("block"):
+                yield from walk_block(s, f"{where}[{i}]")
+            elif s.get("action") == "run_script":
+                yield s, f"{where}[{i}]"
+
+    def walk_block(block, where):
+        yield from walk_steps(block.get("then"), f"{where} then")
+        for j, e in enumerate(block.get("elif") or []):
+            if isinstance(e, dict):
+                yield from walk_block(e, f"{where} elseif[{j}]")
+        yield from walk_steps(block.get("else"), f"{where} else")
+
+    if not isinstance(statements, dict):
+        return
+    for i, b in enumerate(statements.get("blocks") or []):
+        if isinstance(b, dict):
+            yield from walk_block(b, f"block {i + 1}")
+
+
+def unbound_run_scripts(statements, action_names) -> list:
+    """run_script steps that neither carry a `script` body nor name an attached reviewed action.
+
+    These are not runnable - the bridge drops them - so they are a save-time error rather than a
+    rule that quietly does nothing.
+    """
+    names = {str(n) for n in (action_names or []) if n}
+    out = []
+    for step, where in iter_run_scripts(statements):
+        args = step.get("args") or {}
+        if not args.get("script") and str(args.get("name") or "") not in names:
+            out.append(
+                f"{where}: run_script names '{args.get('name') or ''}', which is not an attached "
+                f"reviewed action, and carries no script body"
+            )
+    return out
+
+
+def bind_run_scripts(statements: dict, actions) -> tuple:
+    """Normalise a rule so every run_script step REFERENCES an attached action by name.
+
+    Returns (statements, actions, added_names, changed).
+
+      * an inline `script` body whose name has no attached action is MOVED into the action list, so
+        nothing the author wrote is lost and the rule becomes a reference;
+      * an action that already exists is used as-is; the rule keeps only `name` (plus a deliberate
+        `wait` if the author set one), so the duplicated body/overrides disappear.
+    """
+    import copy
+
+    out = copy.deepcopy(statements or {})
+    acts = [dict(a) for a in (actions or []) if isinstance(a, dict) and a.get("name")]
+    by_name = {str(a["name"]): a for a in acts if a.get("name") and a.get("command")}
+    added: list = []
+    changed = False
+
+    def fix_step(step):
+        nonlocal changed
+        args = step.get("args") if isinstance(step.get("args"), dict) else {}
+        name = str(args.get("name") or "")
+        if not name:
+            return
+        existing = by_name.get(name)
+        if existing is None and args.get("script"):
+            existing = {"name": name, "shell": args.get("shell") or "powershell",
+                        "command": args["script"], "timeout": int(args.get("timeout") or 300),
+                        "params": args.get("params") or []}
+            acts.append(existing)
+            by_name[name] = existing
+            added.append(name)
+        if existing is not None:
+            keep = {"name": name}
+            if "wait" in args:
+                # Keep only a DELIBERATE pause: a wait that already matches the action's own wait
+                # (or the 0 default) is noise and would only lengthen the rule.
+                try:
+                    deliberate = int(args["wait"]) != int(existing.get("wait") or 0)
+                except (TypeError, ValueError):
+                    deliberate = True
+                if deliberate:
+                    keep["wait"] = args["wait"]
+            if args != keep:
+                step["args"] = keep
+                changed = True
+
+    def walk_steps(steps):
+        for s in steps or []:
+            if not isinstance(s, dict):
+                continue
+            if "if" in s or s.get("block"):
+                walk_block(s)
+            elif s.get("action") == "run_script":
+                fix_step(s)
+
+    def walk_block(block):
+        walk_steps(block.get("then"))
+        for e in block.get("elif") or []:
+            if isinstance(e, dict):
+                walk_block(e)
+        walk_steps(block.get("else"))
+
+    for b in out.get("blocks") or []:
+        if isinstance(b, dict):
+            walk_block(b)
+    return out, acts, added, changed
+
+
+# ---------------------------------------------------------------------------
 # ENGLISH. The rule is stored as blocks; people read sentences. Used by the editor, by the
 # report, and by the tests that check a rule says what its author thought it said.
 # ---------------------------------------------------------------------------
@@ -578,12 +771,17 @@ ACTION IDS:
   verify_fix {procedure}               - run the procedure's verification and record pass/fail
                                          (put this after a fix, then branch on fix_verified)
   fix_procedure {procedure}            - run that procedure's reviewed remedy
-  run_script {name, shell, script, timeout, wait, params} - run a script. USE THIS when the work is
-                                         mechanical and identical every time: you MUST write the
-                                         finished script body (powershell | cmd | bash).
-                                         If the script needs values (a mailbox, a user, a level),
-                                         declare them in params so the AI fills them from the ticket
-                                         and code validates them:
+  run_script {name, shell, script, timeout, wait, params} - run a reviewed action. USE THIS when
+                                         the work is mechanical and identical every time.
+                                         NORMAL SHAPE: name an action the subject already has
+                                         attached (the person writing the rule sees them in the
+                                         Reviewed actions list) - just {"name": "the-action"}. The
+                                         command body, shell, timeout and parameter declarations
+                                         live on that action, so the rule stays short.
+                                         If NO attached action fits, write the finished body in
+                                         `script` (powershell | cmd | bash) and declare any values
+                                         it needs in `params`; the app moves the body into the
+                                         subject's reviewed actions and the rule then names it.
                                          params: [{"name":"Mailbox","type":"email","required":true},
                                                   {"name":"AccessLevel","type":"choice",
                                                    "choices":["FullAccess","SendAs","SendOnBehalf"]}]
@@ -613,6 +811,13 @@ RULES YOU MUST FOLLOW:
    technician, but those steps want the customer-side verification.
 6. Keep it shallow: two or three levels at most, so a technician can read it in one pass.
 7. Only use procedure ids from the list you are given.
+8. EVERY action that changes something (run_script, fix_procedure) MUST sit inside an IF branch. An
+   action that is not guarded by an IF is never reached and never runs - the interpreter enforces
+   this in code - so never write a bare action expecting it to run. A run_script normally names a
+   reviewed action ATTACHED to the subject; only write a `script` body when no attached action
+   fits, and the app will store it as one. The subject's attached `fix_actions` are library data,
+   NOT authority: without a rule that reaches a run_script inside an IF, nothing on any device is
+   touched.
 """
 
 
@@ -624,12 +829,15 @@ def draft_content(*, description: str, procedures: list[dict], subject: dict | N
         for p in procedures
     ) or "  (no procedures available)"
     s = subject or {}
+    acts = [str(a) for a in (s.get("actions") or []) if str(a).strip()]
     return (
         "WHAT THE TECHNICIAN WANTS THIS RULE TO DO:\n"
         f"{description.strip()}\n\n"
         "THE SUBJECT THIS RULE BELONGS TO:\n"
         f"name: {s.get('name') or '(new subject)'}\n"
         f"covers: {s.get('description') or '-'}\n"
-        f"instructions: {(s.get('instructions') or '-')[:600]}\n\n"
-        "PROCEDURES AVAILABLE (use these ids):\n" + plist
+        f"instructions: {(s.get('instructions') or '-')[:600]}\n"
+        "REVIEWED ACTIONS ALREADY ATTACHED (name one in run_script instead of writing a body):\n"
+        + ("\n".join(f"  - {a}" for a in acts) if acts else "  (none - write the script body if you need one; it will be stored as a reviewed action)")
+        + "\n\nPROCEDURES AVAILABLE (use these ids):\n" + plist
     )

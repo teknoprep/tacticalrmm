@@ -52,6 +52,7 @@ urlpatterns = [
     # pi relay (2026-09-27) - see core/relay.py
     path("ai/relay/verify/", relay.AIRelayVerify.as_view()),
     path("ai/session-caps/", relay.AISessionCapabilities.as_view()),
+    path("ai/operator/workstations/", relay.AIOperatorWorkstations.as_view()),
     path("ai/relay/keys/", relay.AIRelayKeys.as_view()),
     # Must come before the <int:pk> routes in intent (an int converter would not match it
     # anyway) and before any future <str:pk> pattern that could swallow it.
@@ -81,7 +82,15 @@ urlpatterns = [
     path("ai/schedule-action/<int:pk>/", views.AIScheduleAction.as_view()),
     path("ai/decision/<str:token>/session/", views.AIDecisionSession.as_view()),
     path("ai/ticket-console/", views.AITicketConsole.as_view()),
+    # MUST come before the <path:ticket_ref> item route: <path:...> matches slashes, so the
+    # generic item route would otherwise swallow "TICKET/123/complete".
+    path("ai/ticket-console/<path:ticket_ref>/complete/", views.AITicketCompletionStart.as_view()),
     path("ai/ticket-console/<path:ticket_ref>/", views.AITicketConsoleItem.as_view()),
+    # "Complete this ticket": one run, its live progress, and the rule/procedures it proposes.
+    path("ai/ticket-completion/<int:pk>/", views.AITicketCompletionDetail.as_view()),
+    path("ai/ticket-completion/<int:pk>/approve/", views.AITicketCompletionApprove.as_view()),
+    path("ai/ticket-completion/<int:pk>/decline/", views.AITicketCompletionDecline.as_view()),
+    path("ai/ticket-completion/<int:pk>/attempt-fix/", views.AITicketCompletionAttemptFix.as_view()),
     path("ai/action-credit/", views.AIActionCreditView.as_view()),
     path("ai/work-entry/", views.AIWorkEntryView.as_view()),
     path("ai/spend-entry/", views.AISpendEntryView.as_view()),

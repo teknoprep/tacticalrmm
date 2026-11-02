@@ -1906,6 +1906,7 @@ class PiMultiSession(APIView):
             "hostname": hostnames,
             "device_facts": machines[0]["device_facts"],
             "username": user.username,
+            "is_admin": bool(user.is_superuser or (user.role and user.role.is_superuser)),  # ADMIN DIRECTIVE 2026-10-25
             "user_email": getattr(user, "email", "") or "",
             "user_display": (user.get_full_name() if hasattr(user, "get_full_name") else "") or user.username,
             "provider": chosen.provider.name,
@@ -2119,6 +2120,7 @@ class AgentPiSession(APIView):
             "agent_id": agent.agent_id,
             "hostname": agent.hostname,
             "username": user.username,
+            "is_admin": bool(user.is_superuser or (user.role and user.role.is_superuser)),  # ADMIN DIRECTIVE 2026-10-25
             "user_email": getattr(user, "email", "") or "",
             "user_display": (user.get_full_name() if hasattr(user, "get_full_name") else "") or user.username,
             "provider": chosen["provider"] if isinstance(chosen, dict) else chosen.provider.name,
@@ -2167,6 +2169,12 @@ class AgentPiSession(APIView):
             "helpdesk_code": core.ai_helpdesk_code or "",
             "operator": operator_policy,
         }
+        # AI desktop control for THIS computer (core/operator_machines.py): the hamburger switch.
+        # `desktop_allowed` (may flip it) comes from the role or an admin grant via
+        # _apply_device_caps below; this is the computer itself and whether it is on now.
+        from core.operator_machines import chat_desktop_machines
+
+        blob["desktop_machines"] = chat_desktop_machines([agent])
         # An admin's per-DEVICE capability grant (core/session_caps.py) applies to this chat.
         _apply_device_caps(blob, user, agent.agent_id)
         blob["can_grant_caps"] = bool(is_super or (user.role and user.role.can_edit_core_settings))
@@ -2206,6 +2214,42 @@ class AgentPiSession(APIView):
                 ],
             }
         )
+
+
+class AgentPiDesktopControl(APIView):
+    """AI desktop control for ONE computer - the chat hamburger switch (core/operator_machines.py).
+
+    GET  -> {enabled, can_toggle, unavailable}   what the switch shows
+    POST {enabled: bool}                          switch it; needs can_use_ai_desktop or an admin
+                                                  "desktop" grant for this device
+    """
+
+    permission_classes = [IsAuthenticated, PiPerms]
+
+    def get(self, request, agent_id):
+        from core import operator_machines as om
+
+        agent = get_object_or_404(Agent.objects.defer(*AGENT_DEFER), agent_id=agent_id)
+        return Response({
+            "agent_id": agent.agent_id,
+            "enabled": om.is_enabled(agent.agent_id),
+            "can_toggle": om.can_toggle(request.user, agent.agent_id),
+            "unavailable": om.why_not_eligible(agent),
+        })
+
+    def post(self, request, agent_id):
+        from core import operator_machines as om
+
+        agent = get_object_or_404(Agent.objects.defer(*AGENT_DEFER), agent_id=agent_id)
+        if not om.can_toggle(request.user, agent.agent_id):
+            return Response("You do not have permission to change AI desktop control on this computer.", status=403)
+        want = request.data.get("enabled") in (True, "true", "1", 1)
+        if want:
+            why = om.why_not_eligible(agent)
+            if why:
+                return notify_error(why)
+        r = om.set_enabled(agent, want, by=request.user.username, via=str(request.data.get("via") or "chat")[:40])
+        return Response({**r, "agent_id": agent.agent_id, "hostname": agent.hostname})
 
 
 class AgentPiHistory(APIView):

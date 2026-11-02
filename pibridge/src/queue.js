@@ -43,6 +43,45 @@ export const QUEUE_MAX_HISTORY = Number(process.env.PI_QUEUE_MAX_HISTORY || 5000
 export const QUEUE_HISTORY_TEXT = Number(process.env.PI_QUEUE_HISTORY_TEXT || 2000);
 // A name, not an essay. Long enough for "Firstname Lastname (username)" shapes.
 const ACTOR_MAX = 150;
+// The INLINED FILES of a prompt (attachments.js caps them at 500 KB of text per message).
+// They are capped separately from the typed words: QUEUE_MAX_TEXT is a limit on what a
+// person writes, and applying it to the whole composed prompt cut an attached HTML quote
+// off after 8000 characters - mid-<style>, closing marker gone - so the model got a
+// fragment and the window rendered it as a wall of raw text (TICKET/63160, 2026-10-25).
+export const QUEUE_MAX_ATTACH_TEXT = Number(process.env.PI_QUEUE_MAX_ATTACH_TEXT || 640 * 1024);
+
+// Where the inlined files of a composed prompt begin: the bridge's own preamble
+// (attachments.js normalizeAttachments) or, failing that, the first real open marker.
+const ATTACH_PREAMBLE_RE = /\n*The technician attached \d+ file\(s\)\.[^\n]*\n?/;
+const ATTACH_OPEN_G = /\[\[pi-attachment:([^\]|]*)\|(\d+)\]\]/g;
+
+/**
+ * Split a composed prompt into what the person TYPED and the inlined file bodies.
+ * Tolerates a block with no closing marker (a prompt truncated by older code).
+ * @returns {{ words: string, tail: string, files: Array<{name:string, kind:string, bytes:number}> }}
+ */
+export function splitPrompt(raw) {
+  const s = String(raw || "");
+  let at = -1;
+  const pre = s.match(ATTACH_PREAMBLE_RE);
+  if (pre) at = pre.index;
+  else {
+    ATTACH_OPEN_G.lastIndex = 0;
+    const m = ATTACH_OPEN_G.exec(s);
+    if (m) at = m.index;
+  }
+  if (at < 0) return { words: s, tail: "", files: [] };
+  const tail = s.slice(at).replace(/^\s+/, "");
+  const files = [];
+  for (const m of tail.matchAll(ATTACH_OPEN_G)) files.push({ name: m[1], kind: "text", bytes: Number(m[2]) || 0 });
+  return { words: s.slice(0, at), tail, files };
+}
+
+/** Cap a prompt: the typed words at QUEUE_MAX_TEXT, the inlined files separately. */
+export function clipPrompt(raw) {
+  const { words, tail } = splitPrompt(raw);
+  return (words.trim().slice(0, QUEUE_MAX_TEXT) + (tail ? tail.slice(0, QUEUE_MAX_ATTACH_TEXT) : "")).trim();
+}
 
 /**
  * WHO DID IT.
@@ -89,6 +128,18 @@ function attachPath(root, scopeKey, sessionId, itemId) {
   return path.join(dir, `${sessionId}.${itemId}.json`);
 }
 
+// THE SIDECAR also holds the item's inlined TEXT files (2026-10-25). They used to live in
+// item.text, which is in every queue_state frame - a queued 150 KB HTML page went over the
+// socket on every queue tick (the transcript-bound.js heartbeat problem) and, being past
+// QUEUE_MAX_TEXT, was truncated anyway. Format: { images: [...], text: "..." }; a bare
+// array is the older images-only shape.
+function readSidecar(root, scopeKey, sessionId, itemId) {
+  const raw = JSON.parse(fs.readFileSync(attachPath(root, scopeKey, sessionId, itemId), "utf8"));
+  if (Array.isArray(raw)) return { images: raw, text: "" };
+  return { images: Array.isArray(raw?.images) ? raw.images : [], text: typeof raw?.text === "string" ? raw.text : "" };
+}
+const hasSidecar = (it) => !!(it && (it.images || it.attach_text));
+
 // An item that no longer exists must not leave megabytes of screenshots behind.
 function dropAttachments(root, scopeKey, sessionId, itemId) {
   try { fs.unlinkSync(attachPath(root, scopeKey, sessionId, itemId)); } catch { /* none, or already gone */ }
@@ -120,7 +171,16 @@ function sanitize(raw, autoClearDefault = true) {
     if (!it || typeof it !== "object" || !it.id || typeof it.text !== "string") continue;
     st.items.push({
       id: String(it.id),
-      text: it.text.slice(0, QUEUE_MAX_TEXT),
+      text: clipPrompt(it.text),
+      // What is in the sidecar and what the window shows as chips. Dropped here before
+      // 2026-10-25, so a bridge restart orphaned every queued screenshot.
+      images: Number(it.images) || 0,
+      attach_text: !!it.attach_text,
+      attachments: Array.isArray(it.attachments)
+        ? it.attachments.filter((a) => a && typeof a.name === "string").map((a) => ({ name: a.name.slice(0, 200), kind: String(a.kind || "text").slice(0, 20), bytes: Number(a.bytes) || 0 }))
+        : [],
+      typed: !!it.typed,
+      origin: typeof it.origin === "string" ? it.origin.slice(0, 20) : undefined,
       // Who queued (or typed) it - carried so the history rows this item generates later
       // (started, done, failed) name the person whose work it is, not whoever is watching
       // the window when it eventually runs.
@@ -212,7 +272,11 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
   // AUTO-CLEAR. On unless THIS window has been told otherwise - the caller reads that from
   // window-memory.js (recallSwitch) so the choice outlives the session, the socket and the
   // bridge, and reports it back through onSwitch when someone flips it.
-  autoClearDefault = true, onSwitch = null }) {
+  autoClearDefault = true, onSwitch = null,
+  // (text) => Promise<boolean>: put the operator's words into the turn that is running
+  // right now (session.steer). true = delivered. Lets a question be answered while the
+  // assistant is still working, instead of "wait for it to finish" (owner, 2026-10-25).
+  steer = null }) {
   let sessionId = null;
   let inherited = "";        // the session id this queue was carried over from, if any
   let file = null;
@@ -305,8 +369,11 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
   let workingOn = null;         // { text, origin, at } for the run in flight
 
   function noteRun(text, origin = "browser") {
-    const t = String(text || "").trim();
-    workingOn = t ? { text: t.slice(0, 4000), origin, at: now() } : null;
+    // Words only: the inlined files are the model's, and this goes out on every queue tick.
+    const sp = splitPrompt(text);
+    const names = sp.files.map((f) => f.name);
+    const t = (sp.words.trim().slice(0, 4000) + (names.length ? `  \u{1F4CE} ${names.join(", ")}` : "")).trim();
+    workingOn = t ? { text: t, origin, at: now() } : null;
     publish();
   }
 
@@ -365,19 +432,26 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
         await compact(`queue: ${item.text.slice(0, 80)}`);
       }
       if (detached) throw new Error("window closed");
-      send({ type: "queue_started", id: item.id, text, reply: isReply });
       // The files queued WITH this prompt, read back at the moment it runs.
       let images = [];
-      if (!isReply && item.images) {
-        try { images = JSON.parse(fs.readFileSync(attachPath(root, scopeKey, sessionId, item.id), "utf8")); }
-        catch { images = []; }
-        if (!images.length) {
+      let modelText = text;
+      if (!isReply && hasSidecar(item)) {
+        let side = { images: [], text: "" };
+        try { side = readSidecar(root, scopeKey, sessionId, item.id); }
+        catch { /* reported below */ }
+        images = item.images ? side.images : [];
+        if (item.images && !images.length) {
           // Never silent: the operator queued a screenshot and the model is about to answer
           // without it, which is worse than refusing.
           send({ type: "error", message: `The ${item.images} image(s) queued with "${item.text.slice(0, 40)}" could not be read back - answering without them.` });
         }
+        if (item.attach_text) {
+          if (side.text) modelText = String(compose(text, side.text) || text);
+          else send({ type: "error", message: `The file(s) queued with "${item.text.slice(0, 40)}" could not be read back - answering without them.` });
+        }
       }
-      await runPrompt(text, images);
+      send({ type: "queue_started", id: item.id, text: modelText, reply: isReply });
+      await runPrompt(modelText, images);
       if (item.status === "failed") {
         // noteError() already marked it and paused the queue.
       } else if (st.questions.some((q) => q.item_id === item.id)) {
@@ -411,7 +485,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       // the time and who gave it are all in the history, which is one click away.
       if (st.auto_clear_done && item.status === "done") {
         st.items = st.items.filter((i) => i.id !== item.id);
-        if (item.images) dropAttachments(root, scopeKey, sessionId, item.id);
+        if (hasSidecar(item)) dropAttachments(root, scopeKey, sessionId, item.id);
         record("auto_cleared", { text: item.text, item });
       }
       publish();
@@ -514,7 +588,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       // looked like. Only plain "done" goes; failed, skipped and waiting still need a human.
       if (st.auto_clear_done) {
         for (const it of st.items.filter((i) => i.status === "done")) {
-          if (it.images) dropAttachments(root, scopeKey, sessionId, it.id);
+          if (hasSidecar(it)) dropAttachments(root, scopeKey, sessionId, it.id);
           record("auto_cleared", { text: it.text, item: it });
         }
         st.items = st.items.filter((i) => i.status !== "done");
@@ -622,12 +696,19 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       const body = String(text || "").trim();
       if (!body || origin === "queue") return "";
       const who = actorOf(actor);
+      // WORDS AND CHIPS, NOT THE FILE. The chat already sent the full prompt to the model
+      // (and it is in the transcript); this item is the panel's record of it. It used to
+      // keep the first 4000 characters of the COMPOSED prompt, which for an attached HTML
+      // page was the words plus a slab of <style> with the closing marker cut off - the
+      // panel could not fold it back into a chip and showed it raw (TICKET/63160).
+      const sp = splitPrompt(body);
+      const words = sp.words.trim().slice(0, QUEUE_MAX_TEXT) || (sp.files.length ? "(see attached file)" : "");
       // The chat is driving this turn, so an item created here is already running: it must
       // not be picked up a second time by advance().
       const item = {
-        id: randomUUID(), text: body.slice(0, 4000), compact_first: false, status: "running",
+        id: randomUUID(), text: words, compact_first: false, status: "running",
         typed: true, origin, note: "", thread: [], created_at: now(), started_at: now(), ended_at: null,
-        by: who ? who.display : "", user: who ? who.user : "",
+        by: who ? who.display : "", user: who ? who.user : "", attachments: sp.files,
       };
       st.items.push(item);
       if (st.items.length > QUEUE_MAX_ITEMS) st.items.splice(0, st.items.length - QUEUE_MAX_ITEMS);
@@ -652,7 +733,10 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
      * not be queued).
      */
     addTyped(text, actor = null, images = []) {
-      const body = String(text || "").trim().slice(0, QUEUE_MAX_TEXT);
+      // The words go in the item; any inlined files go in the sidecar (see readSidecar).
+      const sp = splitPrompt(String(text || "").trim());
+      const tail = sp.tail.slice(0, QUEUE_MAX_ATTACH_TEXT);
+      const body = sp.words.trim().slice(0, QUEUE_MAX_TEXT) || (tail || (images || []).length ? "(see attached file)" : "");
       if (!body) return "";
       if (st.items.length >= QUEUE_MAX_ITEMS) {
         send({ type: "error", message: `The queue is full (${QUEUE_MAX_ITEMS} items). Clear finished items first.` });
@@ -662,15 +746,21 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       const item = {
         id: randomUUID(), text: body, compact_first: false, status: "pending", next: true,
         added_at: now(), started_at: null, ended_at: null, note: "", thread: [],
-        by: who ? who.display : "", user: who ? who.user : "", attachments: [],
+        by: who ? who.display : "", user: who ? who.user : "",
+        attachments: [
+          ...(images || []).map((_, i) => ({ name: `image ${i + 1}`, kind: "image", bytes: 0 })),
+          ...sp.files,
+        ],
       };
-      if ((images || []).length) {
+      if ((images || []).length || tail) {
         try {
-          fs.writeFileSync(attachPath(root, scopeKey, sessionId, item.id), JSON.stringify(images));
-          item.images = images.length;
+          fs.writeFileSync(attachPath(root, scopeKey, sessionId, item.id), JSON.stringify({ images: images || [], text: tail }));
+          item.images = (images || []).length;
+          item.attach_text = !!tail;
         } catch (e) {
           item.images = 0;
-          item.note = "images could not be stored: " + String(e?.message || e).slice(0, 120);
+          item.attach_text = false;
+          item.note = "attachments could not be stored: " + String(e?.message || e).slice(0, 120);
         }
       }
       st.items.push(item);
@@ -693,7 +783,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       // leaves the list whether or not the assistant asked something along the way.
       if (st.auto_clear_done && it.status === "done") {
         st.items = st.items.filter((x) => x.id !== it.id);
-        if (it.images) dropAttachments(root, scopeKey, sessionId, it.id);
+        if (hasSidecar(it)) dropAttachments(root, scopeKey, sessionId, it.id);
         record("auto_cleared", { text: it.text, item: it });
       }
       publish();
@@ -804,8 +894,13 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           // sent with a prompt typed right now - so queueing work meant losing the evidence.
           // Processed at ADD time, not run time, so a refusal is reported while the operator
           // is still looking at the window instead of an hour later.
-          const att = intake ? intake(msg) : { images: [], text: "", accepted: [], rejected: [] };
-          const text = String(compose(String(msg.text || ""), att.text) || "").trim().slice(0, QUEUE_MAX_TEXT);
+          const att = intake ? await intake(msg) : { images: [], text: "", accepted: [], rejected: [] };
+          // The item keeps the WORDS; the inlined text files go in the sidecar with any
+          // images and are composed back in when it runs (see runItem). Before 2026-10-25 the
+          // composed prompt was stored and cut at QUEUE_MAX_TEXT, so an HTML file queued with
+          // a prompt reached the model as its first few KB.
+          const text = String(msg.text || "").trim().slice(0, QUEUE_MAX_TEXT);
+          const attText = String(att.text || "").trim().slice(0, QUEUE_MAX_ATTACH_TEXT);
           if (!text) {
             // A file on its own is evidence, not an instruction. Queueing it with no words
             // would mean an item nobody can read and a model guessing what to do with a
@@ -831,13 +926,15 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
             // state file. The bytes (if any) are in the sidecar.
             attachments: (att.accepted || []).map((a) => ({ name: a.name, kind: a.kind || (a.mimeType ? "image" : "text"), bytes: a.bytes || 0 })),
           };
-          if ((att.images || []).length) {
+          if ((att.images || []).length || attText) {
             try {
-              fs.writeFileSync(attachPath(root, scopeKey, sessionId, added.id), JSON.stringify(att.images));
-              added.images = att.images.length;
+              fs.writeFileSync(attachPath(root, scopeKey, sessionId, added.id), JSON.stringify({ images: att.images || [], text: attText }));
+              added.images = (att.images || []).length;
+              added.attach_text = !!attText;
             } catch (e) {
               added.images = 0;
-              added.note = "images could not be stored: " + String(e?.message || e).slice(0, 120);
+              added.attach_text = false;
+              added.note = "attachments could not be stored: " + String(e?.message || e).slice(0, 120);
             }
           }
           st.items.push(added);
@@ -857,7 +954,9 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           if (!it || it.status === "running") break;
           if (typeof msg.text === "string" && msg.text.trim() && msg.text.trim() !== it.text) {
             rec("edited", { text: msg.text.trim(), detail: `was: ${it.text.slice(0, 500)}`, item: it });
-            it.text = msg.text.trim().slice(0, QUEUE_MAX_TEXT);
+            // Words capped, any inlined files (an item from before the sidecar held them)
+            // kept whole - the window puts them back on the end of an edit.
+            it.text = clipPrompt(msg.text);
           }
           if (msg.compact_first !== undefined) it.compact_first = !!msg.compact_first;
           // Re-queue a finished/failed/skipped item ("run it again").
@@ -881,14 +980,10 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
             ? st.questions.find((x) => x.id === msg.id)
             : st.questions.find((x) => x.item_id === msg.id);   // legacy: by item id
           if (!q) break;
-          if (engineBusy || (typeof isStreaming === "function" && isStreaming())) {
-            send({ type: "error", message: "The assistant is still working - wait for it to finish, then answer." });
-            break;
-          }
+          const busy = engineBusy || (typeof isStreaming === "function" && isStreaming());
           st.questions = st.questions.filter((x) => x.id !== q.id);
           if (!st.questions.length) st.paused = null;   // the answer is what the pause was waiting for
           const it = q.item_id ? st.items.find((i) => i.id === q.item_id) : null;
-          rec("answered", { text: q.text, detail: text, item: it });
           // THE ANSWER TRAVELS WITH ITS QUESTION (2026-09-30). "yes" / "ok that works" on
           // its own is what reached the judge's TECHNICIAN SAID list, so it refused the very
           // step the technician had just approved ("the technician only said..."). Quoting
@@ -897,6 +992,46 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           const said = qText
             ? `(Answering your question: "${qText.length > 400 ? qText.slice(0, 400) + "..." : qText}")\n${text}`
             : text;
+          // ANSWERING WHILE IT IS STILL WORKING (owner, 2026-10-25: "I can't answer the AI's
+          // questions while it's working in the background even though it asked"). The model
+          // often asks with pause_queue and then carries on with what it CAN do - so the turn
+          // is still running, and the answer box used to refuse with "wait for it to finish".
+          // The answer now goes INTO the running turn (a steer, read at its next step), the
+          // same thing typing in the chat does. Between runs, where the SDK cannot take a
+          // steer, it runs as the very next prompt instead.
+          if (busy) {
+            let delivered = false;
+            if (typeof steer === "function") {
+              try { delivered = !!(await steer(said)); }
+              catch (e) { log?.("queue_answer_steer_error", key(), String(e?.message || e).slice(0, 200)); }
+            }
+            if (it) it.thread.push({ role: "operator", text, at: now(), by: who ? who.display : undefined });
+            // An item that had already finished and was only WAITING on this answer is
+            // settled by it: the answer is carried by the run in flight (or the next one).
+            const settleWaiting = () => { if (it && it.status === "waiting") { it.status = "done"; it.ended_at = now(); } };
+            if (delivered) {
+              settleWaiting();
+              rec("answered", { text: q.text, detail: text, item: it });
+              log?.("queue_answer_steered", key(), text.slice(0, 160));
+              send({ type: "queue_answer_steered", id: q.id, text, by: who ? who.display : "" });
+              publish();
+              break;
+            }
+            const id = queue.addTyped(said, who);
+            if (id) {
+              settleWaiting();
+              rec("answered", { text: q.text, detail: `${text}  (runs as soon as the current step finishes)`, item: it });
+              send({ type: "system_note", text: "Answer queued - the assistant is between steps; it gets it the moment this one settles." });
+              publish();
+              setImmediate(() => { advance("answer while busy").catch(() => {}); });
+            } else {
+              // Could not be delivered at all: put the question back, nothing is lost.
+              st.questions.push(q);
+              publish();
+            }
+            break;
+          }
+          rec("answered", { text: q.text, detail: text, item: it });
           if (it) {
             it.thread.push({ role: "operator", text, at: now(), by: who ? who.display : undefined });
             await runItem(it, said, { isReply: true });
@@ -934,7 +1069,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           const i = st.items.findIndex((x) => x.id === msg.id);
           if (i < 0 || st.items[i].status === "running") break;
           rec("removed", { text: st.items[i].text, detail: `was ${st.items[i].status}`, item: st.items[i] });
-          if (st.items[i].images) dropAttachments(root, scopeKey, sessionId, st.items[i].id);
+          if (hasSidecar(st.items[i])) dropAttachments(root, scopeKey, sessionId, st.items[i].id);
           st.items.splice(i, 1);
           publish();
           break;
@@ -1048,7 +1183,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           break;
         case "queue_clear":
           rec("cleared_all", { detail: `${st.items.length} item(s), ${st.questions.length} question(s)` });
-          for (const it of st.items) if (it.images && it.status !== "running") dropAttachments(root, scopeKey, sessionId, it.id);
+          for (const it of st.items) if (hasSidecar(it) && it.status !== "running") dropAttachments(root, scopeKey, sessionId, it.id);
           st.items = st.items.filter((i) => i.status === "running");
           st.questions = [];
           st.paused = null;

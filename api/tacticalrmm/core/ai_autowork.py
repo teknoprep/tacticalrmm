@@ -90,10 +90,19 @@ def _subject_payload(subj, core) -> dict:
     # model picks one by NAME and can never compose a command. Withheld entirely while the
     # subject is inside its cooldown, so a service that keeps dying escalates to a human
     # instead of being restarted on a loop.
-    fix_actions, fix_agent_id, fix_withheld = [], "", ""
+    # THE REVIEWED-ACTION LIBRARY, NOT AUTHORITY (owner, 2026-10-06). The rule names an action;
+    # the command body for that name lives here. The bridge resolves a name ONLY for a `run_script`
+    # step the rule reaches inside a true IF - this list on its own executes nothing. `fix_allowed`
+    # says whether the cooldown currently withholds fixes, so a service that keeps dying escalates
+    # to a human instead of restarting in a loop.
+    fix_agent_id, fix_withheld, fix_allowed = "", "", False
+    library = [a for a in (subj.fix_actions or [])
+               if isinstance(a, dict) and a.get("name") and a.get("command")]
     if subj.mode == "device_fix":
         from django.utils import timezone as _tz
 
+        if isinstance(getattr(subj, "fix_target", None), dict):
+            fix_agent_id = str((subj.fix_target or {}).get("agent_id") or "")
         cooldown = int(getattr(subj, "fix_cooldown_minutes", 60) or 0)
         last = getattr(subj, "last_fix_at", None)
         if last and cooldown and _tz.now() < last + _tz.timedelta(minutes=cooldown):
@@ -101,16 +110,22 @@ def _subject_payload(subj, core) -> dict:
             fix_withheld = (f"the reviewed fix was already applied at {last:%H:%M} UTC; it is withheld for "
                             f"another {mins} minute(s). Investigate read-only and hand this to a human.")
         else:
-            fix_actions = [a for a in (subj.fix_actions or []) if isinstance(a, dict) and a.get("name") and a.get("command")]
-            fix_agent_id = str((subj.fix_target or {}).get("agent_id") or "") if isinstance(getattr(subj, "fix_target", None), dict) else ""
+            fix_allowed = True
     return {
         "id": subj.pk, "name": subj.name, "description": subj.description, "mode": subj.mode,
+        # THE SAFE-ACTION BYPASS SWITCH TRAVELS WITH THE SUBJECT. The rule may skip the per-ticket
+        # approval for an action whose own `class` is read / restart / update - never for a
+        # `mutating` one. Off unless a person turned it on for this subject.
+        "allow_safe_bypass": bool(getattr(subj, "allow_safe_bypass", False)),
         # THE RULE TRAVELS WITH THE TICKET. Without this the bridge had no idea a rule existed and
         # silently fell back to mode + fix_actions - which is exactly how a subject that had been
         # converted to a rule went on executing its old canned actions.
         "statements": subj.statements or {},
         "instructions": subj.instructions, "procedures": procs, "kb_articles": kbs,
-        "fix_actions": fix_actions, "fix_agent_id": fix_agent_id, "fix_withheld": fix_withheld,
+        # THE LIBRARY IS SENT SO THE RULE CAN NAME A SCRIPT. The bridge resolves `run_script`
+        # steps against it; it is never authority on its own (see autowork-rule.js).
+        "fix_actions": library,
+        "fix_agent_id": fix_agent_id, "fix_withheld": fix_withheld, "fix_allowed": fix_allowed,
         # A reply is allowed in both modes; the bridge only sends on a confident verdict.
         "reply_allowed": True,
         "reply_template": (subj.instructions and "{{findings}}" in subj.instructions) and subj.instructions or "",
@@ -138,35 +153,70 @@ def _subject_payload(subj, core) -> dict:
 # read it as gratitude and re-closed the ticket. Anything with a problem signal in it is now
 # treated as NOT a thank-you, which (with the owner's rule of 2026-09-28) means the automation
 # stands down and a person reads it.
+#
+# NOT ON THIS LIST, on purpose (owner, 2026-10-15): "again", "help", "please", "also", "need",
+# "check". They are what people write when they are HAPPY - "it's running again, thanks",
+# "thanks for the help", "please close it" - and having them here is why TICKET/62724 ("It looks
+# like the webpage is running again. Thanks") was treated as a new problem and handed to a tech.
+# A real new problem still trips the problem words and the contrast words below; "down again" /
+# "happening again" are caught first by _STILL_BROKEN.
 _NEW_PROBLEM = re.compile(
-    r"\b(but|however|although|though|except|still|again|also|another|one more|"
+    r"\b(but|however|although|though|except|still|another|one more|"
     r"issue|problem|error|errors|failed|failing|fail|broke|broken|crash|"
     r"not? ?working|does ?n[o']?t work|can'?t|cannot|unable|won'?t|"
-    r"help|please|need|question|wondering|check|look at|"
+    r"question|wondering|"
     r"same (?:thing|problem|issue)|one (?:other|more) thing)\b",
     re.I,
 )
 _STILL_BROKEN = re.compile(
-    r"\b(did ?n[o']?t (?:work|fix|help)|does ?n[o']?t work|not fixed|still (?:down|broken|not working|"
+    r"\b(did ?n[o']?t (?:work|fix|help)|does ?n[o']?t work|not fixed|still (?:down|broken|not \w+|"
     r"happening|an issue|the same)|back (?:down|again)|same (?:problem|issue|thing) again|"
     r"no (?:better|change|luck)|worse|again today|happening again|not resolved|unresolved|"
-    r"re-?open|reopen|this is still|it'?s still|isn'?t (?:fixed|working)|nothing (?:changed|happened))\b",
+    r"re-?open|reopen|this is still|it'?s still|isn'?t (?:fixed|working)|nothing (?:changed|happened)|"
+    r"nothing (?:is )?working|(?:went|is|it'?s|gone) down again|stopped (?:working|again))\b",
     re.I,
 )
 _THANKS = re.compile(
     r"\b(thank(?:s| you)|much appreciated|appreciate it|that'?s (?:great|perfect|working)|"
-    r"all (?:good|set|sorted)|working (?:now|again)|it'?s (?:working|fixed|back)|perfect|sorted|"
-    r"resolved|no further (?:action|issues))\b",
+    r"all (?:good|set|sorted|fixed)|working (?:now|again|fine|great|properly|well)|"
+    r"it'?s (?:working|fixed|back)|perfect|sorted|resolved|no further (?:action|issues)|"
+    r"running (?:now|again|fine|ok|okay)|back up|up and running|good to go|fixed now|"
+    r"(?:is|it'?s|are) (?:up|running|working)(?: now| again| fine)?|looks (?:good|fine|great))\b",
     re.I,
 )
+
+# WHERE THE CUSTOMER'S OWN WORDS END. A reply carries the whole thread below it - including OUR
+# earlier email ("the service had stopped ... returning an error"), which is full of problem words
+# the customer never wrote. The old comment below said "only the NEW part matters" but the code just
+# took the first 1500 characters, so on TICKET/62719 the word "error" in our own quoted email
+# outvoted the customer's "Thank you, it is back up and working". Cut at the first reply header.
+_QUOTE_START = re.compile(
+    r"(\bFrom:\s.{0,300}?\bSent:"                       # Outlook: From: x  Sent: y
+    r"|\bOn\b.{0,200}?\bwrote:"                         # Gmail/Apple: On <date> <who> wrote:
+    r"|-{2,}\s*Original Message\s*-{2,}"
+    r"|_{8,}"                                           # Outlook mobile separator line
+    r"|\bSent from my\b"                                # mobile signature
+    r"|^\s*>)",                                         # > quoted lines
+    re.I | re.S | re.M,
+)
+
+
+def reply_new_text(text: str) -> str:
+    """The part of a reply the customer actually wrote, without the quoted thread below it."""
+    raw = str(text or "")
+    m = _QUOTE_START.search(raw)
+    if m:
+        raw = raw[: m.start()]
+    return re.sub(r"\s+", " ", raw).strip()
 
 
 def classify_reply(text: str) -> str:
     """'still_broken' | 'thanks' | 'unclear' - from the customer's own words."""
-    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    # Only the NEW part matters; a quoted history would match everything - so it is CUT, not
+    # merely truncated (see _QUOTE_START).
+    body = reply_new_text(text)
     if not body:
         return "unclear"
-    # Only the NEW part matters; a quoted history would match everything.
     body = body[:1500]
     if _STILL_BROKEN.search(body):
         return "still_broken"
@@ -205,6 +255,32 @@ def stand_down(st, *, reason: str, core, decision_url: str = "", note_title: str
         hd_op(core, "release_ticket", {"ticket": st.ticket_ref})
     except Exception as e:
         logger.warning("stand-down bookkeeping failed for %s: %s", st.ticket_ref, e)
+
+
+# A subject that answered the customer but did NOT finish the job leaves the ticket OPEN, tagged for
+# a person (owner, 2026-10-05). Two cases reach here: an intake/advice subject (may_close_ticket is
+# off - it exists to book the job, not to complete it), and a session whose own verdict said a human
+# is needed. Both used to be filed to AI Closed, which takes the ticket out of the human queue while
+# the customer is still waiting for the thing they asked for.
+_HOLD_OPEN_NOTE = (
+    "\U0001F916 Pi.dev AI \u2014 Automation subject \"{name}\"\n"
+    "REPLIED TO THE CUSTOMER \u00b7 LEFT OPEN FOR A HUMAN\n\n"
+    "This ticket was NOT filed to AI Closed{why}. The customer has been answered; the work itself "
+    "still needs a person, so it stays in the queue and is tagged for input.\n"
+    "If nothing further is needed, close it from here \u2014 otherwise pick it up as normal."
+)
+
+
+def _hold_open(core, st, subj, verdict, reason: str = "") -> None:
+    """Answer sent, work not finished: keep the ticket open and put it in front of a person."""
+    st.status = "needs_input"
+    why = f": {str(reason).strip()[:600]}" if str(reason or "").strip() else ""
+    try:
+        hd_op(core, "add_note", {"ticket": st.ticket_ref, "message": _HOLD_OPEN_NOTE.format(
+            name=subj.name, why=why)})
+        hd_op(core, "set_needs_input_tag", {"ticket": st.ticket_ref})
+    except Exception as e:
+        logger.warning("hold-open bookkeeping failed for %s: %s", st.ticket_ref, e)
 
 
 def handle_reply_to_resolved(st, *, body_text: str, core, decision_url: str = "") -> Optional[str]:
@@ -306,6 +382,13 @@ def _approval_blob(ticket_ref: str, subj, *, requester_email: str = "", core=Non
     """
     from core.ai_approval import active_approval
 
+    # THE SAFE-ACTION BYPASS (owner, 2026-10-15). Per subject, default OFF. It does NOT make
+    # anything approved: it travels beside `approved` so the bridge can let a `run_script` whose
+    # attached action is DECLARED class read / restart / update run without a per-ticket approval,
+    # while every mutating action still waits for the plan approval. The bridge resolves each
+    # script's class from the library in `_subject_payload`; Django never widens it here.
+    safe_bypass = bool(getattr(subj, "allow_safe_bypass", False))
+
     try:
         row = active_approval(ticket_ref, subj, subj.statements or {})
     except Exception as e:  # never let the gate's own bookkeeping break the run
@@ -313,7 +396,7 @@ def _approval_blob(ticket_ref: str, subj, *, requester_email: str = "", core=Non
         row = None
     if row is not None:
         return {"approved": True, "by": row.approved_by, "capacity": row.approver_capacity,
-                "digest": row.plan_digest, "auto": False,
+                "digest": row.plan_digest, "auto": False, "safe_bypass": safe_bypass,
                 "reason": "an approval was recorded for this plan"}
 
     # ---- AUTO-APPROVAL: the requester IS a support contact --------------------------------
@@ -342,9 +425,12 @@ def _approval_blob(ticket_ref: str, subj, *, requester_email: str = "", core=Non
         who = requester_email or (primary if "@" in primary else "") or "support contact"
         logger.info("autowork: %s auto-approved - requester %s is an authorised support contact", ticket_ref, who)
         return {"approved": True, "by": who, "capacity": "support_contact", "digest": "", "auto": True,
+                "safe_bypass": safe_bypass,
                 "reason": "the requester is an authorised support contact for this customer"}
     return {"approved": False, "by": "", "capacity": "", "digest": "", "auto": False,
-            "reason": "the requester is not a support contact, so a person has to approve first"}
+            "safe_bypass": safe_bypass,
+            "reason": ("the requester is not a support contact, so a person has to approve first"
+                       + (" (safe actions may run without that approval on this subject)" if safe_bypass else ""))}
 
 
 def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, core, model,
@@ -567,6 +653,23 @@ def work_ticket(st, *, subj, body_text: str, client: str, decision_url: str, cor
         # A rule whose branches never reach close_ticket means exactly that - the ticket stays
         # open for a human, however confident the session was about its own summary.
         logger.info("autowork: %s not closed - the subject's rule has no close step", st.ticket_ref)
+    elif not getattr(subj, "may_close_ticket", False):
+        # AN INTAKE SUBJECT DOES NOT FINISH THE JOB (owner, 2026-10-05).
+        # TICKET/62168/62169: the onboarding-intake subject replied asking for details and then filed
+        # the ticket to AI Closed in the same run, while a technician still had to create the account
+        # and an on-site visit was still owed - the customer was told "ignore the last reply, that was
+        # by AI". A subject with no rule has nothing that says the work is finished, so closing is off
+        # unless a human switches it on (see may_close_ticket / the Procedures page).
+        logger.info("autowork: %s not closed - subject %r may not close tickets", st.ticket_ref, subj.name)
+        _hold_open(core, st, subj, v_final,
+                   "this subject is an intake/advice subject - it books the job, it does not finish it")
+    elif str(v_final.get("needs_human_because") or "").strip():
+        # THE SESSION ITSELF SAID A PERSON IS NEEDED. It still answered the customer, so the ticket is
+        # not untouched - but filing it to AI Closed is how "a technician still owns the on-site visit"
+        # became a closed ticket (TICKET/62168). Hand it over instead, in the session's own words.
+        logger.info("autowork: %s not closed - the session asked for a human: %s", st.ticket_ref,
+                    str(v_final.get("needs_human_because"))[:120])
+        _hold_open(core, st, subj, v_final, str(v_final.get("needs_human_because")))
     elif outcome == "replied" and v_final.get("confidence") == "confident":
         try:
             hd_op(core, "ai_close_ticket", {"ticket": st.ticket_ref, "reason": (

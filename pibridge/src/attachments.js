@@ -8,6 +8,9 @@
 //   image/*  -> ImageContent block (session.prompt(text, { images })) - only if the
 //               ACTIVE model advertises image input, otherwise it is rejected with a
 //               reason the operator can act on ("switch model or paste the text").
+//   pdf      -> text extracted from the PDF and inlined like a text file (invoices,
+//               statements, exported reports). A PDF with no selectable text (a scan)
+//               is refused with a reason that says so.
 //   text-ish -> inlined into the prompt inside sentinel markers so the chat window can
 //               collapse it back into a chip instead of re-rendering a 200 KB log.
 //   binary   -> rejected by name with the reason. NEVER silently dropped: "I attached
@@ -71,6 +74,29 @@ export function humanBytes(n) {
 }
 
 /**
+ * Extract the text of a PDF. `unpdf` bundles a serverless build of pdf.js, so there is no
+ * native dependency and nothing to install on the host.
+ *
+ * Returns { text, totalPages, encrypted }. Throws only for a genuinely unreadable file, so
+ * the caller can tell "this is a scan / protected" from "this is not a PDF at all".
+ * The import is dynamic: pdf.js is large and only a PDF attachment needs it.
+ */
+export async function extractPdf(buf, { maxPages = 60 } = {}) {
+  // unpdf/pdf.js insist on a plain Uint8Array - a Node Buffer is rejected outright, and a
+  // Buffer IS a Uint8Array subclass, so `instanceof` is not enough. Copy into a fresh one.
+  const u8 = new Uint8Array(buf);
+  const { extractText } = await import("unpdf");
+  try {
+    const res = await extractText(u8, { mergePages: true, maxPages });
+    return { text: String(res?.text || ""), totalPages: Number(res?.totalPages || 0), encrypted: false };
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (/password|encrypt/i.test(msg)) return { text: "", totalPages: 0, encrypted: true };
+    throw e;
+  }
+}
+
+/**
  * Is this buffer plausibly UTF-8 text? A NUL byte, or a high proportion of
  * non-printable bytes, means "binary" - sniffing beats trusting the mime type,
  * because browsers get the mime type wrong for exactly the files techs attach.
@@ -108,7 +134,7 @@ function decodeBase64(data) {
  *   rejected: Array<{name:string, reason:string}>,
  * }}
  */
-export function normalizeAttachments(list, opts = {}) {
+export async function normalizeAttachments(list, opts = {}) {
   const L = { ...ATTACH_LIMITS, ...(opts.limits || {}) };
   const out = { images: [], text: "", accepted: [], rejected: [] };
   if (!Array.isArray(list) || list.length === 0) return out;
@@ -124,6 +150,36 @@ export function normalizeAttachments(list, opts = {}) {
   let totalBytes = 0;
   let totalText = 0;
   const textParts = [];
+
+  // Inline one text body - a real text file, or the text extracted from a PDF - with the
+  // SAME caps, truncation notice and sentinel markers, so a PDF cannot bypass them.
+  const addText = (name, body, fileBytes, kind, inlineMedia = 0, extra = {}) => {
+    let truncated = false;
+    let text = String(body || "");
+    if (text.length > L.maxTextBytes) {
+      text = text.slice(0, L.maxTextBytes);
+      truncated = true;
+    }
+    if (totalText + Buffer.byteLength(text) > L.maxTotalTextBytes) {
+      const room = Math.max(0, L.maxTotalTextBytes - totalText);
+      if (room < 1024) {
+        out.rejected.push({ name, reason: "no room left in this message for more text files" });
+        return;
+      }
+      text = text.slice(0, room);
+      truncated = true;
+    }
+    // Strip a stray sentinel so an attached file can never forge an attachment boundary.
+    text = text.split("[[/pi-attachment]]").join("[[/pi-attachment ]]");
+    textParts.push(
+      `${attachOpen(name, fileBytes)}\n${text}` +
+        (truncated ? `\n...[truncated - original file is ${humanBytes(fileBytes)}]` : "") +
+        `\n${ATTACH_CLOSE}`,
+    );
+    totalText += Buffer.byteLength(text);
+    totalBytes += fileBytes;
+    out.accepted.push({ name, kind, bytes: fileBytes, truncated, inlineMedia, ...extra });
+  };
 
   for (const raw of items) {
     const name = safeName(raw?.name);
@@ -185,13 +241,32 @@ export function normalizeAttachments(list, opts = {}) {
       continue;
     }
 
-    // PDFs are the single most common "why not?" - answer it precisely instead of
-    // letting it fall through to the generic binary rejection.
+    // PDFs are the single most common thing a technician attaches (invoices, statements,
+    // exported reports). Extract the text and inline it like a text file. A PDF with no
+    // selectable text is a scan or an image - say so, precisely, rather than sending an empty
+    // body the model would quietly reason around.
     if (mime === "application/pdf" || ext === "pdf") {
-      out.rejected.push({
-        name,
-        reason: "PDFs are not supported yet - export the relevant page as PNG, or paste the text",
-      });
+      let ex;
+      try {
+        ex = await extractPdf(buf);
+      } catch (e) {
+        out.rejected.push({
+          name,
+          reason: `this PDF could not be read (${String(e?.message || e).slice(0, 120)}) - ` +
+                  `export the page as PNG, or paste the text`,
+        });
+        continue;
+      }
+      if (!ex.text.trim()) {
+        out.rejected.push({
+          name,
+          reason: ex.encrypted
+            ? "this PDF is password-protected - unlock it, or export the page as PNG"
+            : "this PDF has no selectable text (a scan or image-only PDF) - export the page as PNG or paste the text",
+        });
+        continue;
+      }
+      addText(name, ex.text, buf.length, "pdf", 0, { pages: ex.totalPages });
       continue;
     }
 
@@ -224,31 +299,7 @@ export function normalizeAttachments(list, opts = {}) {
         return `[inline ${mime} removed: ${humanBytes(Math.round((m.length * 3) / 4))} of base64 - ` +
                `attach the image itself if you need the AI to see it]`;
       });
-    let truncated = false;
-    if (buf.length > L.maxTextBytes) {
-      body = buf.subarray(0, L.maxTextBytes).toString("utf8");
-      truncated = true;
-    }
-    if (totalText + Buffer.byteLength(body) > L.maxTotalTextBytes) {
-      const room = Math.max(0, L.maxTotalTextBytes - totalText);
-      if (room < 1024) {
-        out.rejected.push({ name, reason: "no room left in this message for more text files" });
-        continue;
-      }
-      body = body.slice(0, room);
-      truncated = true;
-    }
-    // Strip a stray sentinel so an attached file can never forge an attachment boundary.
-    body = body.split("[[/pi-attachment]]").join("[[/pi-attachment ]]");
-
-    textParts.push(
-      `${attachOpen(name, buf.length)}\n${body}` +
-        (truncated ? `\n...[truncated - original file is ${humanBytes(buf.length)}]` : "") +
-        `\n${ATTACH_CLOSE}`,
-    );
-    totalText += Buffer.byteLength(body);
-    totalBytes += buf.length;
-    out.accepted.push({ name, kind: "text", bytes: buf.length, truncated, inlineMedia });
+    addText(name, body, buf.length, "text", inlineMedia);
   }
 
   if (textParts.length) {
@@ -272,7 +323,7 @@ export function composePrompt(typed, attachText) {
 /** One-line audit summary, e.g. `screenshot.png (image, 412.0 KB), errors.log (text, 8.2 KB)`. */
 export function describeAccepted(accepted) {
   return accepted
-    .map((a) => `${a.name} (${a.kind}, ${humanBytes(a.bytes)}${a.truncated ? ", truncated" : ""}` +
+    .map((a) => `${a.name} (${a.kind}, ${humanBytes(a.bytes)}${a.pages ? `, ${a.pages} page(s)` : ""}${a.truncated ? ", truncated" : ""}` +
       `${a.inlineMedia ? `, ${a.inlineMedia} inline image(s) stripped` : ""})`)
     .join(", ");
 }
@@ -295,11 +346,14 @@ export function describeAccepted(accepted) {
  */
 export function makeAttachmentIntake({ send, model, log = () => {}, key = "", sessionId = "" }) {
   const EMPTY = { images: [], text: "", accepted: [], rejected: [] };
-  return function takeAttachments(msg) {
+  // ASYNC: a PDF has to be parsed before its text can be inlined. The two direct callers and the
+  // queue's intake all await it; a caller that forgets gets a Promise (and no attachments), which
+  // is loud in review rather than silently dropping the file.
+  return async function takeAttachments(msg) {
     const list = Array.isArray(msg?.attachments) ? msg.attachments : null;
     if (!list || !list.length) return EMPTY;
     const active = model();
-    const res = normalizeAttachments(list, {
+    const res = await normalizeAttachments(list, {
       modelAcceptsImages: Array.isArray(active?.input) ? active.input.includes("image") : false,
       modelName: active?.name || "",
     });

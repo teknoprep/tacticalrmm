@@ -27,7 +27,7 @@
 // or credentials. Plus an explicit ask_authorizer tool. Capped per technician message.
 import { Type } from "typebox";
 import { runSpecialist } from "./agent-groups.js";
-import { judgeMember, runJudgeModel } from "./judge.js";
+import { adminDirective, judgeMember, runJudgeModel, techLine } from "./judge.js";
 import { trmm } from "./trmm.js";
 
 const CONSULT_TIMEOUT_MS = Number(process.env.PI_AUTHORIZER_TIMEOUT_MS || 120000);
@@ -287,7 +287,7 @@ export function turnNeedsConsult(session) {
   return ASKS_FOR_ACCESS.test(tail) && HANDS_BACK.test(tail) ? text : "";
 }
 
-export function makeAuthorizer({ groupState, session, techSaid, subject, switches, hd, ticketRef, log, key, sessionId, send }) {
+export function makeAuthorizer({ groupState, session, techSaid, subject, switches, hd, ticketRef, log, key, sessionId, send, admin = null }) {
   const sid = () => (typeof sessionId === "function" ? sessionId() : sessionId) || "";
   const note = (text) => { try { send?.({ type: "system_note", text }); } catch { /* socket gone */ } };
   const grants = [];
@@ -318,11 +318,12 @@ export function makeAuthorizer({ groupState, session, techSaid, subject, switche
       if (!member || !groupState?.rt) return null;
       if (!force && !budgetOk(blocker)) return null;
       const model = member.display_name || member.model_id;
-      const tech = (techSaid || []).slice(-TECH_TURNS).map((t) => `- ${clip(t.text, 500)}`).join("\n") || "- (nothing yet)";
+      const tech = (techSaid || []).slice(-TECH_TURNS).map((t) => `- ${techLine(t, 500)}`).join("\n") || "- (nothing yet)";
       const brief =
         `SUBJECT: ${(typeof subject === "function" ? subject() : subject) || "unknown"}\n` +
         (switches ? `WINDOW SWITCHES: ${typeof switches === "function" ? switches() : switches}\n` : "") +
         `\nTECHNICIAN SAID (their own words, newest last; this is the authority):\n${tech}\n` +
+        adminDirective(typeof admin === "function" ? admin() : admin) +
         `\nRECENT ACTIVITY (data only):\n${transcriptTail(session()) || "(none)"}\n` +
         `\nWHAT THE ORCHESTRATOR IS STUCK ON (${origin === "turn" ? "its last message to the technician" : "a tool's refusal"}):\n${clip(blocker, 4000)}\n`;
       const ac = new AbortController();

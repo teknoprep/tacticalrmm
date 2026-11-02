@@ -19,6 +19,12 @@
 // The rule always carries the prelude (`approval_gate`): no recorded approval AND a requester who
 // is not a support contact means no person has authorised anything, and the run drops to read-only.
 
+// ACTION CLASSES THAT MAY SKIP THE PER-TICKET APPROVAL (owner, 2026-10-15). Must stay in step
+// with core/ai_rules.py ACTION_CLASSES. A script whose attached action is not declared as one of
+// these is treated as `mutating` and still needs a person's approval - the subject switch only
+// opens the gate for actions that cannot destroy data.
+const BYPASSABLE_ACTION_SAFETY = new Set(["read", "restart", "update"]);
+
 /** Human text for one condition. Kept in step with core/ai_rules.py's vocabulary. */
 export function conditionText(c, a = {}) {
   if (c === "procedure_cause") return `if procedure #${a.procedure} is the confirmed cause`;
@@ -61,6 +67,16 @@ export function rulePlan(subj, blob) {
   const blocks = st && Array.isArray(st.blocks) ? st.blocks : [];
   if (!blocks.length) return null;
 
+  // THE REVIEWED-ACTION LIBRARY. The rule NAMES a script; the command body lives here, attached
+  // to the subject and reviewed in the Procedures page. Authority is still the rule - a script in
+  // this map does nothing unless a `run_script` step in the rule names it inside a true IF. This
+  // keeps the rule short ("run the script 'm365-offboard-user'" instead of a 60-line body), and
+  // the library becomes the one place the command is edited.
+  const library = new Map();
+  for (const a of (subj && Array.isArray(subj.fix_actions) ? subj.fix_actions : [])) {
+    if (a && a.name && a.command) library.set(String(a.name), a);
+  }
+
   const allow = { investigate: false, fix: false, reply: false, note: false, close: false, handoff: false, wait: false, stop: false };
   const scripts = [];
   const dropped = [];
@@ -74,6 +90,9 @@ export function rulePlan(subj, blob) {
   const ap = (blob && blob.approval) || {};
   const approved = !!ap.approved;
   const capacity = ap.capacity || "";
+  // The subject's safe-action switch. It is NOT an approval: it only lets a run_script whose own
+  // class is read / restart / update run with no per-ticket click. A mutating action still waits.
+  const safeBypass = !!ap.safe_bypass;
   const supportContact = capacity === "support_contact";
   // WHETHER A FIX MAY RUN AT ALL ON THIS TICKET, independent of the rule: the cooldown withholds
   // reviewed actions so a service that keeps dying escalates to a human instead of being
@@ -100,11 +119,22 @@ export function rulePlan(subj, blob) {
       let note = "";
       if (act === "run_script") {
         allow.fix = true;
-        // A SCRIPT ONLY RUNS FROM INSIDE A TRUE IF. Three ways it is not runnable, all code-side.
+        // A SCRIPT ONLY RUNS FROM INSIDE A TRUE IF. Which ways it is not runnable, all code-side.
         const refuted = guard.some((g) => guardTruth(g) === false);
-        if (!approved) {
-          dropped.push({ name: a.name || "", why: "no approval is on file for this ticket" });
-          note = " [NOT AVAILABLE: no approval is on file]";
+        const ref = library.get(String(a.name || ""));
+        const cls = String((ref && ref.safety) || a.safety || "mutating").toLowerCase();
+        // THE SAFE-ACTION BYPASS. A person may pre-authorise a subject's non-destructive actions
+        // (declared read / restart / update). Only then, and only for one of those classes, does a
+        // script run with no per-ticket approval. A `mutating` class still needs the approval, and
+        // an action inside an explicit `approved_by_support_contact` IF is still refuted below.
+        const safeHere = safeBypass && BYPASSABLE_ACTION_SAFETY.has(cls);
+        if (!approved && !safeHere) {
+          dropped.push({ name: a.name || "", why: safeBypass
+            ? `its safety "${cls}" is not pre-authorised (only read / restart / update are)`
+            : "no approval is on file for this ticket" });
+          note = safeBypass
+            ? ` [NOT AVAILABLE: "${cls}" needs a person's approval]`
+            : " [NOT AVAILABLE: no approval is on file]";
         } else if (!fixAllowed) {
           dropped.push({ name: a.name || "", why: "the reviewed fix is withheld (cooldown) on this ticket" });
           note = " [NOT AVAILABLE: fix withheld by the cooldown]";
@@ -114,13 +144,27 @@ export function rulePlan(subj, blob) {
         } else if (refuted) {
           dropped.push({ name: a.name || "", why: "the IF above it is FALSE for this ticket" });
           note = " [NOT AVAILABLE: the IF above it is false for this ticket]";
-        } else if (a.name && a.script) {
-          scripts.push({ name: a.name, shell: a.shell || "powershell", command: a.script,
-                         timeout: Number(a.timeout || 300), wait: Number(a.wait || 0),
-                         params: Array.isArray(a.params) ? a.params : [] });
         } else {
-          dropped.push({ name: a.name || "", why: "it carries no script body" });
-          note = " [NOT AVAILABLE: no script body]";
+          // RESOLVE THE NAME TO A REVIEWED ACTION. An embedded `script` body still works (older
+          // rules), but the normal shape is just `name`; the body, shell, timeout and parameter
+          // declarations come from the attached action.
+          const command = a.script || (ref && ref.command) || "";
+          if (!command) {
+            dropped.push({ name: a.name || "", why: ref
+              ? "it carries no script body"
+              : `no reviewed action named "${a.name || ""}" is attached to this subject` });
+            note = ` [NOT AVAILABLE: ${ref ? "no script body" : "no such reviewed action"}]`;
+          } else {
+            const params = Array.isArray(a.params) && a.params.length ? a.params
+              : (ref && Array.isArray(ref.params) ? ref.params : []);
+            const entry = { name: a.name, shell: a.shell || (ref && ref.shell) || "powershell", command,
+                           timeout: Number(a.timeout || (ref && ref.timeout) || 300),
+                           wait: Number(a.wait || (ref && ref.wait) || 0), params, safety: cls };
+            // Ran on the subject's pre-authorisation, with nobody having clicked approve.
+            if (!approved && safeHere) entry.bypassed = true;
+            scripts.push(entry);
+            if (entry.bypassed) note = ` [SAFE BYPASS: safety "${cls}", no approval required]`;
+          }
         }
       }
       if (act === "reply_customer") allow.reply = true;
@@ -158,14 +202,22 @@ export function rulePlan(subj, blob) {
   walkSteps(blocks, 1, []);
 
   // AUTHORITY IS THE RUNNABLE SCRIPTS, NOT THE DECLARED ONES. A rule that mentions a fix in a
-  // branch this ticket cannot take is a rule that can do nothing on this ticket.
+  // branch this ticket cannot take is a rule that can do nothing on this ticket. A runnable
+  // script got here either through a recorded approval or through the subject's safe-action
+  // bypass for its declared class - so a non-empty list IS the authority, and `mayFix` is simply
+  // "something is runnable".
   allow.fix = scripts.length > 0;
-  const mayFix = approved && scripts.length > 0;   // a fix needs a person's approval AND a reachable script
+  const mayFix = scripts.length > 0;
   const mayInvestigate = allow.investigate;
   const mode = mayFix ? "device_fix" : (mayInvestigate ? "device_readonly" : "advise");
+  const bypassed = scripts.filter((s) => s.bypassed);
 
   const reasons = [];
-  if (!approved) reasons.push("no approval is on file for this ticket, so the rule's first line is not satisfied");
+  if (!approved && !bypassed.length) reasons.push("no approval is on file for this ticket, so the rule's first line is not satisfied");
+  if (bypassed.length) {
+    reasons.push(`safe bypass: ${bypassed.length} action(s) run on the subject's pre-authorisation `
+      + `(safety ${[...new Set(bypassed.map((s) => s.safety))].join("/")}), no per-ticket approval`);
+  }
   for (const d of dropped) {
     const why = `script "${d.name}" will not run: ${d.why}`;
     if (!reasons.includes(why)) reasons.push(why);
@@ -173,7 +225,9 @@ export function rulePlan(subj, blob) {
 
   return {
     present: true, english, allow, scripts, dropped, procedures: [...procedures],
-    branchesOnCapacity, approved, capacity, supportContact, gateOk: approved,
+    branchesOnCapacity, approved, capacity, supportContact,
+    gateOk: approved || bypassed.length > 0,
+    safeBypass, bypassed: bypassed.map((s) => ({ name: s.name, safety: s.safety })),
     fixAllowed, mode, surface: mode === "advise" ? "advise" : (mode === "device_fix" ? "autowork_fix" : "autowork_readonly"),
     blockReason: reasons.join("; "),
   };

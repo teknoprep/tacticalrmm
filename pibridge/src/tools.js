@@ -6,6 +6,9 @@ import { loadHelpdesk } from "./helpdesk-runtime.js";
 import { loadSales } from "./sales-runtime.js";
 import { BRAND } from "./brand.js";
 import { gateOp, allowedOps, CAPS_MODE } from "./capabilities.js";
+import {
+  readDocumentText, looksLikeDocumentLink, otherDocumentService, describeConfig,
+} from "./doc-link.js";
 let operatorPlugin = null;
 try {
   operatorPlugin = await import("file:///opt/pi-ai-operator/integrations/pi-trmm-bridge/operator-tools.js");
@@ -318,9 +321,68 @@ async function _webSearch(query, n = 6) {
 }
 export async function webSearchRaw(query, n = 6) { return _webSearch(query, n); }
 export async function webFetchRaw(url, max = 9000) { return _webFetch(url, max); }
+
+// A SharePoint/OneDrive/Teams link fetched as a web page returns the Microsoft SIGN-IN PAGE:
+// 60 KB of HTML with no document in it. Detecting the sign-in page is the honest fallback for a
+// link with a shape we did not recognise.
+function _isSignInPage(html) {
+  return /<title>\s*Sign in to your account\s*<\/title>/i.test(String(html || "")) ||
+    /login\.microsoftonline\.com/i.test(String(html || ""));
+}
+
+/**
+ * Documents behind a Microsoft 365 link (SharePoint / OneDrive / Teams). Read-only, app-only
+ * Graph — see doc-link.js. Exposed on every surface that can already fetch a web page: reading
+ * a document changes nothing, so it needs no approval and no write mode.
+ */
+export function documentTools() {
+  const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
+  const read_document = defineTool({
+    name: "read_document",
+    label: "Read SharePoint/OneDrive document",
+    description:
+      "Read the TEXT of a document behind a Microsoft 365 link — SharePoint, OneDrive, Teams Files, " +
+      "a pasted ':w:/g/...' sharing link, doc.aspx, or a 1drv.ms link. Word/Excel/PowerPoint/PDF are " +
+      "converted to text server-side. Use this instead of web_fetch for any sharepoint.com link: " +
+      "web_fetch only ever gets the Microsoft sign-in page. Long documents come back in parts: pass " +
+      "offset from the previous result to read the next part.",
+    parameters: Type.Object({
+      url: Type.String({ description: "The SharePoint/OneDrive/Teams link, exactly as given." }),
+      offset: Type.Optional(Type.Number({ description: "Character offset to continue from (from the previous result's nextOffset)." })),
+      question: Type.Optional(Type.String({ description: "What you need from the document (helps you quote the right part)." })),
+    }),
+    execute: async (_id, p) => {
+      try {
+        const r = await readDocumentText(p.url, { offset: p.offset || 0 });
+        if (r.ok) return { content: [{ type: "text", text: r.text }], details: { webUrl: r.webUrl, name: r.name, truncated: r.truncated, nextOffset: r.nextOffset } };
+        return text([`read_document: ${r.error}`, r.hint ? `\nWhat to do: ${r.hint}` : ""].join(""));
+      } catch (e) {
+        return text(`read_document failed: ${String(e?.message || e).slice(0, 400)}`);
+      }
+    },
+  });
+  return [read_document];
+}
+
+export function documentStatus() { return describeConfig(); }
 async function _webFetch(url, max = 9000) {
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; PiDevAI/1.0)" }, redirect: "follow" });
+  // A document link is not a web page. Route it to the Graph reader BEFORE fetching, so the
+  // model gets the document instead of the Microsoft sign-in page (read_document is also
+  // offered directly, but a model that reaches for web_fetch out of habit must not be lied to).
+  if (looksLikeDocumentLink(url)) {
+    const d = await readDocumentText(url, { maxChars: Math.max(max, 9000) });
+    if (d.ok) return d.text;
+    const other = otherDocumentService(url);
+    return `[document link] ${d.error}${other ? ` (${other})` : ""}${d.hint ? ` ${d.hint}` : ""}`;
+  }
+  const other = otherDocumentService(url);
+  if (other) return `[document link] ${other} links cannot be read from here. Ask for the file to be attached to the chat, or for the text to be pasted.`;
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; PiDevAI/1.0)" }, redirect: "follow", signal: AbortSignal.timeout(Number(process.env.PI_WEB_TIMEOUT_MS || 15000)) });
   let html = await res.text();
+  if (_isSignInPage(html)) {
+    return `[sign-in wall] ${url} returned a Microsoft/identity-provider SIGN-IN page, not the content. ` +
+      `It is a protected resource: if it is a SharePoint/OneDrive/Teams document use read_document; otherwise a human must fetch it.`;
+  }
   html = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ");
   return _stripHtml(html).slice(0, max);
 }
@@ -350,7 +412,7 @@ export function webTools() {
   const web_fetch = defineTool({
     name: "web_fetch",
     label: "Fetch web page",
-    description: "Fetch a URL and return its readable text (to read a how-to/doc page found via web_search).",
+    description: "Fetch a URL and return its readable text (to read a how-to/doc page found via web_search). SharePoint/OneDrive/Teams document links are handled automatically — prefer read_document for those.",
     parameters: Type.Object({
       url: Type.String({ description: "URL to fetch" }),
       question: Type.Optional(Type.String({ description: "What you need from this page. The researcher (if any) returns only that." })),
@@ -483,13 +545,20 @@ export function terminalAuthFailure(output) {
 // hand-rolled desktop control on a machine that has a proper control plane (see
 // GUI_DRIVING). Empty when Operator is off, which correctly disables the refusal:
 // a machine with no Operator has no better route to point at.
+//
+// Read LIVE, not once (2026-10-19): AI desktop control can be switched on for a computer while
+// its chat is open (desktop-control.js edits the policy's machines in place), and a computer
+// switched on mid-chat must get the same refusal at once.
 function operatorAgentIdSet(operatorPolicy) {
-  const out = new Set();
-  for (const m of (operatorPolicy && operatorPolicy.machines) || []) {
-    if (m && m.agent_id) out.add(String(m.agent_id));
-    if (m && m.agentId) out.add(String(m.agentId));
-  }
-  return out;
+  const ids = () => {
+    const out = new Set();
+    for (const m of (operatorPolicy && operatorPolicy.machines) || []) {
+      if (m && m.agent_id) out.add(String(m.agent_id));
+      if (m && m.agentId) out.add(String(m.agentId));
+    }
+    return out;
+  };
+  return { has: (id) => ids().has(String(id)) };
 }
 
 export function mutatingMatch(command, isWindows) {
@@ -1908,6 +1977,7 @@ export function buildTools({
     schedule_action,
     list_scheduled_actions,
     cancel_scheduled_action,
+    ...documentTools(),
   ];
   if (hd) tools.push(helpdesk_call);
   if (hd) tools.push(attach_capture);
@@ -2216,7 +2286,7 @@ export function buildTicketTriageTools({ helpdeskCode, helpdeskApi } = {}) {
 
   return {
     tools: [get_ticket, resolve_client, find_company, find_devices, deviceHardwareTool(), rmmClientsTool(),
-            list_kb_articles, get_kb_article, ...(hd?.operations?.search_kb ? [search_kb] : []), ...webTools(), submit_triage],
+            list_kb_articles, get_kb_article, ...(hd?.operations?.search_kb ? [search_kb] : []), ...webTools(), ...documentTools(), submit_triage],
     verdict, hd, hdError,
   };
 }
@@ -2279,6 +2349,10 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   // (they start hidden in a ticket chat - see lazy-capabilities.js).
   desktopLoadHint = "",
   techTurns = null,
+  // ADMIN DIRECTIVE (owner, 2026-10-25): the technician's TRMM role is superuser. Their explicit
+  // instruction goes to the judge/authorizer (which carry the admin rule) instead of being
+  // hard-blocked here. The credential-store guard below is NOT relaxed for anyone.
+  isAdmin = false,
 } = {}) {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
   const capStore = makeCaptureStore();
@@ -2636,7 +2710,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // ONLY run when the ticket requester is an APPROVED support contact for the company
       // (Primary/Secondary Support Contact in Odoo). This is deterministic and applies
       // even in Write mode / Auto-approve - no exceptions.
-      if (privilegedMatch(p.command) && !techApproved(techTurns)) {
+      if (privilegedMatch(p.command) && !techApproved(techTurns) && !isAdmin) {
         let authz = null;
         try { if (hd?.operations?.check_support_authorization) authz = await hd.operations.check_support_authorization({ ticket: ticketRef }); } catch { /* verify below */ }
         if (!authz || !authz.authorized) {
@@ -2660,7 +2734,8 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // ...and the same for hand-rolled TOTP work in the ERP database: TICKET/61824 spent a
       // turn on psql/odoo-shell hunting a "TOTP-Admin group id" that add_totp never needs.
       const rawOdoo = /\bpsql\b|odoo(?:-bin)?\s+shell|odoo\.registry|execute_kw|\/jsonrpc/i.test(String(p.command || ""));
-      if (rawOdoo && /totp|res[._]groups/i.test(String(p.command || ""))) {
+      // An administrator who asked for the raw route gets it (still judged); everyone else is pointed at add_totp.
+      if (!isAdmin && rawOdoo && /totp|res[._]groups/i.test(String(p.command || ""))) {
         return text(
           "BLOCKED - do not do TOTP work in the ERP database by hand. helpdesk_call add_totp does it " +
           "as the signed-in technician: pass view_group as the KEY (us_only | admin | helpdesk | " +
@@ -3330,7 +3405,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     });
   }
 
-  let baseTools = [helpdesk_call, ...(hd?.operations?.read_ticket_attachment ? [ticket_attachment] : []), find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools()];
+  let baseTools = [helpdesk_call, ...(hd?.operations?.read_ticket_attachment ? [ticket_attachment] : []), find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools(), ...documentTools()];
   if (sales_call) baseTools.push(sales_call);
   if (leadRef) {
     // DISCOVERY. Device tools stay - they obey Write mode and the approval prompt exactly

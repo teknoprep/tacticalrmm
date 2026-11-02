@@ -61,8 +61,7 @@ read straight out of the database still has its gate, and the bridge treats them
  "blocks": [
    {"if":   {"condition": "procedure_cause", "args": {"procedure": 143}},
     "then": [{"action": "investigate", "args": {}},
-             {"action": "run_script", "args": {"name": "restart-sendplot", "shell": "powershell",
-                                               "script": "...", "wait": 180}},
+             {"action": "run_script", "args": {"name": "restart-sendplot", "wait": 180}},
              {"if":   {"condition": "fix_verified", "args": {}},
               "then": [{"action": "reply_customer", "args": {}}, {"action": "close_ticket", "args": {}}],
               "else": [{"action": "hand_to_human", "args": {}}]}],
@@ -104,7 +103,7 @@ condition or action ⇒ the rule is rejected at save time, not papered over at r
 | `investigate` | investigate the device | read | **yes** |
 | `verify_fix` `{procedure}` | check that it is back up | read | no |
 | `fix_procedure` `{procedure}` | fix it with procedure #N | fix | no |
-| `run_script` `{name,shell,script,wait}` | run the script "N" | fix | no |
+| `run_script` `{name}` | run the reviewed action "N" | fix | no |
 | `reply_customer` | update the customer | reply | **yes** |
 | `note_ticket` | note the ticket | note | **yes** |
 | `close_ticket` | close the ticket | close | no |
@@ -170,8 +169,9 @@ runs to restart sendplot should stay") and adds the verification branch. `mode`,
    decides **in code**:
    * **authority** — which verbs exist at all. No `run_script`/`fix_procedure` in the rule ⇒ no fix
      tool is built, so no ticket text and no model decision can change a device. `apply_fix` carries
-     the RULE's scripts, not the subject's `fix_actions` list, so a rule saying "restart the print
-     spooler" cannot also run nine unrelated actions attached months ago.
+     ONLY the actions the rule names (their command bodies are resolved from the subject's Reviewed
+     actions library), so a rule saying "restart the print spooler" cannot also run nine unrelated
+     actions attached months ago.
    * **the gate** — Django resolves the approval (`active_approval`, digests included) and sends it
      with the ticket. No approval ⇒ the run drops to read-only and the prompt says so. A rule using
      `approved_by_support_contact` is **not** satisfied by a technician's approval.
@@ -229,9 +229,30 @@ runs to restart sendplot should stay") and adds the verification branch. `mode`,
 
 > "should the script be applied only if it's in the IF and the IF is true… i think actions should
 > be allowed to be there but they should NOT RUN unless an IF is setup in the rules"
+>
+> "we either should just remove Actions altogether or call the action's name in the Rule so the rule
+> isn't so long… i like the 2nd option here so we can collapse the scripts in this and then choose
+> that in the rules"
 
-An attached reviewed script is **library data, not authority**. Three things are now enforced in
-code (`src/autowork-rule.js`, unit-tested in `test/autowork-fix.test.mjs`):
+### The rule NAMES the action; the command body lives in the library
+
+A `run_script` step is a **reference**, not a copy:
+
+```json
+{"action": "run_script", "args": {"name": "m365-offboard-user"}}
+```
+
+The command body, shell, timeout and parameter declarations live on the subject's attached Reviewed
+action (the Procedures page). Django folds an inline `script` body into the library on save
+(`ai_rules.bind_run_scripts`), so a saved rule never carries a 60-line body and the script has one
+home. `run_script` that names neither an attached action nor (legacy) an inline body is rejected at
+save time and dropped at run time. `python manage.py bind_rule_scripts --apply` migrated the
+existing rules.
+
+### No IF, no run
+
+An attached reviewed script is **library data, not authority**. Three things are enforced in code
+(`src/autowork-rule.js`, unit-tested in `test/autowork-fix.test.mjs`):
 
 1. **A subject with no rule runs NO reviewed action.** `fix_actions` are kept (a person reviewed
    them) but they are inert. A `device_fix` subject with no `statements` is capped at read-only and
@@ -242,7 +263,8 @@ code (`src/autowork-rule.js`, unit-tested in `test/autowork-fix.test.mjs`):
    * `approved_by_support_contact` is settled from the recorded approval's **capacity** — a
      technician's approval does not satisfy it (account changes want the customer side);
    * the fix cooldown (`fix_allowed`) withholds every script on a ticket;
-   * a `run_script` that is not inside any IF, or carries no body, is dropped;
+   * a `run_script` that is not inside any IF, names no attached action, or carries no body, is
+     dropped;
    * the remaining conditions (`cause_known`, `details_sufficient`, `procedure_cause`, …) are the
      session's judgement, by design — but the step still has to sit inside an IF to be reachable.
    Dropped scripts are removed from `apply_fix` **and** named in the session prompt as unavailable.
@@ -250,8 +272,59 @@ code (`src/autowork-rule.js`, unit-tested in `test/autowork-fix.test.mjs`):
    `RESULT: OK …` / `RESULT: FAIL …`; a FAIL now ends the run and hands the ticket to a human even
    if the script forgot to `exit 1` (subject #31's offboarding script printed FAIL and exited 0).
 
-`_subject_payload` sends `fix_actions: []` and a `fix_allowed` boolean; the bridge never reads the
-subject's attached actions for execution, only the rule's `run_script` steps. New scripted proposals
-from the daily report are created **with** their rule (`rule_for_fix`), so a proposal can never be a
-script that cannot run. Existing Fix subjects were migrated by
-`python manage.py rules_for_fix_subjects --apply`.
+`_subject_payload` sends the reviewed-action **library** plus a `fix_allowed` boolean; the bridge
+resolves a name against that library ONLY for a `run_script` step the rule reaches inside a true IF.
+New scripted proposals from the daily report are created **with** their rule (`rule_for_fix`), so a
+proposal can never be a script that cannot run or a rule that carries its own body. Existing Fix
+subjects were migrated by `python manage.py rules_for_fix_subjects --apply` and
+`python manage.py bind_rule_scripts --apply`.
+
+---
+
+## The safe-action bypass (owner, 2026-10-15)
+
+> "this should be something that can be bypassed, but if it is bypassed the only actions that can be
+> done are IMMUTABLE actions which have 0 affect on data… restarts of services when needed / computer
+> updates / things like this… no deletion of files or change of licenses"
+
+The approval gate stays exactly as it is. What this adds is a narrow, per-subject switch that lets
+a reviewed action run **without** a per-ticket approval — but only when the action itself declares
+that it cannot destroy anything.
+
+### It is a declaration, not a scan
+
+Code cannot prove a PowerShell body is non-destructive. So each reviewed action carries a DECLARED
+`safety` (core/ai_rules.py `ACTION_SAFETY`):
+
+| `safety` | may skip approval? | means |
+|---|---|---|
+| `read` | yes | probes, queries, listings. Nothing changes. |
+| `restart` | yes | start / stop / restart a service, task or process; reboot a host. |
+| `update` | yes | install OS or software updates. Changes the system, not customer data. |
+| `mutating` | **no** | files, licences, mailboxes, users, groups, config, credentials. Always gated. |
+
+Absent or unrecognised ⇒ **`mutating`**. The class sits on the same reviewed record as the command,
+so a wrong class is a review failure — it is not something a ticket or a prompt can flip. The
+boundary is structural: the switch does not change WHAT may run, only whether the safe subset needs
+a click. It is not a regex over the script, which would be a hope, not a guarantee.
+
+### How it is enforced
+
+* `AITicketAutomationSubject.allow_safe_bypass` — per subject, **default False**. Off ⇒ every
+  existing subject keeps the hard gate.
+* Django `_approval_blob()` sends `safe_bypass` alongside `approved` (never instead of it).
+* The bridge (`src/autowork-rule.js`) resolves each `run_script` step's action from the library and
+  lets it run when `approved` **OR** (`safe_bypass` **AND** its `safety` ∈ read/restart/update).
+  Everything else is dropped with the reason, exactly as before.
+* A safe action inside an explicit `approved_by_support_contact` IF is **still refuted** — an
+  author who narrowed the gate to the customer side is not overruled by the switch.
+* The fix cooldown still applies, and `mutating` still requires a person's approval.
+* Every bypassed run logs `autowork_safe_bypass` naming the actions and their classes, so there is
+  always a record of a change made with no click. Unit-tested in `test/autowork-fix.test.mjs`.
+
+### SendPlot, concretely
+
+Subject #2 carries `verify-sendplot` (`read`) and `restart-sendplot` (`restart`). With
+`allow_safe_bypass` on, the KB-40 script restart runs with no per-ticket approval; a mutating
+action on the same subject would still wait. The switch is OFF today — nothing has changed in
+production until a person turns it on for that subject.

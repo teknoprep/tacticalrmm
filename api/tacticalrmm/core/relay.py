@@ -976,9 +976,23 @@ class AISessionCapabilities(APIView):
             from core.session_caps import CAP_STATE
 
             state = {CAP_STATE[c]: True for c in caps if c in CAP_STATE}
+        # DESKTOP CONTROL is not a window switch: "on" means this COMPUTER is on the Operator
+        # allowlist, for every chat (core/operator_machines.py). So the RMM turns it on here, as
+        # the admin, and the bridge hears about it through /pi/desktop - not through apply_state.
+        desktop = None
+        if state.pop("desktop", None) and scope_kind == "device":
+            from agents.models import Agent
+            from core import operator_machines as om
+
+            agent = Agent.objects.filter(agent_id=scope_ref).first()
+            if agent:
+                why = om.why_not_eligible(agent)
+                desktop = ({"enabled": False, "error": why} if why else
+                           om.set_enabled(agent, True, by=request.user.username, via=f"admin grant for {u.username}"))
         pushed = _push_caps_to_bridge(u.username, scope_kind, scope_ref, apply_state=state)
         return Response({"ok": True, "row": key_public_caps(row), "bridge_notified": pushed,
-                         "enabled": sorted(state)})
+                         "enabled": sorted(state) + (["desktop"] if desktop and desktop.get("enabled") else []),
+                         "desktop": desktop})
 
     def delete(self, request):
         from accounts.models import User
@@ -1012,6 +1026,25 @@ def key_public_caps(row) -> dict:
         "expires_at": row.expires_at.isoformat() if row.expires_at else None,
         "active": row.active,
     }
+
+
+class AIOperatorWorkstations(APIView):
+    """The computers the Pi AI Operator may drive right now (core/operator_machines.py).
+
+    Read by the Operator COORDINATOR before it opens a session and before every action, so that
+    switching a computer off in the RMM stops the AI on it even if a chat still holds the tools.
+    Agent ids only - no hostnames, no secrets.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from core import operator_machines as om
+
+        if not _has_perm(request, "can_use_ai"):
+            return Response("AI permission is required.", status=403)
+        ids = om.allowed_ids()
+        return Response({"enabled": bool(ids), "agent_ids": ids})
 
 
 def _push_caps_to_bridge(username: str, scope_kind: str, scope_ref: str, apply_state: dict | None = None) -> bool:

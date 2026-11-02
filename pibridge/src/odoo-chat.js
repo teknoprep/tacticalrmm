@@ -38,6 +38,45 @@ import { piRuntime } from "./pi-runtime.js";
 // implementation would drift and under-report.
 import { makeCostMeter, silentStopMessage } from "./cost-meter.js";
 import { trmm } from "./trmm.js";
+import { readDocumentText, looksLikeDocumentLink } from "./doc-link.js";
+
+// LINKED DOCUMENTS (owner, 2026-11-02). "Where do I get the standard SOW?" -> a SharePoint link,
+// and the model answered "I can't read that, it's behind your tenant" -- because this surface
+// has no tools (deliberately) and so no way to fetch anything. Reading a document is input, not
+// an action, so the BRIDGE reads it (doc-link.js: public "Anyone with the link" shares need no
+// credentials; private ones use Graph if configured) and appends the text to the message the
+// model sees. The visible chat keeps the technician's own words. Authority is unchanged.
+const URL_RE = /https?:\/\/[^\s<>"'`)\]]+/gi;
+const MAX_LINKED_DOCS = 3;
+const LINKED_DOC_CHARS = Number(process.env.PI_ODOO_DOC_CHARS || 30000);
+
+export async function withLinkedDocuments(content, { read = readDocumentText, logFn = log } = {}) {
+  const urls = [...new Set(String(content || "").match(URL_RE) || [])]
+    .map((u) => u.replace(/[.,;:!?]+$/, ""))
+    .filter((u) => looksLikeDocumentLink(u))
+    .slice(0, MAX_LINKED_DOCS);
+  if (!urls.length) return { content, docs: [] };
+  const blocks = [];
+  const docs = [];
+  for (const u of urls) {
+    let r;
+    try { r = await read(u, { maxChars: LINKED_DOC_CHARS }); }
+    catch (e) { r = { ok: false, error: String(e?.message || e) }; }
+    docs.push({ url: u, ok: !!r.ok, name: r.name || "", chars: r.totalChars || 0 });
+    logFn("linked_document", u.slice(0, 160), r.ok ? `${r.name} ${r.totalChars} chars via ${r.source}` : `failed: ${String(r.error || "").slice(0, 160)}`);
+    if (r.ok) {
+      blocks.push(
+        `[[linked-document: ${r.name} | ${u}]]\n` +
+        `(Read by the bridge from the link above. This is the document's text; Word formatting is not shown.)\n` +
+        `${r.text}\n[[/linked-document]]`,
+      );
+    } else {
+      blocks.push(`[[linked-document-unreadable: ${u}]]\nThe bridge could not read this link: ${r.error}` +
+        `${r.hint ? `\nWhat to tell the technician: ${r.hint}` : ""}\n[[/linked-document-unreadable]]`);
+    }
+  }
+  return { content: `${content}\n\n${blocks.join("\n\n")}`, docs };
+}
 
 const INTENT_FENCE = /```pi-intent\s*\n([\s\S]*?)```/g;
 
@@ -161,6 +200,17 @@ function systemPrompt(blob) {
         "If asked to change something, say that it must be done in Odoo directly.",
     );
   }
+
+  parts.push(
+    "LINKED DOCUMENTS\n" +
+      "  When the technician pastes a SharePoint / OneDrive / Teams link, the bridge reads it for you\n" +
+      "  and appends the text to their message between [[linked-document: name | url]] and\n" +
+      "  [[/linked-document]]. That IS the document: use it, quote it, and say you read it. Never\n" +
+      "  claim you cannot open a link that arrived with its text. If instead you see\n" +
+      "  [[linked-document-unreadable]], give the technician the exact reason it states.\n" +
+      "  Placeholders like {{ Tailor for Client }} in a template are for you to fill from the\n" +
+      "  opportunity, or to ask about -- never leave them in anything customer-facing.",
+  );
 
   parts.push(
     "FORMATTING\n" +
@@ -338,6 +388,12 @@ export async function startOdooChat(ws, blob) {
   for (const m of blob.allowed_models || []) {
     if (m.api_key) keys[m.provider] = m.api_key;
   }
+  // Agent group (Django core/odoo_ai.py, 2026-11-02): the orchestrator is already blob.provider /
+  // model_id; the roster's keys come along so a role's backup model can resolve.
+  for (const [p, k] of Object.entries(blob.agent_group_keys || {})) {
+    if (k && !keys[p]) keys[p] = k;
+  }
+  if (blob.agent_group?.slug) log("group", blob.agent_group.slug, `${blob.provider}/${blob.model_id}`);
 
   const rt = await piRuntime(keys);
   const modelRegistry = rt;
@@ -582,7 +638,11 @@ function attachSocket(entry, ws, blob) {
     fanout(entry, { type: "busy", busy: true });
 
     try {
-      await session.prompt(msg.content, { queue: "followUp" });
+      const linked = await withLinkedDocuments(msg.content);
+      if (linked.docs.length) {
+        fanout(entry, { type: "phase", phase: "thinking" });
+      }
+      await session.prompt(linked.content, { queue: "followUp" });
       if (entry.aborted) {
         // The technician stopped this turn. Whatever the provider managed to
         // produce is discarded rather than presented as an answer.

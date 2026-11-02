@@ -84,6 +84,7 @@ const imagesSupported = (model) => (Array.isArray(model?.input) ? model.input.in
 // Nothing the technician sends may be dropped because the window was still building.
 import { bufferEarlyFrames } from "./early-frames.js";
 import { makeLazyCapabilities, TICKET_CHAT_UNADVERTISED, TOTP_OP_RE } from "./lazy-capabilities.js";
+import { makeDesktopControl, applyDesktopToolVisibility } from "./desktop-control.js";
 import { makeRelay } from "./relay.js";
 
 const redis = new Redis(CONFIG.redisUrl);
@@ -594,17 +595,24 @@ function isCompactChatModel(model) {
  *  ranking it by price picked openai/gpt-3.5-turbo, which rejected the reasoning setting outright.
  *  In order:
  *   1. this chat's group summarizer, if it holds the transcript;
- *   2. another group's summarizer - the default group first - for a chat running with NO group
+ *   2. for a chat running with NO group: the admin's "Default summarizer (single-model chats)"
+ *      (Global Settings > Pi.dev AI; blob.default_summarizer), if set and it fits. It does not
+ *      apply to a chat that is on a group - those keep their own summarizer (step 1);
+ *   3. another group's summarizer - the default group first - for a chat running with NO group
  *      (a window can remember "plain model", which is how TICKET/60765 lost its team);
- *   3. the chat's own current model, which by definition already holds this conversation
+ *   4. the chat's own current model, which by definition already holds this conversation
  *      (returning null = no switch);
- *   4. the cheapest reasoning-capable, non-"pro" model from the admin's Models list that fits. */
-function pickCompactionModel(rt, groupState, tokens, current = null, allowed = []) {
+ *   5. the cheapest reasoning-capable, non-"pro" model from the admin's Models list that fits. */
+function pickCompactionModel(rt, groupState, tokens, current = null, allowed = [], defaultSummarizer = null) {
   const need = Math.ceil(Number(tokens || 0) * 1.15);
   const fits = (model) => model && isCompactChatModel(model) && Number(model.contextWindow || 0) >= need;
   const resolve = (m) => (m ? rt.findModel(m.provider, m.model_id) : null);
   const own = resolve(summarizerMember(groupState?.current));
   if (fits(own)) return own;
+  if (!groupState?.current && defaultSummarizer?.provider && defaultSummarizer?.model_id) {
+    const dflt = resolve(defaultSummarizer);
+    if (fits(dflt)) return dflt;
+  }
   const groups = (groupState?.all || []).slice().sort((a, b) => Number(!!b.is_default) - Number(!!a.is_default));
   for (const g of groups) {
     const m = resolve(summarizerMember(g));
@@ -620,11 +628,11 @@ function pickCompactionModel(rt, groupState, tokens, current = null, allowed = [
   return ranked[0] || null;
 }
 
-function compactSummarizerHooks(session, rt, groupState, log, key, allowed = () => []) {
+function compactSummarizerHooks(session, rt, groupState, log, key, allowed = () => [], defaultSummarizer = () => null) {
   let previous = null;
   return {
     prepareSummarizer: async ({ tokens } = {}) => {
-      const m = pickCompactionModel(rt, groupState, tokens, session.model, allowed());
+      const m = pickCompactionModel(rt, groupState, tokens, session.model, allowed(), defaultSummarizer());
       if (!m) return;
       if (session.model && session.model.id === m.id && session.model.provider === m.provider) return;
       previous = session.model;
@@ -907,7 +915,7 @@ function makeCredentialGate({ isOn, allowed, prompt, log, key, sessionId }) {
     // watching. The owner's call: the switch means what it says. The role permission
     // still decides whether the switch may be honoured at all, and every release is
     // logged with its class so the audit trail still distinguishes the two.
-    if (isOn() && allowed) {
+    if (isOn() && (typeof allowed === "function" ? allowed() : allowed)) {
       log(opts.privileged
             ? "PRIVILEGED credential read auto-permitted (Auto-credential)"
             : "credential read auto-permitted (Auto-credential)",
@@ -1197,7 +1205,7 @@ async function startChat(ws, blob) {
   let autoCredential = switches.autoCredential;
   const credentialGate = makeCredentialGate({
     isOn: () => autoCredential,
-    allowed: autocredentialAllowed,
+    allowed: () => autocredentialAllowed,
     techSaid,
     // NOT requestApproval: that one returns true when Auto-approve is on, and Auto-approve
     // has never covered credentials. This surface's approval helper is the reason the
@@ -1212,6 +1220,12 @@ async function startChat(ws, blob) {
     log, key: agentId, sessionId: () => sessionId,
   });
 
+  // AI DESKTOP CONTROL for this computer (desktop-control.js). `desktop.policy` is what the
+  // Operator tools, the GUI-driving guard and the system prompt all read, live; the hamburger
+  // switch (via the RMM and /pi/desktop) edits it. desktopAllowed = may this person flip it.
+  const desktop = makeDesktopControl(blob.operator, multi ? [] : blob.desktop_machines);
+  let desktopAllowed = !!blob.desktop_allowed;
+
   const { tools, mutating, machines: toolMachines, hd: toolsHd } = buildTools({
     techTurns: techSaid,
     machines,
@@ -1224,7 +1238,7 @@ async function startChat(ws, blob) {
     helpdeskApi: blob.helpdesk_api || null,
     helpdeskCode: blob.helpdesk_code || "",
     globalKnowledgeAuthorisation: () => globalKBAuthorisation(techSaid),
-    operatorPolicy: blob.operator || null,
+    operatorPolicy: desktop.policy,
     operatorActor: blob.username || "",
     actorEmail: blob.user_email || "",
     actorName: blob.user_display || blob.username || "",
@@ -1294,6 +1308,14 @@ async function startChat(ws, blob) {
     compose: (text, attachText) => composePrompt(text, attachText),
     compact: (reason) => compactCmd.run("", { reason, clear: true }),
     isStreaming: () => !!session?.isStreaming || compactBusy || !!session?.isCompacting,
+    // An answer given in the Queue panel while the turn is still running goes INTO that
+    // turn, exactly like typing in the chat does (queue.js queue_answer).
+    steer: async (text) => {
+      if (!session?.isStreaming) return false;
+      techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
+      await inTurn(() => session.steer(text));
+      return true;
+    },
     // Auto-clear is ON unless THIS window turned it off - and that choice is remembered
     // per conversation (window-memory.js), like Write mode and Auto-approve, so it
     // survives New chat, a refresh and a bridge restart.
@@ -1311,8 +1333,9 @@ async function startChat(ws, blob) {
       (multi ? systemPromptMulti(toolMachines) : systemPrompt(facts)) +
       roNotice +
       helpdeskSection(blob, facts?.client) +
-      desktopPolicySection(blob) +
-      operatorPromptSection(blob.operator) +
+      // Read every turn, so switching desktop control on/off changes the prompt at once.
+      desktopPolicySection({ operator: desktop.policy }) +
+      operatorPromptSection(desktop.policy) +
       queuePromptSection(),
   }, groupState));
   await loader.reload();
@@ -1408,6 +1431,8 @@ async function startChat(ws, blob) {
     agentDir: CONFIG.sessionsRoot,
     cwd: CONFIG.sessionsRoot,
   });
+  // Desktop tools ride along only while a computer has AI desktop control switched on.
+  if (desktop.live) applyDesktopToolVisibility(session, tools, desktop.anyOn());
 
   const sessionId = session.sessionId;
   // THE SESSION LIVES HERE, NOT IN THE SOCKET. Every former ws.send below is hub.send: a
@@ -1432,10 +1457,17 @@ async function startChat(ws, blob) {
   // pushes the resolved permissions to /pi/grants, which calls this. Only the "may" flags move -
   // the switches stay where the technician left them, so a grant makes a toggle APPEAR rather
   // than silently turning something on. Auto-approve is read straight off `blob`, hence both.
-  hub.applyCaps = (perms = {}, granted = [], state = {}) => {
+  hub.applyCaps = (perms = {}, granted = [], state = {}, reason = "grant") => {
     if (typeof perms.mutate_allowed === "boolean") mutateAllowed = perms.mutate_allowed;
     if (typeof perms.autocredential_allowed === "boolean") autocredentialAllowed = perms.autocredential_allowed;
     if (typeof perms.autoapprove_allowed === "boolean") blob.autoapprove_allowed = perms.autoapprove_allowed;
+    // May this person flip AI desktop control here? (The computer's state itself is the RMM's -
+    // it does not change when the seat or a grant does; see hub.applyDesktop.)
+    if (typeof perms.desktop_allowed === "boolean") desktopAllowed = perms.desktop_allowed;
+    // A switch the (new) driver may not hold goes OFF - without recording it as their choice.
+    if (!mutateAllowed && !readonly) { readonly = true; try { hub.send(JSON.stringify({ type: "readonly_state", value: true })); } catch {} }
+    if (!blob.autoapprove_allowed && autoApprove) { autoApprove = false; try { hub.send(JSON.stringify({ type: "autoapprove_state", value: false })); } catch {} }
+    if (!autocredentialAllowed && autoCredential) { autoCredential = false; try { hub.send(JSON.stringify({ type: "autocredential_state", value: false })); } catch {} }
     // The switch ITSELF, flipped on the technician's behalf by an admin. `state` is what an
     // administrator asked for when they granted the capability ("enable it for them"), and it is
     // applied exactly as the driver's own toggle would be - so every window agrees.
@@ -1451,9 +1483,40 @@ async function startChat(ws, blob) {
       mutate_allowed: mutateAllowed,
       autoapprove_allowed: !!blob.autoapprove_allowed,
       autocredential_allowed: autocredentialAllowed,
+      desktop_allowed: desktopAllowed,
       caps_granted: granted,
+      reason,
     }));
   };
+  // The seat moved: the session now runs on the NEW driver's permissions (live-hub.js).
+  hub.applyDriverPerms = (owner, p) => {
+    const q = p.perms || {};
+    hub.applyCaps({
+      mutate_allowed: !!q.mutate_allowed,
+      autoapprove_allowed: !!q.autoapprove_allowed,
+      autocredential_allowed: !!q.autocredential_allowed,
+      desktop_allowed: !!q.desktop_allowed,
+    }, p.granted || [], p.state || {}, "driver");
+  };
+  // AI DESKTOP CONTROL SWITCHED for a computer (RMM -> /pi/desktop). The RMM has already changed
+  // its allowlist and the coordinator follows it; this makes THIS chat agree immediately: the
+  // Operator tools appear or disappear, the system prompt changes on the next turn, and the
+  // window (and the model, via a note in its next turn) is told who did it.
+  hub.desktopMachine = (agentId) => desktop.isChatMachine(agentId);
+  hub.applyDesktop = (agentId, enabled, machine = null, by = "") => {
+    if (!desktop.set(agentId, enabled, machine)) return false;
+    applyDesktopToolVisibility(session, tools, desktop.anyOn());
+    const host = machine?.hostname || desktop.frame().find((m) => m.agent_id === agentId)?.hostname || agentId;
+    log(enabled ? "desktop control ON" : "desktop control OFF", agentId, sessionId, `${host} by ${by || "?"}`);
+    try {
+      hub.send(JSON.stringify({ type: "desktop_state", agent_id: agentId, enabled: !!enabled, by, machines: desktop.frame() }));
+      hub.send(JSON.stringify({ type: "system_note", text: enabled
+        ? `\u{1F5B1}\uFE0F AI desktop control switched ON for ${host}${by ? ` by ${by}` : ""}. The AI can now drive its screen, mouse and keyboard (Operator rules still apply).`
+        : `\u{1F5B1}\uFE0F AI desktop control switched OFF for ${host}${by ? ` by ${by}` : ""}. The AI can no longer drive its screen.` }));
+    } catch { /* no viewer */ }
+    return true;
+  };
+  hub.permsDriver = String(blob.username || "").toLowerCase();
 
   if (pendingClaim) pendingClaim.resolve(hub);
   // A resumed conversation inherits its queue (see queue.attach): the harness gives the
@@ -1744,7 +1807,7 @@ async function startChat(ws, blob) {
     switches: {
       write: {
         label: "Write mode",
-        allowed: mutateAllowed,
+        get allowed() { return mutateAllowed; },
         denied: "Your role is read-only on devices.",
         get: () => !readonly,
         set: (v) => applyReadonly(v),
@@ -1753,7 +1816,7 @@ async function startChat(ws, blob) {
       },
       approve: {
         label: "Auto-approve",
-        allowed: !!blob.autoapprove_allowed,
+        get allowed() { return !!blob.autoapprove_allowed; },
         denied: "Your role must approve each device action.",
         get: () => autoApprove,
         set: (v) => applyAutoApprove(v),
@@ -1762,7 +1825,7 @@ async function startChat(ws, blob) {
       },
       credentials: {
         label: "Auto-credential",
-        allowed: autocredentialAllowed,
+        get allowed() { return autocredentialAllowed; },
         denied: "Your role must approve each credential read.",
         get: () => autoCredential,
         set: (v) => applyAutoCredential(v),
@@ -1835,8 +1898,12 @@ async function startChat(ws, blob) {
       // images at all. The caps come from the bridge so the UI can never offer something
       // the server will then refuse; the UI re-checks images on every model_changed.
       attachments: attachReady(model),
-      operator_enabled: !!(blob.operator && blob.operator.enabled),
-      operator_machines: (blob.operator && blob.operator.machines) || [],
+      operator_enabled: !!(desktop.policy && desktop.policy.enabled),
+      operator_machines: (desktop.policy && desktop.policy.machines) || [],
+      // AI desktop control: this chat's own computers and whether each is on; desktop_allowed =
+      // may the driver flip it (role can_use_ai_desktop or an admin grant).
+      desktop_allowed: desktopAllowed,
+      desktop_machines: desktop.frame(),
       label: sessionLabel,
       history: uiTranscript(sessionManager, session, { showCost: !!blob.cost_visible }),
       // Did this window pick up an existing conversation, and was that its own idea? The
@@ -1918,7 +1985,7 @@ async function startChat(ws, blob) {
     // A single huge tool result can put the conversation past the model's window and
     // survive compaction in the retained tail - see context-trim.js.
     trimContext: () => trimOversized(session, { log, key: agentId, sessionId }),
-    ...compactSummarizerHooks(session, rt, groupState, log, agentId, () => blob.allowed_models || []),
+    ...compactSummarizerHooks(session, rt, groupState, log, agentId, () => blob.allowed_models || [], () => blob.default_summarizer || null),
   });
   // Busy for the queue while ANY summary runs (manual, auto, or an item's compact-first);
   // when it ends, let the queue carry on with whatever was added meanwhile.
@@ -1951,6 +2018,7 @@ async function startChat(ws, blob) {
     groupState, techSaid, session: () => session,
     subject: () => (multi ? toolMachines.map((m) => m.label).join(" + ") : `device ${facts.hostname}`),
     switches: () => `Write mode ${readonly ? "OFF" : "ON"}, Auto-approve ${autoApprove ? "ON" : "OFF"}`,
+    admin: () => (blob.is_admin ? String(blob.username || "admin") : null),
     log, key: agentId, sessionId: () => sessionId,
     send: (frame) => hub.send(JSON.stringify(frame)),
     grants: () => authorizer?.grants() || [],
@@ -1959,6 +2027,7 @@ async function startChat(ws, blob) {
     groupState, techSaid, session: () => session, hd: toolsHd, ticketRef: "",
     subject: () => (multi ? toolMachines.map((m) => m.label).join(" + ") : `device ${facts.hostname}`),
     switches: () => `Write mode ${readonly ? "OFF" : "ON"}, Auto-approve ${autoApprove ? "ON" : "OFF"}`,
+    admin: () => (blob.is_admin ? String(blob.username || "admin") : null),
     log, key: agentId, sessionId: () => sessionId,
     send: (frame) => hub.send(JSON.stringify(frame)),
   });
@@ -2071,7 +2140,7 @@ async function startChat(ws, blob) {
     const imageBlocks = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime }));
     // SUMMARIZE BEFORE THE NEXT TASK (owner, 2026-09-26), not after the last one: a ticket that
     // is done never pays for a summary. Not for a steer into a running turn.
-    if (!session.isStreaming) { try { await autoCompact?.beforePrompt(); } catch { /* the prompt still goes */ } }
+    if (!session.isStreaming && !answersOpenQuestion(text, typeof queue !== "undefined" ? queue : null)) { try { await autoCompact?.beforePrompt(); } catch { /* the prompt still goes */ } }
     // This turn, for Stop: nothing may start a follow-up prompt once the technician pressed it.
     const turnStartedAt = Date.now();
     const stopped = () => lastAbortAt >= turnStartedAt;
@@ -2165,7 +2234,7 @@ async function startChat(ws, blob) {
             await runPrompt(String(msg.message || ""), [], "browser", who);
             break;
           }
-          const att = takeAttachments(msg);
+          const att = await takeAttachments(msg);
           const text = composePrompt(msg.message, att.text);
           // A message whose every attachment was refused must not become an empty turn:
           // the operator already has the rejection notice and nothing is left to ask.
@@ -2180,6 +2249,9 @@ async function startChat(ws, blob) {
           if (running()) {
             if (session.isStreaming) {
               techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
+              // Typed into the running turn while the assistant has a question open = the answer
+              // (same rule as a prompt typed while idle); clears the card instead of leaving it.
+              queue.noteOperatorReply(msg.message, who);
               queue.notePrompt(msg.message, "browser", { steer: true, actor: who });
               await session.steer(text, att.images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })));
               break;
@@ -2197,7 +2269,7 @@ async function startChat(ws, blob) {
           break;
         }
         case "steer": {
-          const att = takeAttachments(msg);
+          const att = await takeAttachments(msg);
           const text = composePrompt(msg.message, att.text);
           if (!text && !att.images.length) break;
           // Only a STREAMING session can take a steer. Between runs it is queued as "next";
@@ -2215,6 +2287,9 @@ async function startChat(ws, blob) {
             break;
           }
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
+          // Typed into the running turn while the assistant has a question open = the answer
+          // (same rule as a prompt typed while idle); clears the card instead of leaving it.
+          queue.noteOperatorReply(msg.message, who);
           queue.notePrompt(msg.message, "browser", { steer: true, actor: who });
           await inTurn(() => session.steer(text, att.images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime }))));
           break;
@@ -2366,6 +2441,8 @@ async function startChat(ws, blob) {
   hub.refreshGroups = (fresh) => {
     if (!fresh) return;
     if (Array.isArray(fresh.allowed_models) && fresh.allowed_models.length) blob.allowed_models = fresh.allowed_models;
+    // null = the admin cleared it; absent = an older Django that does not send it (leave as is).
+    if ("default_summarizer" in fresh) blob.default_summarizer = fresh.default_summarizer || null;
     if (Array.isArray(fresh.agent_groups) && fresh.agent_groups.length) {
       blob.agent_groups = fresh.agent_groups;
       const g = findGroupInBlob(blob, groupState.current?.id);
@@ -2560,7 +2637,7 @@ async function startDecisionChat(ws, blob) {
   // never consults Auto-approve, so a credential prompt is always a real prompt.
   const credentialGate = makeCredentialGate({
     isOn: () => autoCredential,
-    allowed: autocredentialAllowed,
+    allowed: () => autocredentialAllowed,
     techSaid,
     prompt: (ask) => requestApproval(ask),
     log, key: histKey, sessionId: () => sessionId,
@@ -2757,6 +2834,7 @@ async function startDecisionChat(ws, blob) {
     unadvertised: isCrm ? [] : TICKET_CHAT_UNADVERTISED,
     desktopLoadHint: ` (If the operator_* tools are not in your tool list yet, call load_capability with name "desktop" first.)`,
     techTurns: techSaid,
+    isAdmin: !!blob.is_admin,
     helpdeskApi: blob.helpdesk_api || null,
     helpdeskCode: blob.helpdesk_code || "",
     ticketRef,
@@ -2967,6 +3045,14 @@ async function startDecisionChat(ws, blob) {
     compose: (text, attachText) => composePrompt(text, attachText),
     compact: (reason) => compactCmd.run("", { reason, clear: true }),
     isStreaming: () => !!session?.isStreaming || compactBusy || !!session?.isCompacting,
+    // See the device chat: an answer in the Queue panel while the turn runs is a steer.
+    steer: async (text) => {
+      if (!session?.isStreaming) return false;
+      techSaid.push({ at: new Date().toISOString(), text: String(text || "") });
+      work.humanTurn();
+      await session.steer(text);
+      return true;
+    },
     // See the device chat: on by default, off only where someone said so, remembered.
     autoClearDefault: windowMemory.recallSwitch(histKey, "auto_clear", true),
     onSwitch: (name, value, actor) =>
@@ -3035,11 +3121,16 @@ async function startDecisionChat(ws, blob) {
   // pushes the resolved permissions to /pi/grants, which calls this. Only the "may" flags move -
   // the switches stay where the technician left them, so a grant makes a toggle APPEAR rather
   // than silently turning something on.
-  hub.applyCaps = (perms = {}, granted = [], state = {}) => {
+  hub.applyCaps = (perms = {}, granted = [], state = {}, reason = "grant") => {
     if (typeof perms.mutate_allowed === "boolean") mutateAllowed = perms.mutate_allowed;
     if (typeof perms.autoapprove_allowed === "boolean") autoapproveAllowed = perms.autoapprove_allowed;
     if (typeof perms.autocredential_allowed === "boolean") autocredentialAllowed = perms.autocredential_allowed;
     if (typeof perms.autototp_allowed === "boolean") autototpAllowed = perms.autototp_allowed;
+    // A switch the (new) driver may not hold goes OFF - without recording it as their choice.
+    if (!mutateAllowed && !readonly) { readonly = true; try { hub.send(JSON.stringify({ type: "readonly_state", value: true })); } catch {} }
+    if (!autoapproveAllowed && autoApprove) { autoApprove = false; try { hub.send(JSON.stringify({ type: "autoapprove_state", value: false })); } catch {} }
+    if (!autocredentialAllowed && autoCredential) { autoCredential = false; try { hub.send(JSON.stringify({ type: "autocredential_state", value: false })); } catch {} }
+    if (!autocredentialAllowed && autoTotp) { autoTotp = false; try { hub.send(JSON.stringify({ type: "autototp_state", value: false })); } catch {} }
     // Flip the switch itself, on the technician's behalf (see the device chat). This is what
     // makes "enable it for them" work without the admin taking the seat.
     if (typeof state.write === "boolean" && mutateAllowed) applyReadonly(state.write);
@@ -3056,8 +3147,21 @@ async function startDecisionChat(ws, blob) {
       autocredential_allowed: autocredentialAllowed,
       autototp_allowed: autototpAllowed,
       caps_granted: granted,
+      reason,
     }));
   };
+  // The seat moved: the session now runs on the NEW driver's permissions (live-hub.js).
+  // Same defaults this surface opens with (mutate unless the role says false).
+  hub.applyDriverPerms = (owner, p) => {
+    const q = p.perms || {};
+    hub.applyCaps({
+      mutate_allowed: q.mutate_allowed !== false,
+      autoapprove_allowed: !!q.autoapprove_allowed,
+      autocredential_allowed: !!q.autocredential_allowed,
+      autototp_allowed: q.autototp_allowed !== undefined ? !!q.autototp_allowed : !!q.autocredential_allowed,
+    }, p.granted || [], p.state || {}, "driver");
+  };
+  hub.permsDriver = String(blob.username || "").toLowerCase();
 
   pendingClaim.resolve(hub);
   let ticketStage = String(blob.ticket_stage || "");
@@ -3303,7 +3407,7 @@ async function startDecisionChat(ws, blob) {
       { at: new Date().toISOString(), by: blob.username || "" }),
     // See the device chat: one oversized tool result must not be able to wedge a window.
     trimContext: () => trimOversized(session, { log, key: histKey, sessionId }),
-    ...compactSummarizerHooks(session, rt, groupState, log, histKey, () => blob.allowed_models || []),
+    ...compactSummarizerHooks(session, rt, groupState, log, histKey, () => blob.allowed_models || [], () => blob.default_summarizer || null),
   });
   // Busy for the queue while ANY summary runs (manual, auto, or an item's compact-first);
   // when it ends, let the queue carry on with whatever was added meanwhile.
@@ -3336,6 +3440,7 @@ async function startDecisionChat(ws, blob) {
     groupState, techSaid, session: () => session,
     subject: () => `ticket ${ticketRef || leadRef || histKey}`,
     switches: () => `Write mode ${readonly ? "OFF" : "ON"}, Auto-approve ${autoApprove ? "ON" : "OFF"}, Customer email ${allowEmail ? "ON" : "OFF"}`,
+    admin: () => (blob.is_admin ? String(blob.username || "admin") : null),
     log, key: histKey, sessionId: () => sessionId,
     send: (frame) => hub.send(JSON.stringify(frame)),
     grants: () => authorizer?.grants() || [],
@@ -3344,6 +3449,7 @@ async function startDecisionChat(ws, blob) {
     groupState, techSaid, session: () => session, hd, ticketRef: ticketRef || "",
     subject: () => `ticket ${ticketRef || leadRef || histKey}`,
     switches: () => `Write mode ${readonly ? "OFF" : "ON"}, Auto-approve ${autoApprove ? "ON" : "OFF"}, Customer email ${allowEmail ? "ON" : "OFF"}`,
+    admin: () => (blob.is_admin ? String(blob.username || "admin") : null),
     log, key: histKey, sessionId: () => sessionId,
     send: (frame) => hub.send(JSON.stringify(frame)),
   });
@@ -3392,7 +3498,7 @@ async function startDecisionChat(ws, blob) {
     switches: {
       write: {
         label: "Write mode",
-        allowed: mutateAllowed,
+        get allowed() { return mutateAllowed; },
         denied: "Your role is read-only on devices.",
         get: () => !readonly,
         set: (v) => applyReadonly(v),
@@ -3401,7 +3507,7 @@ async function startDecisionChat(ws, blob) {
       },
       approve: {
         label: "Auto-approve",
-        allowed: autoapproveAllowed,
+        get allowed() { return autoapproveAllowed; },
         denied: "Your role must approve each device action.",
         get: () => autoApprove,
         set: (v) => applyAutoApprove(v),
@@ -3410,7 +3516,7 @@ async function startDecisionChat(ws, blob) {
       },
       credentials: {
         label: "Auto-credential",
-        allowed: autocredentialAllowed,
+        get allowed() { return autocredentialAllowed; },
         denied: "Your role must approve each credential read.",
         get: () => autoCredential,
         set: (v) => applyAutoCredential(v),
@@ -3419,7 +3525,7 @@ async function startDecisionChat(ws, blob) {
       },
       totp: {
         label: "Auto-TOTP",
-        allowed: autocredentialAllowed,
+        get allowed() { return autocredentialAllowed; },
         denied: "Your role must approve each TOTP save and code.",
         get: () => autoTotp,
         set: (v) => applyAutoTotp(v),
@@ -3581,7 +3687,7 @@ async function startDecisionChat(ws, blob) {
     const imageBlocks = images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime }));
     // SUMMARIZE BEFORE THE NEXT TASK (owner, 2026-09-26), not after the last one: a ticket that
     // is done never pays for a summary. Not for a steer into a running turn.
-    if (!session.isStreaming) { try { await autoCompact?.beforePrompt(); } catch { /* the prompt still goes */ } }
+    if (!session.isStreaming && !answersOpenQuestion(text, typeof queue !== "undefined" ? queue : null)) { try { await autoCompact?.beforePrompt(); } catch { /* the prompt still goes */ } }
     // This turn, for Stop: nothing may start a follow-up prompt once the technician pressed it.
     const turnStartedAt = Date.now();
     const stopped = () => lastAbortAt >= turnStartedAt;
@@ -3686,7 +3792,7 @@ async function startDecisionChat(ws, blob) {
             await runPrompt(String(msg.message || ""), [], "browser", who);
             break;
           }
-          const att = takeAttachments(msg);
+          const att = await takeAttachments(msg);
           const text = composePrompt(msg.message, att.text);
           // Every attachment refused and nothing typed: the operator already has the
           // rejection notice, so do not send an empty turn to the model.
@@ -3698,6 +3804,9 @@ async function startDecisionChat(ws, blob) {
             if (session.isStreaming) {
               techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
               work.humanTurn();
+              // Typed into the running turn while the assistant has a question open = the answer
+              // (same rule as a prompt typed while idle); clears the card instead of leaving it.
+              queue.noteOperatorReply(msg.message, who);
               queue.notePrompt(msg.message, "browser", { steer: true, actor: who });
               await session.steer(text, att.images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })));
               break;
@@ -3713,7 +3822,7 @@ async function startDecisionChat(ws, blob) {
           break;
         }
         case "steer": {
-          const att = takeAttachments(msg);
+          const att = await takeAttachments(msg);
           const text = composePrompt(msg.message, att.text);
           if (!text && !att.images.length) break;
           if (!session.isStreaming) {
@@ -3730,6 +3839,9 @@ async function startDecisionChat(ws, blob) {
           }
           techSaid.push({ at: new Date().toISOString(), text: String(msg.message || "") });
           work.humanTurn();
+          // Typed into the running turn while the assistant has a question open = the answer
+          // (same rule as a prompt typed while idle); clears the card instead of leaving it.
+          queue.noteOperatorReply(msg.message, who);
           queue.notePrompt(msg.message, "browser", { steer: true, actor: who });
           await session.steer(text, att.images.map((i) => ({ type: "image", data: i.data, mimeType: i.mime })));
           break;
@@ -3828,6 +3940,8 @@ async function startDecisionChat(ws, blob) {
   hub.refreshGroups = (fresh) => {
     if (!fresh) return;
     if (Array.isArray(fresh.allowed_models) && fresh.allowed_models.length) blob.allowed_models = fresh.allowed_models;
+    // null = the admin cleared it; absent = an older Django that does not send it (leave as is).
+    if ("default_summarizer" in fresh) blob.default_summarizer = fresh.default_summarizer || null;
     if (Array.isArray(fresh.agent_groups) && fresh.agent_groups.length) {
       blob.agent_groups = fresh.agent_groups;
       const g = findGroupInBlob(blob, groupState.current?.id);
@@ -4443,8 +4557,16 @@ async function runAutowork(blob) {
   const plan = rulePlan(subj, blob);
   const { fixActions, mode, surface, ruleAllowsReply, ruleAllowsClose } = autoworkDecision(subj, plan);
   log("autowork_rule", ticketRef, subj.name || "",
-      plan ? `rule: mode=${mode} gateOk=${plan.gateOk} approved=${plan.approved} scripts=${plan.scripts.length} dropped=${plan.dropped.length} reply=${plan.allow.reply} close=${plan.allow.close}${plan.blockReason ? " blocked=" + plan.blockReason : ""}`
+      plan ? `rule: mode=${mode} gateOk=${plan.gateOk} approved=${plan.approved} scripts=${plan.scripts.length} dropped=${plan.dropped.length} safe_bypass=${plan.safeBypass} bypassed=${plan.bypassed.length} reply=${plan.allow.reply} close=${plan.allow.close}${plan.blockReason ? " blocked=" + plan.blockReason : ""}`
            : `no rule - fix actions are INERT (mode capped at ${mode}); a rule with an IF is required to run anything`);
+  // THE SAFE-ACTION BYPASS IS ALWAYS AUDIBLE. A reviewed action is about to run on a customer's
+  // machine without anyone having approved THIS plan, so it gets its own line naming the actions
+  // and saying they are non-destructive by declaration. If this line is ever unexpected, the
+  // subject switch is on when it should not be.
+  if (plan && plan.bypassed && plan.bypassed.length) {
+    log("autowork_safe_bypass", ticketRef, subj.name || "",
+        `running without a per-ticket approval: ${plan.bypassed.map((b) => `${b.name}[${b.safety}]`).join(", ")}`);
+  }
   const rt = await piRuntime({ [blob.provider]: blob.api_key });
   // THE GROUP WIRING WAS MISSING HERE AND IT MADE AUTOWORK COMPLETELY DEAD.
   //
@@ -5093,6 +5215,298 @@ async function runTicketResolve(blob) {
     .join("\n").trim();
   session.dispose();
   return { output: output || "(no output)" };
+}
+
+// ---------------------------------------------------------------------------
+// "COMPLETE THIS TICKET" - the Ticket Console magic button (owner, 2026-10-15).
+//
+//   readonly - investigate read-only, report, and propose the rule + procedures. Never fixes.
+//   fix      - the same, plus the REVIEWED actions of the subject that matched. The BUTTON is
+//              the authorisation: a person pressed it, so their identity is in approval.by. The
+//              reusable rule/procedures it produces are NOT saved here - Django's approve
+//              endpoint is the second, separate approval.
+//
+// A completion run never emails the customer and never closes the ticket. It is an investigation
+// the console shows; `propose_completion` is how the session hands back the artifacts.
+// ---------------------------------------------------------------------------
+const COMPLETION_RULE_LANGUAGE = `
+RULE LANGUAGE (the same one the rule editor uses - never invent a verb or condition):
+  conditions: procedure_cause {procedure} | probe_confirms {procedure} | details_sufficient |
+              cause_known | fix_verified | customer_replied | requester_is_support_contact |
+              approved_by_support_contact | fixed_recently {minutes} | nothing_matched
+  actions:    investigate | verify_fix {procedure} | fix_procedure {procedure} |
+              run_script {name} | reply_customer | note_ticket | close_ticket |
+              hand_to_human | wait_customer | stop
+A rule is {"blocks":[{"if":{"condition":"...","args":{}},"then":[{"action":"...","args":{}}],
+"else":[{"action":"hand_to_human","args":{}}]}]}. A run_script names an action in fix_actions.
+Every branch must end in close_ticket, hand_to_human, wait_customer or stop. The approval gate
+and the final stop are added for you - never write them.
+`;
+
+async function runTicketCompletion(blob) {
+  const ticketRef = blob.ticket_ref || "";
+  const runId = blob.run_id || "";
+  const mode = blob.mode === "fix" ? "fix" : "readonly";
+  const ctx = blob.context || {};
+  const subj = blob.subject || {};
+
+  // Live progress -> redis, polled by the console. Same shape as pi_run:<id>.
+  const live = { status: "running", mode, started: new Date().toISOString(), events: [] };
+  async function pushLive(ev) {
+    live.events.push({ t: new Date().toISOString(), ...ev });
+    if (live.events.length > 400) live.events.shift();
+    if (runId) { try { await redis.set(`pi_completion:${runId}`, JSON.stringify(live), "EX", 7200); } catch { /* best effort */ } }
+  }
+
+  const plan = mode === "fix" ? rulePlan(subj, { ...blob, fix_allowed: blob.fix_allowed !== false }) : null;
+  const fixActions = plan ? plan.scripts : [];
+  await pushLive({ type: "status", text: mode === "fix"
+    ? `Fix run on ${ticketRef} - ${fixActions.length} reviewed action(s) available`
+    : `Read-only run on ${ticketRef} - nothing will be changed` });
+
+  const keys = mergeGroupKeys({ [blob.provider]: blob.api_key }, blob);
+  const rt = await piRuntime(keys);
+  const { groupState, model: groupModel, orchestrator } = await applyHeadlessGroup(blob, rt, log);
+  const model = groupModel || rt.findModel(blob.provider, blob.model_id);
+  if (!model) return { error: `Model not found: ${groupModel ? "group orchestrator" : `${blob.provider}/${blob.model_id}`}` };
+
+  const gate = async (kind) => ({ ok: false, reason: kind === "device"
+    ? (mode === "fix"
+        ? "free-form device changes are refused: use apply_fix with one of this subject's reviewed actions."
+        : "this is a read-only run - start a Fix & Report run to change anything.")
+    : "a completion run does not contact the customer or close the ticket; the report is for the technician." });
+
+  const { tools, hd, hdError } = buildDecisionTools({
+    helpdeskApi: blob.helpdesk_api || null, helpdeskCode: blob.helpdesk_code || "", ticketRef, gate,
+    surface: "auto_resolve", allowedTickets: [ticketRef],
+  });
+  if (!hd) return { error: `helpdesk.js failed to load: ${hdError}` };
+
+  // ---- the artifacts the session hands back --------------------------------
+  const artifacts = { summary: "", verdict: {}, procedures: [], rule: {} };
+  const propose_completion = defineTool({
+    name: "propose_completion",
+    label: "Propose completion",
+    description:
+      "Finish EXACTLY ONCE with: the outcome, the reusable procedures this ticket taught you, and " +
+      "an automation rule for future tickets of this kind. Nothing is saved until a technician approves it.",
+    parameters: Type.Object({
+      summary: Type.String({ description: "what you found and did, one paragraph" }),
+      kind: Type.String({ description: "e.g. service_down, access_request, config_change, unclear" }),
+      confidence: Type.Union([Type.Literal("confident"), Type.Literal("unsure")]),
+      findings: Type.Array(Type.String({ description: "checkable evidence, one per item" })),
+      procedures: Type.Optional(Type.Array(Type.Object({
+        title: Type.String(),
+        category: Type.Optional(Type.String()),
+        applies_to: Type.Optional(Type.String({ description: "space-separated matching keywords" })),
+        symptom: Type.Optional(Type.String()),
+        root_cause: Type.Optional(Type.String()),
+        fix: Type.Optional(Type.String()),
+        verification: Type.Optional(Type.String()),
+      }), { description: "reusable procedures this run created or relied on" })),
+      rule: Type.Optional(Type.Object({
+        name: Type.String(),
+        description: Type.Optional(Type.String()),
+        mode: Type.Optional(Type.Union([Type.Literal("advise"), Type.Literal("device_readonly"), Type.Literal("device_fix")])),
+        match: Type.Optional(Type.Object({
+          subject_regex: Type.Optional(Type.String()),
+          body_any: Type.Optional(Type.Array(Type.String())),
+          body_all: Type.Optional(Type.Array(Type.String())),
+          body_none: Type.Optional(Type.Array(Type.String())),
+        })),
+        statements: Type.Optional(Type.Object({}, { additionalProperties: true,
+          description: "the IF/THEN/ELSE rule tree (see the rule language in the system prompt)" })),
+        fix_actions: Type.Optional(Type.Array(Type.Object({
+          name: Type.String(),
+          shell: Type.Optional(Type.String()),
+          command: Type.String(),
+          what: Type.Optional(Type.String()),
+          safety: Type.Optional(Type.Union([Type.Literal("read"), Type.Literal("restart"), Type.Literal("update"), Type.Literal("mutating")])),
+          timeout: Type.Optional(Type.Number()),
+          wait: Type.Optional(Type.Number()),
+        }))),
+      })),
+    }),
+    execute: async (_id, p) => {
+      artifacts.summary = String(p.summary || "").slice(0, 6000);
+      artifacts.verdict = {
+        kind: String(p.kind || "").slice(0, 40), confidence: p.confidence,
+        findings: (p.findings || []).map((x) => String(x).slice(0, 400)).slice(0, 12),
+      };
+      artifacts.procedures = Array.isArray(p.procedures) ? p.procedures.slice(0, 6) : [];
+      artifacts.rule = (p.rule && typeof p.rule === "object") ? p.rule : {};
+      return { content: [{ type: "text", text: "Recorded. Stop now - a technician will review and approve." }], details: {} };
+    },
+  });
+
+  // ---- apply_fix (fix mode only) ------------------------------------------
+  const fixLog = [];
+  let fixAttempted = false;
+  let fixBroken = null;
+  let apply_fix = null;
+  if (mode === "fix" && fixActions.length) {
+    apply_fix = defineTool({
+      name: "apply_fix",
+      label: "Apply the reviewed fix",
+      description:
+        "Run ONE of this subject's reviewed actions, by name: " +
+        fixActions.map((a) => `'${a.name}'${a.what ? ` (${a.what})` : ""}`).join(", ") +
+        ". Or 'all' to run them in order. Quote the read-only evidence that authorises it. " +
+        "A fix may run once per run. PROBE AGAIN afterwards and report what you found.",
+      parameters: Type.Object({
+        action: Type.String({ description: "the action name, or 'all'" }),
+        evidence: Type.String({ description: "the read-only result that shows the fault, quoted" }),
+        params: Type.Optional(Type.Record(Type.String(), Type.String())),
+      }),
+      execute: async (_id, p) => {
+        if (fixAttempted) return { content: [{ type: "text", text: "A fix has already been run. Probe, then propose_completion." }], details: {} };
+        const ev = String(p.evidence || "").trim();
+        if (ev.length < 20) return { content: [{ type: "text", text: "Refused: quote the read-only evidence that authorises this fix." }], details: {} };
+        const want = String(p.action || "").trim().toLowerCase();
+        const chosen = want === "all" ? fixActions : fixActions.filter((a) => String(a.name).toLowerCase() === want);
+        if (!chosen.length) return { content: [{ type: "text", text: `No such action. Available: ${fixActions.map((a) => a.name).join(", ")}, or 'all'.` }], details: {} };
+        const given = (p.params && typeof p.params === "object") ? p.params : {};
+        const validateValue = (decl, raw) => {
+          const v = raw === undefined || raw === null ? "" : String(raw).trim();
+          if (!v) return decl.required === false ? { ok: true, value: "" } : { ok: false, why: `no value for '${decl.name}'` };
+          if (decl.type === "email") { if (!/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(v)) return { ok: false, why: `'${decl.name}' is not an email address` }; }
+          else if (decl.type === "person") { const asEmail = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(v); const asName = /^[A-Za-z0-9 .'\-]{2,80}$/.test(v); if (!asEmail && !asName) return { ok: false, why: `'${decl.name}' must be a name or an address` }; }
+          else if (decl.type === "choice") { if (!(decl.choices || []).includes(v)) return { ok: false, why: `'${decl.name}' must be one of ${(decl.choices || []).join(", ")}` }; }
+          else if (decl.type === "int") { if (!/^-?\d{1,9}$/.test(v)) return { ok: false, why: `'${decl.name}' must be a number` }; }
+          else if (decl.type === "ticket_ref") { if (!/^TICKET\/\d{1,9}$/.test(v)) return { ok: false, why: `'${decl.name}' must look like TICKET/123` }; }
+          else if (decl.type === "text") { if (!/^[A-Za-z0-9 ,.;:()\/_-]{1,300}$/.test(v)) return { ok: false, why: `'${decl.name}' may only contain plain text` }; }
+          else return { ok: false, why: `'${decl.name}' has type '${decl.type}', which cannot be passed safely` };
+          return { ok: true, value: v };
+        };
+        const planParams = new Map();
+        for (const act of chosen) {
+          const decls = Array.isArray(act.params) ? act.params : [];
+          const values = {};
+          for (const decl of decls) {
+            const r = validateValue(decl, given[decl.name]);
+            if (!r.ok) return { content: [{ type: "text", text: `Refused: "${act.name}" needs a value I will not guess - ${r.why}.` }], details: {} };
+            if (r.value) values[decl.name] = r.value;
+          }
+          planParams.set(act.name, values);
+        }
+        fixAttempted = true;
+        const agentId = String(subj.fix_agent_id || blob.fix_agent_id || "");
+        if (!agentId) return { content: [{ type: "text", text: "No target device is pinned on this subject; nothing safe to run on." }], details: {} };
+        const out = [];
+        const readResult = (res) => {
+          if (typeof res === "string") return { text: res, code: null };
+          const o = res && typeof res === "object" ? res : {};
+          const raw = o.retcode !== undefined ? o.retcode : (o.exit_code !== undefined ? o.exit_code : null);
+          return { text: String(o.output ?? o.stdout ?? (o.stderr ? `stderr: ${o.stderr}` : "") ?? JSON.stringify(o)), code: raw === null ? null : Number(raw) };
+        };
+        for (const act of chosen) {
+          const started = Date.now();
+          const vals = planParams.get(act.name) || {};
+          let cmdToRun = act.command;
+          if (Object.keys(vals).length) {
+            if (String(act.shell || "powershell").toLowerCase() !== "powershell") return { content: [{ type: "text", text: `Refused: "${act.name}" declares parameters and only powershell supports them so far.` }], details: {} };
+            const args = Object.entries(vals).map(([k, v]) => `-${k} '${v}'`).join(" ");
+            const b64 = Buffer.from(String(act.command), "utf8").toString("base64");
+            cmdToRun = `$f = Join-Path $env:TEMP 'pi-reviewed-action.ps1'; [IO.File]::WriteAllBytes($f, [Convert]::FromBase64String('${b64}')); & $f ${args}`;
+          }
+          let res; let threw = false;
+          await pushLive({ type: "tool_start", tool: `apply_fix:${act.name}`, args: JSON.stringify(vals).slice(0, 300) });
+          try { res = await trmm.sendCmd(agentId, { shell: act.shell || "powershell", cmd: cmdToRun, timeout: Number(act.timeout || 300) }); }
+          catch (e) { res = `FAILED: ${String(e?.message || e).slice(0, 300)}`; threw = true; }
+          const rr = readResult(res);
+          const line = { action: act.name, ms: Date.now() - started, output: rr.text.slice(0, 1500), retcode: rr.code };
+          fixLog.push(line);
+          out.push(`--- ${act.name} (${line.ms} ms${rr.code === null ? "" : `, exit ${rr.code}`})\n${line.output}`);
+          await pushLive({ type: "tool_end", tool: `apply_fix:${act.name}`, isError: threw, result: rr.text.slice(0, 600) });
+          log("ticket_completion_fix", ticketRef, act.name, `on ${agentId.slice(0, 8)}`);
+          const broken = threw || (rr.code !== null && rr.code !== 0) || /^FAILED:/i.test(rr.text.trim()) || /\bRESULT:\s*FAIL/i.test(rr.text);
+          if (broken) {
+            fixBroken = { action: act.name, retcode: rr.code, output: line.output, ms: line.ms };
+            out.push(`\nSTOP. The reviewed action "${act.name}" FAILED. Do not retry or invent a replacement. Call propose_completion with confidence='unsure' and say plainly that it failed.`);
+            break;
+          }
+          if (act.wait) await new Promise((r) => setTimeout(r, Math.min(Number(act.wait) * 1000, 30000)));
+        }
+        return { content: [{ type: "text", text: `Ran ${chosen.length} reviewed action(s). PROBE AGAIN, then propose_completion.\n\n${out.join("\n\n")}` }], details: { actions: chosen.map((a) => a.name) } };
+      },
+    });
+  }
+
+  const completionTools = [...tools, propose_completion];
+  if (apply_fix) completionTools.push(apply_fix);
+
+  const loader = new DefaultResourceLoader({
+    agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
+    systemPromptOverride: () =>
+      `You are Pi, asked by a technician to COMPLETE helpdesk ticket ${ticketRef} from the Ticket Console.\n` +
+      `Mode: ${mode === "fix" ? "FIX & REPORT - you MAY run this subject's reviewed fixes" : "READ-ONLY & REPORT - you may NOT change anything"}.\n` +
+      `Client: ${ctx.client || "(unknown)"}; Device: ${ctx.affected_device || "(unknown)"}; Summary: ${ctx.summary || ""}\n` +
+      (blob.prior_findings ? `A previous READ-ONLY pass found:\n${String(blob.prior_findings).slice(0, 4000)}\n` : "") +
+      `RULES:\n` +
+      `- Investigate the device and the ticket with READ-ONLY tools first.\n` +
+      (mode === "fix"
+        ? `- You may then run ONE reviewed fix via apply_fix (${fixActions.length ? fixActions.map((a) => a.name).join(", ") : "none attached - propose a rule instead"}), quoting your evidence. Probe again after it.\n`
+        : `- You may NOT run apply_fix or any changing command. If a fix is warranted, say exactly what it would be - the technician can start a Fix & Report run.\n`) +
+      `- NEVER email the customer and NEVER close or cancel the ticket. The console shows your report; a human acts on it.\n` +
+      `- Finish by calling propose_completion EXACTLY ONCE: your outcome, the procedures this taught you, and an automation rule for future tickets of this kind.\n` +
+      COMPLETION_RULE_LANGUAGE + "\n" +
+      (String(blob.decision_prompt || "").trim() || DEFAULT_DECISION_POLICY) + TOTP_POLICY +
+      helpdeskSection(blob, ctx.client) + procedureSection(blob),
+  });
+  await loader.reload();
+  const { session } = await createAgentSession({
+    model, thinkingLevel: blob.thinking_level || "medium", ...rt.sessionOpts,
+    noTools: "builtin", customTools: completionTools, resourceLoader: loader,
+    sessionManager: SessionManager.inMemory(), agentDir: CONFIG.sessionsRoot, cwd: CONFIG.sessionsRoot,
+  });
+  attachSpendLedger(session, {
+    surface: "resolve", log, key: ticketRef, ticketRef,
+    actorUsername: blob.username || blob.approval?.by || "",
+  });
+  let textBuf = "";
+  const unsub = session.subscribe((event) => {
+    if (event.type === "tool_execution_start") {
+      log("tool>", `completion:${runId || "-"}`, ticketRef, event.toolName, auditArgs(event.toolName, event.args));
+      pushLive({ type: "tool_start", tool: event.toolName, args: event.args ? JSON.stringify(event.args).slice(0, 300) : "" });
+    } else if (event.type === "tool_execution_end") {
+      const t = (event.result?.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+      pushLive({ type: "tool_end", tool: event.toolName, isError: !!event.isError, result: (t || "").slice(0, 600) });
+    } else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+      textBuf += event.assistantMessageEvent.delta;
+    } else if (event.type === "message_end") {
+      if (textBuf.trim()) { pushLive({ type: "text", text: textBuf.trim().slice(0, 1000) }); textBuf = ""; }
+    }
+  });
+  let runError = null;
+  try {
+    await session.prompt(
+      `Work ticket ${ticketRef} now in ${mode} mode. Investigate, ${mode === "fix" ? "apply a reviewed fix if the evidence supports it, " : ""}then call propose_completion once.`);
+  } catch (e) {
+    runError = apiErrorMessage(e);
+  }
+  unsub();
+  const output = session.messages
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => (m.content || []).filter((c) => c.type === "text").map((c) => c.text))
+    .join("\n").trim();
+  session.dispose();
+
+  live.status = runError ? "error" : "done";
+  live.summary = artifacts.summary || output.slice(0, 300);
+  await pushLive({ type: "done", text: live.summary || "Finished" });
+  log("ticket_completion", ticketRef, `mode=${mode} kind=${artifacts.verdict?.kind || "?"} conf=${artifacts.verdict?.confidence || "?"} procedures=${artifacts.procedures.length} rule=${artifacts.rule && artifacts.rule.statements ? "yes" : "no"} fix=${fixLog.length}`);
+  return {
+    output: output || "(no output)",
+    mode,
+    summary: artifacts.summary,
+    verdict: artifacts.verdict,
+    artifacts: { procedures: artifacts.procedures, rule: artifacts.rule },
+    fix_applied: fixLog.map((f) => f.action),
+    fix_log: fixLog,
+    fix_broken: fixBroken ? { action: fixBroken.action, retcode: fixBroken.retcode } : null,
+    error: runError || undefined,
+    events: live.events,
+  };
 }
 
 // Render a clean, readable internal note (HTML) instead of one dense run-on line:
@@ -6013,6 +6427,23 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // Ticket Console "Complete this ticket" (magic button): read-only or fix, live progress, and
+  // the proposed rule + procedures for a person to approve.
+  if (url.pathname === "/pi/ticket-completion" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      try {
+        const result = await runTicketCompletion(JSON.parse(body || "{}"));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: apiErrorMessage(e) }));
+      }
+    });
+    return;
+  }
   // AI Procedures miner: distill reusable procedures from recently-closed tickets.
   if (url.pathname === "/pi/mine-procedures" && req.method === "POST") {
     let body = "";
@@ -6371,7 +6802,7 @@ const server = http.createServer(async (req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      let out = { ok: true, applied: 0 };
+      let out = { ok: true, applied: 0, held: 0 };
       try {
         const d = JSON.parse(body || "{}");
         const username = String(d.username || "").toLowerCase();
@@ -6381,26 +6812,65 @@ const server = http.createServer(async (req, res) => {
         const granted = Array.isArray(d.caps_granted) ? d.caps_granted : [];
         // Optional: turn the switches ON for the session while granting them.
         const state = d.apply_state && typeof d.apply_state === "object" ? d.apply_state : {};
-        for (const [, hub] of LIVE) {
-          if (typeof hub.applyCaps !== "function") continue;
-          const key = String(hub.key || "");
+        // One hub can sit under several keys (aliases): visit each once.
+        for (const hub of new Set(LIVE.values())) {
+          if (!hub || hub.disposed || typeof hub.applyCaps !== "function") continue;
+          // Hub keys are `<scope>::<sessionId>` (liveKey) - compare the SCOPE. Comparing the whole
+          // key is why every grant used to report "0 live window(s)" and never reached the chat.
+          const scope = liveScope(hub.key);
           // Which window does this grant cover? decision:<ticket>, or the device chat's agent id.
           const matches =
             kind === "all"
-            || (kind === "ticket" && key.startsWith("decision:") && key.slice(9).toLowerCase() === ref.toLowerCase())
-            || (kind === "device" && !key.startsWith("decision:") && key === ref);
+            || (kind === "ticket" && scope.startsWith("decision:") && scope.slice(9).toLowerCase() === ref.toLowerCase())
+            || (kind === "device" && !scope.startsWith("decision:") && scope === ref);
           if (!matches) continue;
-          const who = String(hub.presence?.owner?.username || "").toLowerCase();
-          const mine = [...(hub.presence?.members?.values?.() || [])].some((m) => String(m?.username || "").toLowerCase() === username);
-          if (!mine && who !== username) continue;      // not this user's window
-          hub.applyCaps(perms, granted, state);
-          out.applied += 1;
+          const p = hub.presence || {};
+          const who = String(p.owner?.username || "").toLowerCase();
+          const been = [...(p.members?.values?.() || [])].some((m) => String(m?.username || "").toLowerCase() === username)
+            || !!p.history?.has?.(username) || !!p.grants?.has?.(username);
+          if (!been && who !== username) continue;      // not this user's window
+          // Remember it as THEIR permission (it follows them through seat changes)...
+          hub.notePerms?.(username, perms, granted, who === username ? null : state);
+          if (who === username) {
+            // ...and they are driving: it applies now.
+            hub.applyCaps(perms, granted, state);
+            out.applied += 1;
+          } else {
+            // ...not driving: held, applied the moment they take the seat (live-hub.js).
+            out.held += 1;
+          }
         }
-        log("caps_push", username, kind, ref || "-", `${out.applied} live window(s)`);
+        log("caps_push", username, kind, ref || "-", `${out.applied} live window(s), ${out.held} held until they drive`);
       } catch (e) {
         out = { ok: false, error: String(e?.message || e) };
       }
       res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(out));
+    });
+    return;
+  }
+  // AI DESKTOP CONTROL SWITCHED (2026-10-19). The RMM has just switched the Operator on or off
+  // for one computer (tacticalrmm core/operator_machines.py); every live chat about that computer
+  // gains or loses the desktop tools now. Body: {agent_id, enabled, by, machine:{...}}.
+  if (url.pathname === "/pi/desktop" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let out = { ok: true, applied: 0 };
+      try {
+        const d = JSON.parse(body || "{}");
+        const agentId = String(d.agent_id || "");
+        if (!agentId) throw new Error("agent_id required");
+        for (const hub of new Set(LIVE.values())) {
+          if (!hub || hub.disposed || typeof hub.applyDesktop !== "function") continue;
+          if (!hub.desktopMachine?.(agentId)) continue;
+          if (hub.applyDesktop(agentId, !!d.enabled, d.machine || null, String(d.by || ""))) out.applied += 1;
+        }
+        log("desktop_push", agentId, d.enabled ? "on" : "off", `by ${d.by || "?"}`, `${out.applied} live window(s)`);
+      } catch (e) {
+        out = { ok: false, error: String(e?.message || e) };
+      }
+      res.writeHead(out.ok ? 200 : 400, { "Content-Type": "application/json" });
       res.end(JSON.stringify(out));
     });
     return;
@@ -6638,3 +7108,14 @@ server.listen(CONFIG.port, CONFIG.host, async () => {
     log("models_prune error", String(e?.message || e));
   }
 });
+
+// AN ANSWER IS NOT A NEW TASK. When the assistant has asked the technician a question (a queue
+// pause, or a question waiting in the queue), the next chat message is the reply to it, and a
+// summary must never run in front of that reply. TICKET/60427, 2026-10-08: the tech answered a
+// pause question and an auto-summary started ahead of the answer; the tech had to cancel it.
+// Summaries still happen before a genuinely new task (beforePrompt). Covers the queue's own
+// answer wrapper too.
+function answersOpenQuestion(text, queue) {
+  if (String(text || "").startsWith("(Answering your question:")) return true;
+  try { return (queue?.state?.().questions || []).length > 0; } catch { return false; }
+}

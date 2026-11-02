@@ -23,6 +23,7 @@ import path from "node:path";
 import { CONFIG } from "./config.js";
 import { makeCostMeter } from "./cost-meter.js";
 import { ledgerSink } from "./spend-ledger.js";
+import { readDocumentText } from "./doc-link.js";
 
 // 2 (2026-09-27): one key can reach SEVERAL groups. whoami returns `groups: [...]` (was
 // `group: {...}`) and /stream takes `group` (the slug) alongside `role`.
@@ -304,6 +305,32 @@ export function makeRelay({ log = () => {}, piRuntime, verify = djangoVerify, le
     }
   }
 
+  // DOCUMENT READ (owner, 2026-11-02). A relay client (a laptop, another server) may be asked to
+  // read a SharePoint/OneDrive link. The provider keys and the M365 app credentials live HERE, so
+  // the document is fetched by the bridge and only the text crosses the wire. Same auth, same
+  // ledger, same log line every other relay action leaves.
+  async function readDocument(auth, req, res) {
+    let body;
+    try {
+      body = JSON.parse(await readBody(req, 64 * 1024));
+    } catch (e) {
+      json(res, e?.status === 413 ? 413 : 400, { ok: false, error: e?.status === 413 ? "request too large" : "invalid JSON body" });
+      return;
+    }
+    const url = String(body?.url || "").trim();
+    if (!url) { json(res, 400, { ok: false, error: "url is required" }); return; }
+    const offset = Math.max(0, Number(body?.offset || 0) || 0);
+    try {
+      const r = await readDocumentText(url, { offset });
+      log("relay_document", auth.user?.username || "?", auth.key?.key_id || "-", url.slice(0, 200),
+          r.ok ? `${r.totalChars || 0} chars` : `failed: ${String(r.error || "").slice(0, 140)}`);
+      json(res, 200, r);
+    } catch (e) {
+      log("relay_document_error", auth.user?.username || "?", String(e?.message || e).slice(0, 200));
+      json(res, 500, { ok: false, error: String(e?.message || e).slice(0, 300) });
+    }
+  }
+
   function serveClient(url, res) {
     const files = {
       "/client/index.ts": ["index.ts", "text/plain; charset=utf-8"],
@@ -341,6 +368,7 @@ export function makeRelay({ log = () => {}, piRuntime, verify = djangoVerify, le
       if (!auth) return true;
       if (url.pathname === `${PREFIX}/whoami` && req.method === "GET") { await whoami(auth, res); return true; }
       if (url.pathname === `${PREFIX}/stream` && req.method === "POST") { await stream(auth, req, res); return true; }
+      if (url.pathname === `${PREFIX}/document` && req.method === "POST") { await readDocument(auth, req, res); return true; }
       json(res, 404, { error: "Unknown relay endpoint." });
     } catch (e) {
       log("relay_error", "-", String(e?.message || e).slice(0, 300));

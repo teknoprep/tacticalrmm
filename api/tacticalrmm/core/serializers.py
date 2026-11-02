@@ -13,6 +13,7 @@ from .models import (
     AIProvider,
     AITask,
     AITicketAutomationSubject,
+    AITicketCompletion,
     AITaskRun,
     BulkAICommand,
     CodeSignToken,
@@ -706,6 +707,32 @@ class BulkAICommandSerializer(serializers.ModelSerializer):
             extra.append(obj.os_type)
         return base + (f" ({', '.join(extra)})" if extra else "")
 
+class AITicketCompletionSerializer(serializers.ModelSerializer):
+    """One "Complete this ticket" run, for the console. Read-only; every mutation goes through the
+    start / approve / decline endpoints."""
+
+    subject_name = serializers.CharField(source="subject.name", read_only=True, default="")
+    rule_english = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AITicketCompletion
+        fields = (
+            "id", "ticket_ref", "mode", "status", "started_by", "run_id", "subject", "subject_name",
+            "summary", "verdict", "events", "fix_applied", "fix_broken", "proposed_procedures", "proposed_rule",
+            "applied_procedure_ids", "applied_subject_id", "error_detail", "created", "updated",
+            "rule_english",
+        )
+
+    def get_rule_english(self, obj) -> list:
+        try:
+            from core.ai_rules import english
+
+            statements = (obj.proposed_rule or {}).get("statements") or {}
+            return english(statements) if statements.get("blocks") else []
+        except Exception:
+            return []
+
+
 class AIReportScheduleSerializer(serializers.ModelSerializer):
     cadence_display = serializers.SerializerMethodField()
     kind_display = serializers.SerializerMethodField()
@@ -754,4 +781,56 @@ class AITicketAutomationSubjectSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors[:8])
         return with_defaults(clean) if clean else {}
+
+    def validate(self, attrs):
+        """RUN_SCRIPT NAMES AN ATTACHED ACTION (owner, 2026-10-06).
+
+        A saved rule never carries the command body: `bind_run_scripts` folds any inline `script`
+        into the subject's Reviewed actions and leaves the rule naming it, so the rule stays short
+        and the command has one home. A run_script that names neither an attached action nor an
+        inline body cannot run, so it is rejected here rather than saved and ignored at run time.
+        """
+        from core.ai_rules import bind_run_scripts, unbound_run_scripts
+
+        statements = attrs.get("statements", getattr(self.instance, "statements", None))
+        actions = attrs.get("fix_actions", getattr(self.instance, "fix_actions", None))
+        if isinstance(statements, dict) and statements.get("blocks"):
+            bound, actions, _added, changed = bind_run_scripts(statements, actions)
+            missing = unbound_run_scripts(
+                bound, [a.get("name") for a in (actions or []) if isinstance(a, dict)])
+            if missing:
+                raise serializers.ValidationError({"statements": missing[:8]})
+            if changed:
+                attrs["statements"] = bound
+                attrs["fix_actions"] = actions
+        return attrs
+
+    def validate_fix_actions(self, value):
+        """Every reviewed action declares HOW DESTRUCTIVE IT IS (owner, 2026-10-15).
+
+        A class is what lets code decide whether the approval gate may be skipped for this
+        action, so it is not optional and it is not free text: an unknown value is rejected
+        rather than quietly treated as safe, and an action that says nothing is stored as
+        `mutating` (the fail-closed default). The command body and its class are reviewed
+        together by the person who saves the action, which is the whole safety argument.
+        """
+        from core.ai_rules import ACTION_SAFETY_IDS, DEFAULT_ACTION_SAFETY
+
+        if value in (None, []):
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError("fix_actions must be a list")
+        out = []
+        for i, a in enumerate(value):
+            if not isinstance(a, dict):
+                raise serializers.ValidationError(f"fix_actions[{i}] is not an object")
+            a = dict(a)
+            cls = str(a.get("safety") or "").strip().lower()
+            if cls and cls not in ACTION_SAFETY_IDS:
+                raise serializers.ValidationError(
+                    f"fix_actions[{i}] '{a.get('name') or ''}': safety must be one of "
+                    f"{', '.join(sorted(ACTION_SAFETY_IDS))} (it changes what may run without approval)")
+            a["safety"] = cls or DEFAULT_ACTION_SAFETY
+            out.append(a)
+        return out
 

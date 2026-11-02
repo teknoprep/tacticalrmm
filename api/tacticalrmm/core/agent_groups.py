@@ -308,6 +308,8 @@ AGENT_SURFACES = [
      "hint": "The accuracy audit and the per-technician narratives."},
     {"key": "daily", "label": "Daily ticket report",
      "hint": "The written summary at the top of the daily report."},
+    {"key": "odoo", "label": "ERP (Odoo) chat",
+     "hint": "The AI panel in Odoo (quotes, opportunities, invoices), unless the user picks a model."},
 ]
 AGENT_SURFACE_KEYS = [s["key"] for s in AGENT_SURFACES]
 
@@ -615,6 +617,16 @@ def apply_group(blob: dict, request, chosen):
         }
     except Exception:
         blob["summarize_by_model"] = {}
+    # Who writes the auto-summary for a chat on a single model (no group). None = not configured.
+    try:
+        from core.models import CoreSettings
+
+        cs = CoreSettings.objects.first()
+        prov = (getattr(cs, "ai_default_summarizer_provider", "") or "").strip()
+        mid = (getattr(cs, "ai_default_summarizer_model_id", "") or "").strip()
+        blob["default_summarizer"] = {"provider": prov, "model_id": mid} if prov and mid else None
+    except Exception:
+        blob["default_summarizer"] = None
     blob["group_requested"] = "group_id" in (getattr(request, "data", None) or {})
     if not group:
         return chosen

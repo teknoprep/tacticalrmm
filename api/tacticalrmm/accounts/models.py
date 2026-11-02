@@ -202,6 +202,16 @@ class Role(BaseAuditModel):
     # Without this permission the sales tool is not merely gated - it is never built, so
     # the model cannot see it or mention it. Superusers always have it.
     can_use_ai_sales = models.BooleanField(default=False)
+    # Switch AI DESKTOP CONTROL (the Pi AI Operator: real screen, mouse and keyboard) ON or OFF
+    # for a computer, from that computer's AI chat hamburger. Until 2026-10-19 the only way to
+    # add a machine was the allowlist in Global Settings, so in practice exactly one computer
+    # could ever be driven. The list is still the single source of truth
+    # (CoreSettings.ai_operator_allowed_agent_ids) - this permission is who may edit it from the
+    # chat, one computer at a time, for agents the role can already reach.
+    #
+    # An admin can also hand the switch to one technician for one device without changing their
+    # role (core/session_caps.py, capability "desktop"). Superusers always have it.
+    can_use_ai_desktop = models.BooleanField(default=False)
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )
