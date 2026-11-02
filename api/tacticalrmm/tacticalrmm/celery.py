@@ -157,6 +157,12 @@ app.conf.beat_schedule = {
         "task": "core.tasks.mine_ticket_procedures",
         "schedule": crontab(minute="*/30"),
     },
+    # Quick Support queue -> Teams. Self-gates on Global Settings > Quick Support.
+    "quick-support-teams-notify": {
+        "task": "core.tasks.quick_support_teams_notify",
+        "schedule": timedelta(seconds=15.0),
+        "options": {"expires": 14},
+    },
 }
 
 

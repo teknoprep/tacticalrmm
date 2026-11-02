@@ -5597,3 +5597,12 @@ def reconcile_ai_spend():
             )
         )
     return last
+
+
+# BlueCloud Quick Support queue -> Teams (see core/quick_support.py). Beat: every 15s.
+# Self-gates on Global Settings > Quick Support; a no-op (no MeshCentral call) while disabled.
+@app.task(ignore_result=True, soft_time_limit=30)
+def quick_support_teams_notify() -> None:
+    from core.quick_support import run_teams_notify
+
+    run_teams_notify()

@@ -135,3 +135,20 @@ if not (
     or getattr(settings, "DEMO", False)
 ):
     urlpatterns += (path("serverscript/test/", views.TestRunServerScript.as_view()),)
+
+# BlueCloud Quick Support tech entry (TICKET/63164) - see core/quick_support.py
+from .quick_support import (  # noqa: E402
+    QuickSupportConnect,
+    QuickSupportEntry,
+    QuickSupportRelease,
+    QuickSupportSessions,
+    QuickSupportTeamsTest,
+)
+
+urlpatterns += [
+    path("quick-support/", QuickSupportEntry.as_view()),
+    path("quick-support/sessions/", QuickSupportSessions.as_view()),
+    path("quick-support/sessions/<str:node>/connect/", QuickSupportConnect.as_view()),
+    path("quick-support/sessions/<str:node>/release/", QuickSupportRelease.as_view()),
+    path("quick-support/teams-test/", QuickSupportTeamsTest.as_view()),
+]

@@ -118,6 +118,10 @@ class CoreSettings(BaseAuditModel):
     open_ai_model = models.CharField(
         max_length=255, blank=True, default="gpt-3.5-turbo"
     )
+    # BlueCloud Quick Support queue: post each new help request to a Teams channel via a
+    # Power Automate "When a Teams webhook request is received" URL (see core/quick_support.py)
+    quick_support_teams_enabled = models.BooleanField(default=False)
+    quick_support_teams_webhook = models.TextField(blank=True, default="")
     # Pi.dev AI assistant module
     ai_module_enabled = models.BooleanField(default=False)
     ai_persist_history = models.BooleanField(default=True)
