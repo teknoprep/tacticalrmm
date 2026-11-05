@@ -2,6 +2,39 @@
 
 Written 2026-07-27. **Read this before running `~/update.sh`.**
 
+## 2026-11-05: 1.5.2 → 1.6.1. This is how it was done; repeat it next time
+
+We did **not** run `update.sh`. Instead: merge and test everything beside the live system, then do a
+scripted cutover (downtime was 3.5 min). Full record: `~/UPGRADE-v1.6.1-PLAN.md`; exact commands, including
+rollback: `~/prepared-v1.6.1/CUTOVER.md`. Use that file as the template for the next version.
+
+Current state: backend `/rmm` on **`feature/remote-proxy-v1.6.1`**, web `~/tacticalrmm-web` on
+**`feature/remote-proxy-v0.101.65`** (both on teknoprep). Python venv **3.12.13**, Node 24 (mesh only; the bridge and
+Operator use `~/.local/share/pi-node` v22), nats 2.15.1, MeshCentral 1.3.1, agent target 2.12.0.
+
+Lessons. Each of these would have bitten us:
+1. **Backend: merge, don't rebase.** `git merge vX` onto a copy of the feature branch (`git worktree add`).
+   1.6.1 had 7 conflicts, all "keep both". `core/models.py` is **CRLF upstream and LF here**, so it conflicts on
+   every line: take ours and re-add upstream's few lines by hand.
+2. **Migrations: our numbers collide, our names don't.** Fix with `makemigrations --merge` (empty merge nodes),
+   not renumbering. Then run `makemigrations --check`. Pin model `Meta`/`id` to what is in the DB rather than
+   letting Django "fix" drift with a schema-changing migration.
+3. **The venv trap.** Upstream moved to Python 3.12 in 1.5.2, but `update.sh` only rebuilds the venv when
+   `PIP_VER` changes, and we arrived at 1.5.2 by git merge, so we ran 1.5.2 on 3.11 for months. Debian 12 has no
+   python3.12 package, so compile it (`~/build-py312/build.sh`, about 4 min). Build a wheelhouse in advance and create the
+   venv **in place** at cutover: console-script shebangs hard-code the venv path, so a venv cannot be renamed.
+4. **Web: check ancestry first** (`git merge-base --is-ancestor <upstream-tag> HEAD`). Upstream web release tags
+   are standalone squashed commits, and our branch had been a parentless snapshot of 0.101.59, so the live UI
+   had silently lost upstream 0.101.60–64. Repair: re-parent the snapshot onto the tag it came from, rebase
+   onto the previous upstream release, then merge the new one. Re-add `dompurify` if upstream drops it.
+5. **Test in a sandbox, never against live services:** `~/rmm-161-sandbox.sh` (network namespace + private redis,
+   no NATS/internet, restored DB copy over the unix socket). Several modules hard-code `redis://HOST:6379`, so a
+   redis DB index cannot isolate them.
+6. `create_uwsgi_conf` rewrites app.ini. Our `harakiri = 960` survives only because `UWSGI_HARAKIRI = 960` is
+   now in `local_settings.py`.
+7. `delete_tokens` logs every user out. The bridge is unaffected because it uses an API key (`X-API-KEY`).
+8. `pibridge/setup.sh` always upgrades the pi SDK to latest (0.99.1 → 0.99.2 this time). Run `npm test` afterwards.
+
 Pinned state at time of writing:
 
 | Thing | Value |
