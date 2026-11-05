@@ -1178,3 +1178,29 @@ was impossible and a drag-selection was pulled out from under the mouse mid-copy
   keyboard resize only re-pins when it was already following.
 * Tested in `web/src/utils/scrollFollow.test.mjs` (`node --test`) - the app has no component
   test harness, which is exactly why the rule is a pure module.
+
+### The approval band is a summary, not the whole script (2026-11-05, owner)
+
+Asked for: "we need to approve this but it's so long i need a crazy big monitor to get it
+approved... we need to reduce what the command is when it's this long and just give a summary
+of what it's asking aproval for".
+
+An approval ask lands in one orange band at the bottom of the chat (PiChat.vue) and, through
+remote-room.js, on a phone. A 200-line PowerShell script pasted into it turns the band into a
+wall of text that pushes Approve off the screen - the opposite of what a prompt is for.
+
+* **`src/approval-text.js` → `compactAsk()`** keeps the asking line whole (what, which machine,
+  which shell), then as many WHOLE lines of the body as fit 600 chars / 6 lines, then an honest
+  `… [114 more lines, 5,944 more characters not shown - the whole thing is in the tool call in
+  the transcript above]`. Short asks pass through untouched, character for character.
+* **It never paraphrases.** A regex that decides "this one deletes mailboxes" is a summary that
+  can be wrong, and the person is approving the words on the screen - so the words shown are the
+  command's own, and what is hidden is stated. A cut also lands on a line boundary, never
+  mid-statement.
+* **The judge still sees everything.** Compaction happens at the frame (`requestApproval` in
+  server.js), *after* safety review and after the `gate()` judgement, so the reviewer cannot be
+  fed a summary; the verdict line is appended *after* the cut so it is never trimmed.
+* The device-chat ask became two paragraphs (`Run on device [bash]:` + blank line + command) so
+  the headline is protected the same way the ticket chat's already was.
+* `test/approval-text.test.mjs` pins all of it, including the one-liner case (no blank line, so
+  the body - and the cut inside its first line - is the whole ask).

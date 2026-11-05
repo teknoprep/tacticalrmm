@@ -1228,7 +1228,10 @@ export function buildTools({
           );
         }
       }
-      const ok = await gateFor(m, `Run on device [${shell}]: ${p.command}`);
+      // Two paragraphs on purpose: the first line is the asking line (what, on which machine,
+      // which shell) and stays whole when a long script is compacted for the approval band -
+      // see approval-text.js.
+      const ok = await gateFor(m, `Run on device [${shell}]:\n\n${p.command}`);
       if (!ok) return denied();
       // On Linux, self-terminate the command with `timeout` so a hung command
       // (e.g. a stuck Proxmox `qm list`/pmxcfs) returns promptly with partial

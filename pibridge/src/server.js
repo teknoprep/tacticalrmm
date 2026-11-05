@@ -28,6 +28,7 @@ import { makeTurnWatchdog } from "./turn-watchdog.js";
 import { notebookWriteAuthorisation, totpWriteAuthorisation } from "./authorisation.js";
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
 import { makeCompactCommand } from "./compaction.js";
+import { compactAsk } from "./approval-text.js";
 import { makeAutoCompact } from "./auto-compact.js";
 import { makeJudge, judgeDenialText, judgeLine } from "./judge.js";
 import { makeRunCost } from "./run-cost.js";
@@ -1173,7 +1174,11 @@ async function startChat(ws, blob) {
     // carries that delegation; a judge that could not decide sends it back to the person.
     if (autoApprove && blob.autoapprove_allowed && (!judge?.active() || verdict?.verdict === "approve")) return true;
     const id = randomUUID();
-    const ask = summary + judgeLine(verdict);
+    // The JUDGE just read `summary` in full - this is the copy the PERSON is shown, and a
+    // long command in one band is unreadable (see approval-text.js). The full text stays in
+    // the transcript's tool call, and the judge's own line is appended after the cut so it
+    // is never the part that gets trimmed.
+    const ask = compactAsk(summary) + judgeLine(verdict);
     return new Promise((resolve) => {
       pendingApprovals.set(id, resolve);
       pendingApprovals.asks.set(id, ask);
@@ -2569,11 +2574,15 @@ async function startDecisionChat(ws, blob) {
   const pendingApprovals = makePendingApprovals();
   function requestApproval(summary) {
     const id = randomUUID();
+    // Compacted HERE, at the frame, for the same reason as the device chat: a long command
+    // in a single approval band is unreadable. The judge (in gate(), above this) has already
+    // seen the whole `summary`, and the full text is still in the transcript's tool call.
+    const ask = compactAsk(summary);
     return new Promise((resolve) => {
       pendingApprovals.set(id, resolve);
-      pendingApprovals.asks.set(id, summary);
-      hub.send(JSON.stringify({ type: "approval_request", id, summary }));
-      remote?.onApprovalRequest(id, summary);
+      pendingApprovals.asks.set(id, ask);
+      hub.send(JSON.stringify({ type: "approval_request", id, summary: ask }));
+      remote?.onApprovalRequest(id, ask);
     });
   }
   // See the device chat: requestApproval closes over this before the binding can exist.
