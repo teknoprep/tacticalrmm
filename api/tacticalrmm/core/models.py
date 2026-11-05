@@ -1382,7 +1382,12 @@ class AIAutomationApproval(models.Model):
     created = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [models.Index(fields=["ticket_ref", "subject"])]
+        # name pinned to what migration 0137 created in the database (avoids a rename migration)
+        indexes = [
+            models.Index(
+                fields=["ticket_ref", "subject"], name="core_aiauto_ticket__7f1a3c_idx"
+            )
+        ]
 
 
 class AISessionCapability(models.Model):
@@ -2806,6 +2811,11 @@ class AITicketCompletion(models.Model):
     ids (what was actually saved when a person pressed Approve).
     """
 
+    # 0143 created this table with a bigint id; keep the model in step with the database
+    id = models.BigAutoField(
+        auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
+    )
+
     MODE = (("readonly", "Read-only and report"), ("fix", "Fix and report"))
     STATUS = (
         ("running", "Running"),
@@ -2852,7 +2862,12 @@ class AITicketCompletion(models.Model):
 
     class Meta:
         ordering = ["-created"]
-        indexes = [models.Index(fields=["ticket_ref", "-created"])]
+        # name pinned to what migration 0143 created in the database (avoids a rename migration)
+        indexes = [
+            models.Index(
+                fields=["ticket_ref", "-created"], name="core_aitick_ticket__7c1a2b_idx"
+            )
+        ]
 
     def __str__(self) -> str:
         return f"{self.ticket_ref} [{self.mode}/{self.status}]"
