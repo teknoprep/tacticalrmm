@@ -215,6 +215,7 @@ class Role(BaseAuditModel):
     ai_allowed_models = models.ManyToManyField(
         "core.AIModel", related_name="role_ai_models", blank=True
     )
+    can_use_file_browser = models.BooleanField(default=False)
 
     # core
     can_list_notes = models.BooleanField(default=False)
