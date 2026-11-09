@@ -40,8 +40,29 @@ class TunnelError(Exception):
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MESH_PORT = 4430
-RELAY_HOST = "127.0.0.1"
+def _mesh_relay_endpoint() -> tuple[str, int]:
+    """Host and port of MeshCentral's relay, for the TCP tunnel below.
+
+    These were hardcoded to 127.0.0.1:4430, which only held while the app and
+    MeshCentral shared a host. Under Docker the relay is its own container, so
+    127.0.0.1 points at the app's own loopback and every remote-proxy request
+    dies with "Proxy error: [Errno 111] Connection refused" (seen 2026-11-09).
+
+    MESH_WS_URL already carries the right endpoint (ws://trmm-prod-mesh:4430 in
+    the Docker stack), so read it from there and keep loopback as the fallback
+    for a single-host install.
+    """
+    from django.conf import settings as dj_settings
+
+    raw = str(getattr(dj_settings, "MESH_WS_URL", "") or "").strip()
+    if raw:
+        parsed = urllib.parse.urlparse(raw if "//" in raw else f"ws://{raw}")
+        if parsed.hostname:
+            return parsed.hostname, parsed.port or 4430
+    return "127.0.0.1", 4430
+
+
+RELAY_HOST, MESH_PORT = _mesh_relay_endpoint()
 SESSION_PREFIX = "webproxy:"
 SESSION_TTL = 60 * 60 * 4  # 4 hours
 HANDSHAKE_TIMEOUT = 25
