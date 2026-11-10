@@ -25,7 +25,7 @@ import { makeCostMeter, silentStopMessage, seedDesktopFromBranch } from "./cost-
 import { makeLlmRecovery } from "./llm-recovery.js";
 import { continueIfStalled } from "./stall-continue.js";
 import { makeAuthorizer, consultOnBlocked, askAuthorizerTool, continueIfAuthorized } from "./authorizer.js";
-import { credentialCommandTool } from "./credential-command.js";
+import { credentialCommandTool, passwordResetTool } from "./credential-command.js";
 import { makeTurnWatchdog } from "./turn-watchdog.js";
 import { notebookWriteAuthorisation, totpWriteAuthorisation } from "./authorisation.js";
 import { installStreamLiveness, makeTurnLiveness, runWithLiveness } from "./stream-liveness.js";
@@ -1265,6 +1265,19 @@ async function startChat(ws, blob) {
       const ok = await requestApproval(summary);
       const reason = judgeDenial || undefined; judgeDenial = "";
       return { ok, reason };
+    },
+  }));
+  // Password reset: the bridge generates the new value; only the driving technician sees it.
+  tools.push(passwordResetTool({
+    deviceGate: async (summary) => {
+      if (readonly) return { ok: false, reason: "the chat is in READ-ONLY mode - switch on Write mode to make device changes." };
+      const ok = await requestApproval(summary);
+      const reason = judgeDenial || undefined; judgeDenial = "";
+      return { ok, reason };
+    },
+    reveal: {
+      available: () => !!hub?.presence?.ownerSocket,
+      send: (frame) => { const ws = hub?.presence?.ownerSocket; if (ws) hub.sendTo(ws, frame); },
     },
   }));
   consultOnBlocked(tools, authorizerRef);
