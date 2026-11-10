@@ -139,3 +139,18 @@ export function loadHelpdesk(code, config, context) {
     apiKey: sandbox.helpdesk.apiKey,
   };
 }
+
+// Register the client's notebook values BEFORE a session starts. Without this, a password a
+// human pasted into a ticket is only known to the registry after the notebook has been read,
+// so the model could receive it first (see the ticket case in the gate tests).
+export async function warmSecrets(code, config, company) {
+  if (!company) return 0;
+  try {
+    const hd = loadHelpdesk(code, config);
+    if (!hd?.readNotebookValues) return 0;
+    await hd.readNotebookValues({ company_name: company, include_privileged: true }); // registers via the raw wrapper
+    return 1;
+  } catch {
+    return 0;
+  }
+}

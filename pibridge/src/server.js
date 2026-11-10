@@ -1,4 +1,5 @@
 import { createAgentSession } from "./session-guard.js";
+import { warmSecrets } from "./helpdesk-runtime.js";
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -4023,6 +4024,9 @@ async function runHeadless(blob) {
   if (!model) {
     return { status: "error", summary: `Model not found: ${blob.provider}/${blob.model_id}`, transcript: "" };
   }
+
+  // Credential gate: register the client's notebook values before the model sees anything.
+  await warmSecrets(blob.helpdesk_code || "", blob.helpdesk_api || null, blob.client || blob.company || "");
 
   // How technical a customer reply may be, declared per task by whoever authored it.
   // "none" (the default) means this run holds no customer-contact capability at all.
