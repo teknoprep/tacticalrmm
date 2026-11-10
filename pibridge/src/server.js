@@ -2156,9 +2156,9 @@ async function startChat(ws, blob) {
     try {
       await inTurn(async () => {
         if (session.isStreaming) {
-          await session.prompt(body, { streamingBehavior: "steer", images: imageBlocks });
+          await session.prompt(SECRETS.redact(body), { streamingBehavior: "steer", images: imageBlocks });
         } else {
-          await session.prompt(body, { images: imageBlocks });
+          await session.prompt(SECRETS.redact(body), { images: imageBlocks });
         }
         // prompt() resolves once the whole turn has settled (including the harness's own
         // retries), so this is the point at which we know a blank rejection ended it.
@@ -2171,7 +2171,7 @@ async function startChat(ws, blob) {
           session, log, key: agentId, sessionId: () => sessionId, stopped,
           notify: (t) => hub.send(JSON.stringify({ type: "system_note", text: t })),
           prompt: async (t) => {
-            await session.prompt(t);
+            await session.prompt(SECRETS.redact(t));
             while (recovery.pending && !stopped()) { if (!(await recovery.run(session))) break; }
           },
         });
@@ -3706,8 +3706,8 @@ async function startDecisionChat(ws, blob) {
     sendRunState();
     try {
       await inTurn(async () => {
-        if (session.isStreaming) await session.prompt(body, { streamingBehavior: "steer", images: imageBlocks });
-        else await session.prompt(body, { images: imageBlocks });
+        if (session.isStreaming) await session.prompt(SECRETS.redact(body), { streamingBehavior: "steer", images: imageBlocks });
+        else await session.prompt(SECRETS.redact(body), { images: imageBlocks });
         // See the device chat: re-run a blank provider rejection (or our own stall abort)
         // before telling the tech.
         while (recovery.pending && !stopped()) {
@@ -3718,7 +3718,7 @@ async function startDecisionChat(ws, blob) {
           session, log, key: histKey, sessionId: () => sessionId, stopped,
           notify: (t) => hub.send(JSON.stringify({ type: "system_note", text: t })),
           prompt: async (t) => {
-            await session.prompt(t);
+            await session.prompt(SECRETS.redact(t));
             while (recovery.pending && !stopped()) { if (!(await recovery.run(session))) break; }
           },
         });
