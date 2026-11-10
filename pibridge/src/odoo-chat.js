@@ -1,3 +1,4 @@
+import { createAgentSession } from "./session-guard.js";
 // odoo-chat.js - streaming chat for the Odoo `ai_pi_bridge` addon.
 //
 // Deliberately the SMALLEST of the three chat surfaces.
@@ -29,8 +30,7 @@
 import {
   SessionManager,
   DefaultResourceLoader,
-  createAgentSession,
-} from "@earendil-works/pi-coding-agent";
+  } from "@earendil-works/pi-coding-agent";
 import { CONFIG } from "./config.js";
 import { piRuntime } from "./pi-runtime.js";
 // Reuse the existing meter and spend ledger. AI costs money on this surface

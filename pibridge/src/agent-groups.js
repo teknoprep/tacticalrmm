@@ -1,3 +1,4 @@
+import { createAgentSession } from "./session-guard.js";
 // Agent Groups: a roster of specialist models sitting next to the orchestrator.
 //
 // The technician talks to ONE model (the orchestrator). That model can `delegate`
@@ -14,8 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { attachSpendLedger } from "./spend-ledger.js";
 import {
-  createAgentSession,
-  DefaultResourceLoader,
+    DefaultResourceLoader,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";

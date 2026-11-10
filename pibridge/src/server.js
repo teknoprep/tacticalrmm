@@ -1,3 +1,4 @@
+import { createAgentSession } from "./session-guard.js";
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -6,8 +7,7 @@ import { WebSocketServer } from "ws";
 import {
   SessionManager,
   DefaultResourceLoader,
-  createAgentSession,
-  defineTool,
+    defineTool,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CONFIG } from "./config.js";

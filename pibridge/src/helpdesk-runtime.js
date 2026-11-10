@@ -1,3 +1,4 @@
+import { registerNotebookSecrets } from "./secret-store.js";
 // Loads and runs the admin-authored "helpdesk.js" integration code that lives
 // in Global Settings (CoreSettings.ai_helpdesk_code). This is what makes the
 // ticketing layer BOTH deterministic (real code) AND system-agnostic (the code
@@ -114,8 +115,11 @@ export function loadHelpdesk(code, config, context) {
   const names = Object.keys(operations).filter((k) => typeof operations[k] === "function");
   if (!names.length) throw new Error("helpdesk.js defined no exports.operations functions");
   // The model-facing operations get the masked notebook read; the raw one stays server-side.
+  // Every raw notebook read registers its values with the secret registry, so anything the
+  // model later receives that carries one of them is redacted (see secret-store.js).
   const rawCredentials = typeof operations.get_partner_credentials === "function"
-    ? operations.get_partner_credentials.bind(operations) : null;
+    ? (async (args) => { const r = await operations.get_partner_credentials.call(operations, args); registerNotebookSecrets(r); return r; })
+    : null;
   const exposed = { ...operations };
   if (rawCredentials) {
     exposed.get_partner_credentials = async (args = {}) =>
