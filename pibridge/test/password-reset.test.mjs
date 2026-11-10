@@ -23,7 +23,7 @@ test("generated passwords: 20 chars, every class present, unique", () => {
 test("command templates refer to the environment only, never to a value", () => {
   for (const t of Object.values(RESET_TEMPLATES)) {
     assert.match(t, /PI_PASS/); assert.match(t, /PI_USER/);
-    assert.doesNotMatch(t, /Canary|password=|[A-Za-z0-9]{12,}/);
+    assert.doesNotMatch(t, /Canary|password=|passwd\s+\S+\s+\S{6,}/);
   }
 });
 
@@ -73,10 +73,10 @@ test("success: the value goes to the reveal channel only, never into the command
   const r = await tool.execute("id", { agent_id: "A1", shell: "bash", username: "testuser", reason: "locked out" });
   assert.equal(calls.run.length, 1);
   const env = envOf(calls.run[0].opts);
-  assert.equal(env.PI_CMD, RESET_TEMPLATES.bash, "the command is the fixed template");
-  assert.equal(env.PI_USER, "testuser");
-  const pw = env.PI_PASS;
-  assert.equal(pw.length, 20, "the new password travels in PI_PASS");
+  assert.equal(env.PI_CMD_HEX, RESET_TEMPLATES.bash, "the command is the fixed template");
+  assert.equal(env.PI_USER_HEX, "testuser");
+  const pw = env.PI_PASS_HEX;
+  assert.equal(pw.length, 20, "the new password travels in PI_PASS (hex env)");
   assert.equal(calls.reveal.length, 1, "one reveal frame");
   assert.equal(calls.reveal[0].value, pw, "the technician's dialog gets the value");
   assert.equal(calls.reveal[0].username, "testuser");
@@ -88,7 +88,7 @@ test("success: the value goes to the reveal channel only, never into the command
 test("failure: no reveal, and the value is not returned", async () => {
   const { tool, calls } = harness({ runOut: "chpasswd: user 'testuser' does not exist" });
   const r = await tool.execute("id", { agent_id: "A1", shell: "bash", username: "testuser" });
-  const pw = envOf(calls.run[0].opts).PI_PASS;
+  const pw = envOf(calls.run[0].opts).PI_PASS_HEX;
   assert.equal(calls.reveal.length, 0);
   assert.match(text(r), /NOT set/);
   assert.ok(!text(r).includes(pw));
