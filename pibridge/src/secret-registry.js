@@ -11,7 +11,14 @@
 // It cannot recognise a secret that was never registered. That is why registration happens
 // at the read site, not at the output site, and why outbound content is also DLP-checked.
 
+import { createHash } from "node:crypto";
+
 const MIN_LEN = 6; // shorter strings produce too many false positives to be useful
+// Digest matching (values known only by their SHA-256, e.g. generated passwords reloaded after a
+// restart): the text is split into tokens on these delimiters and each token is hashed.
+const TOKEN_SPLIT = /([\s"'`,;.()<>\[\]{}|&:]+)/;
+const DIGEST_MIN = 8;
+export const digestOf = (v) => createHash("sha256").update(String(v), "utf8").digest("hex");
 
 function variants(value) {
   const out = new Set([value]);
@@ -29,6 +36,13 @@ export class SecretRegistry {
   constructor() {
     this.labels = new Map(); // needle -> label
     this.patterns = null;    // compiled alternation, rebuilt on change
+    this.digests = new Map(); // sha256(value) -> label, for values held only as a digest
+  }
+
+  /** Register a value known only by its SHA-256 (reloaded from the state file after a restart). */
+  addDigest(label, digest) {
+    if (/^[0-9a-f]{64}$/.test(String(digest))) this.digests.set(digest, label);
+    return this;
   }
 
   /** Register a secret value under a label. The label is what the model sees instead. */
@@ -56,10 +70,26 @@ export class SecretRegistry {
 
   /** Replace every registered secret in a string. Returns the string unchanged if none. */
   redact(s) {
-    if (typeof s !== "string" || !this.labels.size) return s;
-    const rx = this._rx();
-    rx.lastIndex = 0;
-    return s.replace(rx, (m) => `[REDACTED:${this.labels.get(m) || "secret"}]`);
+    if (typeof s !== "string") return s;
+    let out = s;
+    if (this.labels.size) {
+      const rx = this._rx();
+      rx.lastIndex = 0;
+      out = out.replace(rx, (m) => `[REDACTED:${this.labels.get(m) || "secret"}]`);
+    }
+    return this._redactTokens(out);
+  }
+
+  _redactTokens(s) {
+    if (!this.digests.size) return s;
+    return s.split(TOKEN_SPLIT).map((part, i) => {
+      if (i % 2 === 1 || part.length < DIGEST_MIN) return part; // odd indexes are the delimiters
+      for (const c of [part, part.replace(/[!?]+$/, "")]) {
+        const label = this.digests.get(digestOf(c));
+        if (label) return `[REDACTED:${label}]`;
+      }
+      return part;
+    }).join("");
   }
 
   /** Deep-redact any JSON-like value (tool results, prompts, transcripts). */

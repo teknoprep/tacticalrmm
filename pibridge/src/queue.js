@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { defineTool } from "@earendil-works/pi-coding-agent";
+import { SECRETS, redactedJSON } from "./secret-store.js";
 import { Type } from "typebox";
 import { CONFIG } from "./config.js";
 
@@ -290,7 +291,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
 
   function persist() {
     if (!file) return;
-    try { fs.writeFileSync(file, JSON.stringify(st, null, 2)); }
+    try { fs.writeFileSync(file, redactedJSON(st, 2)); }
     catch (e) { log?.("queue_persist_error", key(), String(e?.message || e).slice(0, 200)); }
   }
 
@@ -348,8 +349,8 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
     st.history.push({
       at: now(),
       event,
-      text: String(text || "").slice(0, QUEUE_HISTORY_TEXT),
-      detail: String(detail || "").slice(0, QUEUE_HISTORY_TEXT),
+      text: SECRETS.redact(String(text || "")).slice(0, QUEUE_HISTORY_TEXT),
+      detail: SECRETS.redact(String(detail || "")).slice(0, QUEUE_HISTORY_TEXT),
       item_id: item ? item.id : null,
       by: who ? who.display : "",
       user: who ? who.user : "",
@@ -617,7 +618,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       const rows = list.map((p) => ({
         at: p.at,
         event: "prompt",
-        text: p.text.slice(0, QUEUE_HISTORY_TEXT),
+        text: SECRETS.redact(p.text).slice(0, QUEUE_HISTORY_TEXT),
         detail: "recovered from the transcript",
         item_id: null,
         // The transcript does not say who typed these, and a guess in an audit is worse
@@ -754,7 +755,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
       };
       if ((images || []).length || tail) {
         try {
-          fs.writeFileSync(attachPath(root, scopeKey, sessionId, item.id), JSON.stringify({ images: images || [], text: tail }));
+          fs.writeFileSync(attachPath(root, scopeKey, sessionId, item.id), JSON.stringify({ images: images || [], text: SECRETS.redact(tail) }));
           item.images = (images || []).length;
           item.attach_text = !!tail;
         } catch (e) {
@@ -928,7 +929,7 @@ export function makePromptQueue({ scopeKey, send, log, runPrompt, compact, isStr
           };
           if ((att.images || []).length || attText) {
             try {
-              fs.writeFileSync(attachPath(root, scopeKey, sessionId, added.id), JSON.stringify({ images: att.images || [], text: attText }));
+              fs.writeFileSync(attachPath(root, scopeKey, sessionId, added.id), JSON.stringify({ images: att.images || [], text: SECRETS.redact(attText) }));
               added.images = (att.images || []).length;
               added.attach_text = !!attText;
             } catch (e) {

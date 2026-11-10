@@ -13,8 +13,16 @@
 // registry knows every value the bridge has ever handed to a helpdesk operation.
 
 import { SecretRegistry, wrapToolRedaction } from "./secret-registry.js";
+import { loadGeneratedSecrets } from "./generated-secrets.js";
 
 export const SECRETS = new SecretRegistry();
+
+// Generated-password digests from before a restart (generated-secrets.js). Loaded once per process.
+try {
+  loadGeneratedSecrets({ registry: SECRETS });
+} catch (e) {
+  console.error("generated-secrets: could not load digests:", e?.message || e);
+}
 
 const BLOCK_MSG =
   "BLOCKED - this would send a stored credential value to the tool. Name the credential " +
@@ -34,6 +42,11 @@ export function guardToolInput(tool) {
   guarded.__inputGuarded = true;
   tool.execute = guarded;
   return tool;
+}
+
+/** JSON for anything the bridge writes to disk: registered values are replaced before it is stored. */
+export function redactedJSON(value, indent) {
+  return JSON.stringify(SECRETS.redactDeep(value), null, indent);
 }
 
 /** Redaction on output, DLP on input. Idempotent. */

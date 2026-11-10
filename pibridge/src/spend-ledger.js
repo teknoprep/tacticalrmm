@@ -22,6 +22,7 @@ import path from "node:path";
 import { makeCostMeter } from "./cost-meter.js";
 import { trmm } from "./trmm.js";
 import { CONFIG } from "./config.js";
+import { redactedJSON } from "./secret-store.js";
 
 // ---- the outbox -----------------------------------------------------------------
 //
@@ -48,7 +49,7 @@ const RETRY_BATCH = Number(process.env.PI_SPEND_RETRY_BATCH || 200);
 
 function stash(entry, log) {
   try {
-    fs.appendFileSync(OUTBOX, `${JSON.stringify(entry)}\n`);
+    fs.appendFileSync(OUTBOX, `${redactedJSON(entry)}\n`);
   } catch (e) {
     // The last line of defence failed. This is the one case where money really is at
     // risk, so say so unmistakably.

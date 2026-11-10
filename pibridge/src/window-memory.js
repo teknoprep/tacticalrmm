@@ -26,6 +26,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "./config.js";
+import { redactedJSON } from "./secret-store.js";
 
 // Same layout as history.js: one directory per conversation key. Decision keys contain a
 // slash ("decision:TICKET/60427") and become a nested directory, which is what the history
@@ -50,7 +51,7 @@ function readRecord(scopeKey) {
 
 function writeRecord(scopeKey, rec) {
   try {
-    fs.writeFileSync(memoryPath(scopeKey), JSON.stringify(rec, null, 2));
+    fs.writeFileSync(memoryPath(scopeKey), redactedJSON(rec, 2));
   } catch {
     /* preference only */
   }

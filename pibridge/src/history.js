@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CONFIG } from "./config.js";
+import { redactedJSON } from "./secret-store.js";
 
 function agentDir(agentId) {
   const d = path.join(CONFIG.sessionsRoot, agentId);
@@ -24,7 +25,7 @@ export function readIndex(agentId) {
 }
 
 function writeIndex(agentId, idx) {
-  fs.writeFileSync(indexPath(agentId), JSON.stringify(idx, null, 2));
+  fs.writeFileSync(indexPath(agentId), redactedJSON(idx, 2));
 }
 
 export function recordSession(agentId, sessionId, info) {

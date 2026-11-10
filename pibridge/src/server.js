@@ -1269,6 +1269,7 @@ async function startChat(ws, blob) {
   }));
   // Password reset: the bridge generates the new value; only the driving technician sees it.
   tools.push(passwordResetTool({
+    actor: { email: blob.user_email || "", name: blob.user_display || blob.username || "" },
     deviceGate: async (summary) => {
       if (readonly) return { ok: false, reason: "the chat is in READ-ONLY mode - switch on Write mode to make device changes." };
       const ok = await requestApproval(summary);
