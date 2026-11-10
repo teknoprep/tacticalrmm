@@ -1,5 +1,6 @@
 import { createAgentSession } from "./session-guard.js";
 import { warmSecrets } from "./helpdesk-runtime.js";
+import { SECRETS } from "./secret-store.js";
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -4137,7 +4138,7 @@ async function runHeadless(blob) {
   });
 
   try {
-    await session.prompt(blob.prompt);
+    await session.prompt(SECRETS.redact(blob.prompt)); // typed text: registered secrets never reach the model
   } catch (e) {
     unsub();
     if (runId) activeRuns.delete(runId);

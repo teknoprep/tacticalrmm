@@ -15,5 +15,17 @@ export async function createAgentSession(opts = {}) {
     const orig = o.resourceLoader.getSystemPrompt.bind(o.resourceLoader);
     o.resourceLoader.getSystemPrompt = (...a) => SECRETS.redact(orig(...a));
   }
-  return piCreateAgentSession(o);
+  const created = await piCreateAgentSession(o);
+  // Every model call receives the conversation history, including the model's own earlier
+  // tool calls. Redact that history on the way out too, so a value the model wrote itself
+  // never comes back to it. (The SDK chains transformContext, so this runs last.)
+  const agent = created?.session?.agent;
+  if (agent) {
+    const prev = agent.transformContext;
+    agent.transformContext = async (messages, signal) => {
+      const base = prev ? await prev(messages, signal) : messages;
+      return SECRETS.redactDeep(base);
+    };
+  }
+  return created;
 }
