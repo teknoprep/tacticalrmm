@@ -1,7 +1,7 @@
 from django.urls import path
 from django.conf import settings
 
-from . import odoo_ai, relay, views
+from . import odoo_ai, operator_mesh, relay, views
 
 urlpatterns = [
     # Odoo `ai_pi_bridge` addon entry points. Shared-secret authenticated (see
@@ -25,6 +25,8 @@ urlpatterns = [
     # Asked by an unattended session: which tickets are held behind the one I am working?
     path("ai/autowork/duplicates/<path:ticket_ref>/", views.AutoworkDuplicates.as_view()),
     path("ai/odoo/work/", odoo_ai.work),
+    # Pi AI Operator: Mesh Take Control facts (X-API-KEY auth). See core/operator_mesh.py.
+    path("operator/mesh-bootstrap/<str:agent_id>/", operator_mesh.OperatorMeshBootstrap.as_view()),
     path("settings/", views.GetEditCoreSettings.as_view()),
     path("version/", views.version),
     path("emailtest/", views.email_test),
