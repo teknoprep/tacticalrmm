@@ -32,6 +32,39 @@ const HANDOFF = new RegExp(
   "i",
 );
 
+// A REQUEST AIMED AT THE TECHNICIAN - the turn is being handed back even though the same
+// sentence also promises "I'll …". TICKET/60427, 2026-11-16: "Say the word and I'll start the
+// image build" and "Tell me when the call is done and I'll pull the negotiated codec" were both
+// read as announcements. Auto-continue fired 30 s after the technician had been asked a
+// question, and the push bought a wasted turn that ended in a bogus "Blocked on approval".
+// A completion summary that ends with the next move left to the technician is NOT a stall: the
+// run is over on purpose, and the technician is the one who starts the next one.
+const ASKS_TECH = new RegExp(
+  "\\b(say (?:the word|the go|so|yes|go)\\b|" +
+  "(?:your|the) (?:go|ok|okay|nod|approval|sign-?off|green light|window|side)\\b|" +
+  "(?:need|needs|waiting (?:for|on)) (?:your|the) (?:go|ok|okay|approval|sign-?off|green light)\\b|" +
+  "give (?:me|us) (?:the |a |your )?(?:go|green light|ok|okay|nod|approval)\\b|" +
+  "(?:tell|show|send|email) me\\b|paste|" +
+  "want me to\\b|shall i\\b|may i\\b|" +
+  "(?:make|place) (?:the |that |a |this )?[^.?!\\n]{0,40}?\\bcall\\b|" +
+  "if you(?:'d| would)? (?:want|need|prefer|like)\\b|" +
+  "when you(?:'re| are|'ve| have| get| finish| see| call)?\\b|while you(?:'re| are)\\b|" +
+  "once you(?:'ve| have)?\\b|as soon as you\\b|on your (?:window|side|end|screen|desk|call)\\b|" +
+  "test it\\b|try it\\b|\\bthen you\\b|" +
+  // "**Call again.** The thing I'll look for..." (TICKET/60427, 15:38 on 2026-11-16) - a bare
+  // imperative at the start of a sentence or after markdown emphasis is an instruction to the
+  // technician, even with no "make/place the call" around it.
+  "(?:^|[.!?:*_\\n\\u2014-]\\s{0,2})\\*{0,2}(?:call|dial|re-?dial|ring|answer|re-?try|retry|try|test|" +
+  "paste|send|click|approve|confirm|reboot|restart|power[- ]cycle|sign[ -]?in|log ?in)\\b|" +
+  "\\bcall (?:again|now|back)\\b|\\bi need (?:one|another|you|your)\\b|" +
+  // "Approve, and I'll do 1-3 now, then you test a call" / "go for the logging and I'll run a
+  // capture" - an imperative the technician must carry out, glued to the promise by "and I'll".
+  "\\b(?:say|tell|give|approve|confirm|send|paste|show|go|ok|okay|yes|sign(?:[ -]?in| on)?|log ?in)\\b[^.!?\\n]{0,60}\\band i(?:'| wi)ll\\b|" +
+  // "You assign BlueUC-DirectRouting in Teams admin" - an instruction that ends the turn.
+  "\\byou\\b[\\s*_]{0,4}(?:assign|configure|create|set up|add|need to|will need to|should|must|check|test|verify|confirm|make|place)\\b)",
+  "i",
+);
+
 export const AUTO_CONTINUE_TEXT =
   "[auto-continue from the bridge, not the technician] Your last message said what you would do " +
   "next, but the turn ended without doing it. Do it now with your tools - do not announce it again. " +
@@ -57,7 +90,7 @@ export function endedOnPromise(session) {
   if (!text || text.length > 2500) return false;
   // Judge the tail: the promise is what the turn ends on.
   const tail = text.slice(-600);
-  if (HANDOFF.test(tail)) return false;
+  if (HANDOFF.test(tail) || ASKS_TECH.test(tail)) return false;
   return PROMISE.test(tail);
 }
 
