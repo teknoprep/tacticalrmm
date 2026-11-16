@@ -35,7 +35,7 @@
 // should do it and we will let them know, or if I tell it then it can." So a write needs
 // EITHER a verbatim instruction from the technician OR an approval click, and no toggle
 // skips it. See the `secret_write` branch of gate() in server.js.
-export const CLASSES = ["read", "create", "note", "knowledge", "global_knowledge", "customer", "close", "routing", "secret", "secret_write", "sales"];
+export const CLASSES = ["read", "create", "note", "knowledge", "knowledge_delete", "global_knowledge", "customer", "close", "routing", "secret", "secret_write", "sales"];
 
 // Ships-working-out-of-the-box classifier for conventional operation names. This is a
 // DEFAULT CLASSIFIER ONLY, never the authority: explicit exports.opClasses always wins.
@@ -52,6 +52,12 @@ export const NAME_DEFAULTS = {
   add_note: "note",
   // knowledge  (MANDATE 4.13: company-scoped knowledge capture is memory, not a change)
   upsert_ai_kb_article: "knowledge",
+  // knowledge_delete (2026-11-16): DELETING text from an existing KB article - the one
+  // knowledge class that destroys something instead of adding to it. Interactive only:
+  // a person asked for the cleanup, in their own words, and (in the ticket chat) approves
+  // the call. Never on an unattended/auto-resolve/mining surface, where nobody is reading
+  // the diff and "this looks stale" is the model's guess rather than a technician's ruling.
+  edit_ai_kb_article: "knowledge_delete",
   // global_knowledge (shared/global KB authoring is only exposed interactively and
   // also requires a direct technician instruction; see tools.js)
   create_global_kb_article: "global_knowledge",
@@ -106,12 +112,12 @@ export const SURFACE_CLASSES = {
   //
   // `secret_write` stays out. Recording a credential is a decision about what the customer's
   // record should say, and it belongs with the ticket that justifies it.
-  device_chat:   ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "secret"],
+  device_chat:   ["create", "note", "knowledge", "knowledge_delete", "global_knowledge", "read", "customer", "routing", "secret"],
   // Decision chat: a human is driving the ticket and approves each mutating call. Reaches
   // the credential store under makeCredentialGate(), which Auto-approve cannot skip.
   // `secret_write` is here and nowhere else: recording a credential is a decision about the
   // customer's record, and the ticket is what justifies and dates it.
-  decision_chat: ["create", "note", "knowledge", "global_knowledge", "read", "customer", "routing", "close", "secret", "secret_write", "sales"],
+  decision_chat: ["create", "note", "knowledge", "knowledge_delete", "global_knowledge", "read", "customer", "routing", "close", "secret", "secret_write", "sales"],
   // Ticket Console auto-resolve: read-only investigation, posts a note. Never closes,
   // never emails. Replaces the old blockOps name list (ISSUES.md I6).
   auto_resolve:  ["read", "note", "knowledge"],
@@ -261,7 +267,10 @@ export function checkOp({ surface, op, opClasses, mutating, grants }) {
 // resolving tickets - the exact acts the class system exists to stop, logged and then
 // allowed. An email to a customer is as irreversible as a password handed to the model;
 // no observation window is worth one sent by a job nobody was watching.
-const ALWAYS_ENFORCED = new Set(["secret", "secret_write", "customer"]);
+// `customer` joined them 2026-09-15 (see below). `knowledge_delete` joined 2026-11-16: on a
+// surface that is not supposed to have it, warn-mode would delete KB text and log it
+// afterwards, and the article's previous body would only exist in a backup attachment.
+const ALWAYS_ENFORCED = new Set(["secret", "secret_write", "customer", "knowledge_delete"]);
 
 export function gateOp(ctx) {
   const v = checkOp(ctx);

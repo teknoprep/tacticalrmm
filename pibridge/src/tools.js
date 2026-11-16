@@ -1,6 +1,9 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import crypto from "node:crypto";
+import nodePath from "node:path";
+import { CONFIG } from "./config.js";
+import { createKbGuard, makeResultRing, fileBudget, isObservation, isKbWrite, runKbOp } from "./kb-guard.js";
 import { trmm } from "./trmm.js";
 import { loadHelpdesk } from "./helpdesk-runtime.js";
 import { loadSales } from "./sales-runtime.js";
@@ -1256,6 +1259,7 @@ export function buildTools({
         { signal },
       );
       const s = typeof out === "string" ? out : JSON.stringify(out);
+      kbRing.push(s);
       // Captured: keep the bytes here and hand back a receipt, not the content.
       if (p.capture_as && String(p.capture_as).trim()) {
         const name = String(p.capture_as).trim().slice(0, 80);
@@ -1623,6 +1627,17 @@ export function buildTools({
   const opList = hdVisible
     .map((n) => `  - ${n}${hd.meta[n] ? ": " + hd.meta[n] : ""}`)
     .join("\n");
+  // KB WRITE GUARD (docs/KB-WRITE-GUARD.md). Every KB write on this surface goes through it.
+  // `kbRing` is what the model has actually seen this chat (device output + non-KB helpdesk
+  // results) - the only thing an evidence quote may be matched against.
+  const kbRing = makeResultRing();
+  const kbBudget = fileBudget(nodePath.join(CONFIG.sessionsRoot, "kb-write-budget.json"));
+  const kbGuardFor = (a = {}) => createKbGuard({
+    hd, partnerId: a.partner_id || 0, companyName: a.company_name || "", articleId: a.article_id || 0,
+    ticketRef: jobRef || "", surface, techSaid: techTurns || [], getRecentResults: kbRing.list,
+    now: () => new Date(), budget: kbBudget, globalAuth: globalKnowledgeAuthorisation,
+    log: (...x) => console.log(new Date().toISOString(), ...x),
+  });
   const helpdesk_call = defineTool({
     name: "helpdesk_call",
     label: "Helpdesk operation",
@@ -1633,7 +1648,11 @@ export function buildTools({
       "POLICY in your instructions - follow it. These are TICKET actions: they do NOT " +
       "require the session's Write mode (that controls changes to the DEVICES), but a " +
       "mutating one still asks the operator to approve it. Available operations:\n" +
-      (opList || "  (none configured)"),
+      (opList || "  (none configured)") +
+      "\n\nKB CLEANUP (edit_ai_kb_article) is GUARDED: put {entries:[quote]} to delete whole " +
+      "entries, {remove:[quote]} for one statement, or {replace:[{find,with}]} to rewrite one, " +
+      "in args. It runs ONLY when the technician asked for the cleanup in this chat - never on " +
+      "your own judgement that text looks stale - and it shows you a 'KB edit:' line to repeat.",
     parameters: Type.Object({
       operation: Type.String({ description: "Operation name (one listed above)" }),
       args: Type.Optional(
@@ -1728,7 +1747,9 @@ export function buildTools({
         if (!ok) return denied();
       }
       try {
+        if (isKbWrite(op)) return text(await runKbOp(kbGuardFor(args), op, args));
         const result = await hd.operations[op](args);
+        if (isObservation(op)) kbRing.push(result);
         // CAPPED. Every other tool on this surface caps its output; this one did not, and
         // on 2026-09-22 a single `list_closed_tickets` (since=2026-08-01, full message
         // bodies) returned 2.96 MB - about 740k tokens - straight into the context of a
@@ -2359,6 +2380,32 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
 } = {}) {
   const text = (s) => ({ content: [{ type: "text", text: s }], details: {} });
   const capStore = makeCaptureStore();
+  // KB WRITE GUARD (docs/KB-WRITE-GUARD.md). `kbRing` is the bounded record of tool results
+  // observed in this chat (helpdesk results that are not KB reads/echoes, and device command
+  // output): "evidence in this turn" is implemented as "a verbatim fragment of a result
+  // observed in this chat" - the honest loosening of "this turn". `kbPartner` remembers the
+  // company the model last named on a KB operation, for kb_retract.
+  const kbRing = makeResultRing();
+  const kbBudget = fileBudget(nodePath.join(CONFIG.sessionsRoot, "kb-write-budget.json"));
+  let kbPartner = 0;
+  // THE TICKET'S COMPANY (spec E). A KB write with no partner_id must land on the CLIENT of
+  // this ticket, never on "the company the model last happened to mention". get_ticket
+  // returns the commercial company as partner_company_id, and the raw m2o array as
+  // partner_id - read both, and memoise: one RPC per chat.
+  let kbCompany = null, kbCompanyFor = "";
+  const kbCompanyOfTicket = async () => {
+    if (!ticketRef || !hd?.operations?.get_ticket) return { id: 0, name: "" };
+    if (kbCompany && kbCompanyFor === ticketRef) return kbCompany;
+    try {
+      const t = await hd.operations.get_ticket({ ticket: ticketRef });
+      const pid = Number(t?.partner_company_id)
+        || (Array.isArray(t?.partner_id) ? Number(t.partner_id[0]) : Number(t?.partner_id))
+        || 0;
+      kbCompany = { id: pid, name: String(t?.partner_company_name || "") };
+      kbCompanyFor = ticketRef;
+      return kbCompany;
+    } catch { return { id: 0, name: "" }; }
+  };
   // Machines with a proper desktop-control plane - see GUI_DRIVING.
   const operatorAgentIds = operatorAgentIdSet(operatorPolicy);
   let hd = null, hdError = "";
@@ -2380,6 +2427,15 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
   // Catalog lines for the ops NOT advertised, so a capability that owns them can list them
   // when it loads (e.g. the TOTP ops in the "totp" capability).
   const unadvertisedOpLines = hd ? hdVisible.filter((n) => !advertised.includes(n)).map(opLine) : [];
+
+  const kbGuardFor = (a = {}) => createKbGuard({
+    hd, partnerId: Number(a.partner_id) || (ticketRef ? 0 : kbPartner), companyName: a.company_name || "",
+    articleId: a.article_id || 0,
+    ticketRef: ticketRef || "", surface, techSaid: techTurns || [], getRecentResults: kbRing.list,
+    now: () => new Date(), budget: kbBudget, globalAuth: globalKnowledgeAuthorisation,
+    resolvePartner: kbCompanyOfTicket,
+    log: (...x) => console.log(new Date().toISOString(), ...x),
+  });
 
   // READ A TICKET ATTACHMENT - AND SEE IT (owner, 2026-10-06).
   // Tickets carry screenshots (a customer's error, a photo of a handwritten note) and the AI could
@@ -2440,6 +2496,8 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       "automatically. Field names: add_note and reply_to_ticket use 'message'; resolve_ticket uses " +
       "'internal_note' (review note) + 'customer_html' (the HTML customer reply); close_ticket uses " +
       "'reason'; set_ticket_company uses 'company_partner_id'; KB ops use 'partner_id'/'title'/'content'; " +
+      "upsert_ai_kb_article is GUARDED - put {entry, topic, evidence:{kind, quote}} (and state/scope/kind/target_ref when needed) in args, see CAPTURE KNOWLEDGE; " +
+      "edit_ai_kb_article is GUARDED too - put {entries:[quote]} (delete whole entries), {remove:[quote]} (one statement) or {replace:[{find,with}]} (rewrite one) in args, see CLEANING UP THE KB; " +
       "search_kb uses 'query' (search our KB BEFORE planning or changing anything); get_kb_article takes 'article_id' plus 'query' or 'offset' for long articles.",
     parameters: Type.Object({
       operation: Type.String({ description: "Operation name (one of the list above)" }),
@@ -2618,7 +2676,12 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
       // to wander onto a different customer's opportunity by mistyping an id.
       if (leadRef && LEAD_OPS.has(p.operation) && args.lead === undefined) args.lead = leadRef;
       try {
+        if (/kb/i.test(p.operation) && Number(args.partner_id) > 0) kbPartner = Number(args.partner_id);
+        // KB writes never reach the operation directly: the guard decides (verification,
+        // clock, scope, duplicates, budget) and prints the "KB write:" line.
+        if (isKbWrite(p.operation)) return text(await runKbOp(kbGuardFor(args), p.operation, args));
         const out = await hd.operations[p.operation](args);
+        if (isObservation(p.operation)) kbRing.push(out);
         // Record WHO drove this, as it happens. The helpdesk will log the API user as the
         // actor; this is the only place that knows a person was sitting here directing it.
         if (creditActor && ["customer", "close", "note", "create", "routing"].includes(cap.cls)) {
@@ -2662,6 +2725,42 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
         return text(typeof out === "string" ? capString(out, 20000) : capJson(out, { maxBytes: 20000, what: "helpdesk" }));
       }
       catch (e) { return text(`${p.operation} failed: ${e?.message || e}`); }
+    },
+  });
+
+  // H. RETRACT A KB ENTRY (docs/KB-WRITE-GUARD.md). Appends a [retract ref X] block: the wrong
+  // block stays in the article's history, recall stops showing it. Decision surface only.
+  const kb_retract = defineTool({
+    name: "kb_retract",
+    label: "Retract a KB entry",
+    description:
+      "Withdraw a KB entry that turned out to be WRONG, by its ref (the [ref xxxxxxxx] marker in the KB text). " +
+      "It is not deleted: a retraction is appended, the entry stays in the article's history, and it stops being " +
+      "shown in recall. Use this instead of writing a second entry that contradicts the first. A reason is required.",
+    parameters: Type.Object({
+      ref: Type.String({ description: "8-character ref of the entry to retract, e.g. 7f3a1c02" }),
+      reason: Type.String({ description: "What was wrong - one or two sentences" }),
+      ticket: Type.Optional(Type.String({ description: "This ticket (filled in for you)" })),
+      partner_id: Type.Optional(Type.Number({ description: "The company whose KB article holds the entry (defaults to the last company you used a KB operation on)" })),
+    }),
+    execute: async (_id, p) => {
+      if (!hd?.operations?.upsert_ai_kb_article) return text("KB retraction is not available on this helpdesk.");
+      const cap = gateOp({ surface, op: "upsert_ai_kb_article", opClasses: hd.opClasses, mutating: hd.mutating, ref: ticketRef });
+      if (!cap.allowed && cap.enforced) return text(`Not permitted in this mode: ${cap.reason}.`);
+      if (p.ticket && ticketRef && String(p.ticket).trim() !== ticketRef)
+        return text(`Refused: this chat is bound to ${ticketRef}; it cannot retract on behalf of ${p.ticket}.`);
+      // Which company's article holds it: the argument, else THIS TICKET's company (the
+      // model must not have to remember a number, and must not be able to aim at another
+      // client's article by omitting it), else the last company it named here.
+      const co = await kbCompanyOfTicket();
+      const partner = Number(p.partner_id) || co.id || kbPartner || 0;
+      if (!partner) return text("NOTHING WAS WRITTEN. Which company's KB article holds that entry? Call kb_retract again with partner_id.");
+      try {
+        const r = await kbGuardFor({ partner_id: partner, ...(partner === co.id && co.name ? { company_name: co.name } : {}) }).retract({
+          ref: p.ref, reason: p.reason, who: actorName || creditActor || actorEmail || "the technician",
+        });
+        return text(r.chatLine + (r.refused ? "\nNOTHING WAS WRITTEN." : ""));
+      } catch (e) { return text(`kb_retract failed: ${e?.message || e}`); }
     },
   });
 
@@ -2808,6 +2907,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
           timeout: p.timeout && p.timeout > 0 ? p.timeout : 45,
         }, { signal });
         const raw = typeof out === "string" ? out : JSON.stringify(out);
+        kbRing.push(raw);
         if (p.capture_as && String(p.capture_as).trim()) {
           const nm = String(p.capture_as).trim().slice(0, 80);
           const rec = capStore.put(nm, raw, `${p.agent_id}: ${p.command.slice(0, 120)}`);
@@ -3408,7 +3508,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     });
   }
 
-  let baseTools = [helpdesk_call, ...(hd?.operations?.read_ticket_attachment ? [ticket_attachment] : []), find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools(), ...documentTools()];
+  let baseTools = [helpdesk_call, kb_retract, ...(hd?.operations?.read_ticket_attachment ? [ticket_attachment] : []), find_devices, deviceHardwareTool(), rmmClientsTool(), run_device_command, attach_capture, save_device_note, get_device_notes, schedule_action, list_scheduled_actions, cancel_scheduled_action, send_email, save_procedure, ...operatorTools, ...webTools(), ...documentTools()];
   if (sales_call) baseTools.push(sales_call);
   if (leadRef) {
     // DISCOVERY. Device tools stay - they obey Write mode and the approval prompt exactly
@@ -3425,7 +3525,7 @@ export function buildDecisionTools({ helpdeskCode, helpdeskApi, ticketRef, gate,
     // it now gates itself on the window's switches (see its execute). attach_capture is
     // still out - it attaches to a TICKET, and there is no ticket on this surface.
     const drop = new Set(["attach_capture", "schedule_action", "cancel_scheduled_action",
-                          "save_procedure", "ticket_attachment"]);
+                          "save_procedure", "ticket_attachment", "kb_retract"]);
     baseTools = baseTools.filter((t) => !drop.has(t.name));
     baseTools.push(submit_discovery_scope);
   }

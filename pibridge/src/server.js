@@ -3,6 +3,7 @@ import { warmSecrets } from "./helpdesk-runtime.js";
 import { SECRETS } from "./secret-store.js";
 import http from "node:http";
 import fs from "node:fs";
+import nodePath from "node:path";
 import { randomUUID } from "node:crypto";
 import Redis from "ioredis";
 import { WebSocketServer } from "ws";
@@ -61,6 +62,7 @@ import { LIVE, LIVE_PENDING, claimPending, liveKey, makeHub, DRIVING_FRAMES, act
 import { presenceFrame, mayAnswerApproval } from "./live-presence.js";
 import { makeAttachmentIntake, composePrompt, ATTACH_LIMITS } from "./attachments.js";
 import { KB_FIRST_RULE, kbRecall, kbRecallBlock } from "./kb-recall.js";
+import { createKbGuard, fileBudget } from "./kb-guard.js";
 
 // The pi version THIS process actually loaded, read ONCE at startup. That is the whole point:
 // it must NOT move when `npm install` swaps the package on disk. A runtime update is only real
@@ -127,6 +129,9 @@ void uninstallLiveness;
 function log(...a) {
   console.log(new Date().toISOString(), ...a);
 }
+
+// KB write budget (docs/KB-WRITE-GUARD.md G): hourly stamps survive a restart.
+const kbBudget = fileBudget(nodePath.join(CONFIG.sessionsRoot, "kb-write-budget.json"));
 
 // Instructions for an unattended run about contacting the customer. The CAPABILITY to do
 // so is enforced in code (capabilities.js grants `customer` only when a register is
@@ -347,7 +352,12 @@ const DEFAULT_DECISION_POLICY =
   `  - save_device_note = DEVICE-SPECIFIC facts about ONE machine (its role, disk/volume/pool layout, service/container names, hardware quirks, a fix that worked on it, how to verify its health). Anything tied to a specific host goes here, NOT the KB.\n` +
   `  - upsert_ai_kb_article = GENERAL guidance for working with this CLIENT (their standards/preferences, key contacts, naming conventions, recurring procedures that apply across their fleet). Never put a specific device's history or one-off event into the KB.\n` +
   `  - create_global_kb_article = a NEW GLOBAL/shared article not tied to any client. Use it ONLY when the technician explicitly asks to create/write/publish a GLOBAL KB article. Never choose this proactively, and never substitute the company AI article for a requested global article.\n` +
-  `CAPTURE KNOWLEDGE (do this proactively, without being asked): whenever the technician tells you something you did NOT already know - how a machine is set up, where something lives, how a process/workflow at this client works, a quirk or gotcha, or the fix that actually worked - DOCUMENT it right then so future runs start with it. Route it: a fact about ONE machine -> save_device_note (that device's agent_id); general client/process knowledge -> upsert_ai_kb_article. Briefly tell the tech what you saved. NEVER store secrets/passwords in a device note or the KB - note WHERE they live, not the value (the IT Notebook is the one place a credential belongs; see CREDENTIALS below). IMPORTANT - recording knowledge is NOT a 'change' and NEVER needs permission, Write mode, or the tech's go-ahead: save_device_note and upsert_ai_kb_article only write to YOUR OWN memory - they do not touch a device, run a command, reboot anything, or contact a customer. So capture durable facts SILENTLY and proactively AS you learn them, EVEN when the tech has said 'don't make changes' or 'don't act without direction' - those rules govern DEVICES and CUSTOMER communication, not your memory. Do not ask 'should I save this?'; just save it and mention it in one line.\n` +
+  `CAPTURE KNOWLEDGE (the KB is SHARED by every client, so write rarely and only what is PROVEN - entries are appended, and are only ever DELETED on the technician's own instruction, see CLEANING UP THE KB below): when the technician tells you something you did NOT already know, or a fix actually worked, route it: a fact about ONE machine -> save_device_note (that device's agent_id); general client/process knowledge -> upsert_ai_kb_article. NEVER store secrets/passwords in a device note or the KB - note WHERE they live, not the value (the IT Notebook is the one place a credential belongs; see CREDENTIALS below). Recording knowledge is not a device change, so it needs no Write mode - but the bridge enforces these rules on every upsert_ai_kb_article and prints a "KB write:" line for each attempt; repeat that line to the tech in one line. ` +
+  `(1) VERIFY FIRST: send args {entry, topic, evidence:{kind: "readback"|"result_json"|"log"|"cdr", quote: "<a verbatim fragment, 20+ characters, of a tool result you saw in THIS chat that proves it>"}}. A plan, hypothesis, instruction or "should work" is not evidence. A change you applied but could not verify may only be saved with state:"unverified" (it is stored as "applied, UNVERIFIED"), never as a conclusion. Do not write a date - the server stamps it. ` +
+  `(2) ONE ENTRY PER OUTCOME: save the result once, as a few sentences - not each step, not a restatement, not a reversal. The bridge allows 1 write per turn and 3 per hour per ticket and ignores duplicates. To change an entry you already wrote, use kind:"amend" with target_ref (the [ref xxxxxxxx] in the KB). ` +
+  `(3) CORRECTIONS BY REF: if something recorded turns out wrong, do not add a contradicting entry and never write "supersedes everything above" - use kind:"correction" with target_ref and the one line of what was wrong, or kb_retract {ticket, ref, reason} to withdraw it. ` +
+  `(4) NEVER A STANDING RULE FROM ONE CLIENT: record what was seen at THIS client only. If it might apply to everyone, add scope:"candidate" (stored as "candidate for a global rule - NOT yet a standard"). A rule for all clients needs the technician's explicit instruction, quoted in the entry.\n` +
+  `CLEANING UP THE KB (helpdesk_call edit_ai_kb_article) - ONLY when the technician asks you to tidy an article: delete entries a newer entry superseded, remove a statement that is now wrong, or fix a typo in place instead of appending a correction. Quote the text VERBATIM from the article you just read with get_kb_article: args {entries:[quote]} deletes the whole entry that contains the quote, {remove:[quote]} deletes just that statement, {replace:[{find,with}]} rewrites it. A quote must match EXACTLY ONCE (25+ characters for a delete; no-match and ambiguity are refusals, never guesses), one call takes a backup attachment of the entire previous article and may remove at most half of it - so a big tidy-up is several calls - and the result is read back and verified, or rolled back. Repeat the "KB edit:" line to the technician. Never delete because YOU think text looks stale: the technician must have asked, and before deleting a fact, confirm a newer entry actually supersedes it.\n` +
   `CREDENTIALS - THE IT NOTEBOOK IS THE ONLY PLACE A PASSWORD GOES: never put a credential in a ticket note, a customer reply, an email, the KB or a device note - say where it lives, never the value. You CAN write to the customer's IT Notebook (helpdesk_call upsert_notebook_row / update_notebook_row), but ONLY when the technician has told you to save it, or you have ASKED and they said yes. So when you set something up that has a credential: do NOT dump a block of text for them to paste in by hand - tell them in one line what you would record (system, URL, username, 'password' - never the password itself), ask 'want me to save this to the IT Notebook?', and write it when they agree. If they say no, show them the row as a table they can paste and move on. Match the column layout of the notebook's existing rows. Never record a password you did not actually set or were not given, and never guess a row's columns - read one existing row first if you are unsure.\n` +
   `SCHEDULING: only when the tech asks, use schedule_action (device agent_id, ISO 8601 run_at, instruction) - it runs once at that time and updates the ticket. When you finish work early, close a ticket, or a later check supersedes an earlier follow-up, ALWAYS list_scheduled_actions for this ticket and cancel_scheduled_action any leftover jobs so they do not fire.\n` +
   `SALES/ERP: When sales_call is available, create DRAFT quotations in the ERP ONLY when the technician explicitly tells you to create/push the quote in Odoo/ERP. Building numbers in chat or emailing a quote is NOT permission to create an ERP quote. Never confirm a Sales Order. Always show the quotation URL. Partner must come from the ticket — if unclear, stop and ask. After create, add an internal ticket note with quote name/total/URL.\n` +
@@ -4516,8 +4526,14 @@ async function runProcedureMining(blob) {
     // chunk - keeps the KB article tidy instead of piling on repeated blocks.
     if (coKbParts.length && co.partner_id && hd.operations.upsert_ai_kb_article) {
       try {
-        await hd.operations.upsert_ai_kb_article({ partner_id: co.partner_id, company_name: co.name, entry: coKbParts.join(" ") });
-        prog.kb_updates++; say(`  + KB note saved for ${co.name}`);
+        // Through the KB write guard (docs/KB-WRITE-GUARD.md): mined notes are OFFLINE
+        // evidence, so they are stored as "unverified" and recall flags them as such.
+        const g = await createKbGuard({
+          hd, partnerId: co.partner_id, companyName: co.name, ticketRef: "mining", surface: "mining",
+          budget: kbBudget, log, maxLen: 8000, budgetByPartner: true,
+        }).write({ entry: coKbParts.join(" "), topic: "mined-tickets", state: "unverified", evidence: { kind: "offline" } });
+        if (g.refused || g.action === "no-op") say(`  - ${g.chatLine}`);
+        else { prog.kb_updates++; say(`  + KB note saved for ${co.name} (unverified)`); }
       } catch (e) { say(`  ! KB write failed: ${String(e).slice(0, 100)}`); }
     }
     for (const r of co.refs) mined.push({ ref: r.ref, write_date: r.write_date || "" });
