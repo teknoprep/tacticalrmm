@@ -38,6 +38,7 @@ urlpatterns = [
     path("clients/", include("clients.urls")),
     path("agents/", include("agents.urls")),
     path("netdevices/", include("netdevices.urls")),
+    path("backup/", include("backup.urls")),
     path("checks/", include("checks.urls")),
     path("services/", include("services.urls")),
     path("winupdate/", include("winupdate.urls")),

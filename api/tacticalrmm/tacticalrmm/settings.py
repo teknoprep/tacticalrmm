@@ -285,6 +285,7 @@ INSTALLED_APPS = [
     "clients",
     "agents",
     "netdevices",
+    "backup",
     "checks",
     "services",
     "winupdate",
